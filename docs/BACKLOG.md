@@ -19,12 +19,12 @@ Status: `idea` · `ready` · `specced` · `in_progress` · `done` · `blocked`
 
 | ID | Item | Why | Status | Notes |
 |----|------|-----|--------|-------|
-| P0-1 | **Canonical import plan from v49 tarball** | Empty GitHub; only copy is a tar | ready | Layout proposal: package `kx_orderbooks/`, trader script(s), `cmd_adv`, `examples/`, `docs/`, `pyproject.toml`, `.gitignore`. Exclude `__pycache__`, secrets, venv, local state logs. |
-| P0-2 | **Secret & path scrub checklist** | Prevent key material / absolute machine paths leaking | ready | Env-only auth (`KALSHI_*`); never commit PEM paths with keys; document required env vars only. |
-| P0-3 | **Safety freeze checklist** | Speed work must not break operator-critical guards | ready | Dry-run default; `--demo`/`--prod` required; `--live` gate; heard-on-detect; Ctrl-E then Enter; typed END inert; Ctrl-C then Enter exit; price clamps; END YES/NO gates; disqualify honors. |
-| P0-4 | **Owner runbook (demo → dry → live)** | Formal project needs a known-good launch path | ready | Document `cmd_adv` profiles (OTA/web-stream), rate defaults, trade-controls keybinds, log locations under `~/.local/state/...`. |
-| P0-5 | **Baseline coupling audit: trader ↔ kx_orderbooks** | Can’t optimize what may be duplicated | ready | Map whether trader uses `SeriesOrderbookManager` cleanly or reimplements WS/book pieces; list double-maintenance risks. |
-| P0-6 | **Local git init / branch strategy (no remote push)** | History before any GitHub write | ready | Main + short-lived perf/tweak branches; tag `v49-import` after clean import. |
+| P0-1 | **Canonical import plan from v49 tarball** | Empty GitHub; only copy is a tar | done | Imported 2026-08-03 to `rpgrimm/kalshi-multiplex-orderbook` @ `6058a9a` tag `v49-import`. Local tree: `~/kalshi-multiplex-orderbook`. |
+| P0-2 | **Secret & path scrub checklist** | Prevent key material / absolute machine paths leaking | ready | GitHub #1. Env-only auth; `.gitignore` seeded; keep scanning. |
+| P0-3 | **Safety freeze checklist** | Speed work must not break operator-critical guards | ready | Doc done; GitHub #4 for walkthrough + future tests. |
+| P0-4 | **Owner runbook (demo → dry → live)** | Formal project needs a known-good launch path | ready | GitHub #2 |
+| P0-5 | **Baseline coupling audit: trader ↔ kx_orderbooks** | Can’t optimize what may be duplicated | ready | GitHub #3 |
+| P0-6 | **Local git init / branch strategy** | History + remote | done | `main` tracking origin; tag `v49-import` pushed. |
 
 ---
 
