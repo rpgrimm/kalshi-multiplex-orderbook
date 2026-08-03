@@ -1,0 +1,18 @@
+# pyproject.toml
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kx-orderbooks"
+version = "0.1.0"
+description = "Multiplexed Kalshi orderbook websocket manager"
+requires-python = ">=3.10"
+dependencies = [
+    "websockets>=12",
+    "cryptography>=41",
+]
+
+[tool.setuptools]
+packages = ["kx_orderbooks"]

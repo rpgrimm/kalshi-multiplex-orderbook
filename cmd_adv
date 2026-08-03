@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Fast Kalshi broadcast trader wrapper.
+#
+# Default tier: Advanced
+#   reads:  bucket_capacity=600, refill_rate=300 tokens/sec
+#   writes: bucket_capacity=600, refill_rate=300 tokens/sec
+#
+# This wrapper uses a conservative call-based default of 20 writes/sec.
+# The trader's local --write-rate-limit is call-based, while Kalshi limits
+# are token-based. Override with KALSHI_WRITE_RATE_LIMIT when testing.
+#
+# Manual trade controls are ALWAYS enabled by this wrapper.
+#   Ctrl-Y YES | Ctrl-N NO | Ctrl-B BUY | Ctrl-S SELL mode | Ctrl-D DISQUALIFY mode | Ctrl-T edit selected-side size | Ctrl-R refresh | Ctrl-E then Enter END (typed END is ignored)
+# Manual control orders remain simple IOC if --execution-mode ioc-ladder is supplied; Ctrl-E retains the ladder.
+#
+# Uses this directory's venv automatically; no `source venv/bin/activate`
+# is required.
+#
+# Usage:
+#   ./cmd_adv <market-full-name> --prod --live [--over-the-air|--web-stream]
+#   KALSHI_MARKET=<market-full-name> ./cmd_adv --prod --live
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+TRADER="${KALSHI_TRADER:-$ROOT/kalshi_broadcast_word_trader.py}"
+PY="${KALSHI_PYTHON:-$ROOT/venv/bin/python}"
+
+# Advanced-tier defaults. Override any of these with environment variables.
+RATE_TIER="${KALSHI_RATE_TIER:-advanced}"
+COUNT_YES="${KALSHI_COUNT_YES:-100}"
+COUNT_NO="${KALSHI_COUNT_NO:-100}"
+READ_RATE_LIMIT="${KALSHI_READ_RATE_LIMIT:-270}"
+WRITE_RATE_LIMIT="${KALSHI_WRITE_RATE_LIMIT:-20}"
+MAX_429_RETRIES="${KALSHI_MAX_429_RETRIES:-5}"
+ORDER_WORKERS="${KALSHI_ORDER_WORKERS:-2}"
+EXECUTION_MODE="${KALSHI_EXECUTION_MODE:-simple}"
+WS_SNAPSHOT_MAX_AGE_MS="${KALSHI_WS_SNAPSHOT_MAX_AGE_MS:-750}"
+WS_FRESH_ORDER_WAIT_MS="${KALSHI_WS_FRESH_ORDER_WAIT_MS:-100}"
+
+usage() {
+    cat >&2 <<'USAGE'
+Usage:
+  cmd_adv <full-name> --prod|--demo [--live] [--over-the-air|--web-stream] [extra trader args...]
+  KALSHI_MARKET=<full-name> cmd_adv --prod|--demo [--live] [--over-the-air|--web-stream] [extra trader args...]
+
+Examples:
+  ./cmd_adv kxvancemention-26jun14 --prod --live --trade-controls
+  ./cmd_adv kxvancemention-26jun14 --prod --live --web-stream --trade-controls
+  ./cmd_adv kxvancemention-26jun14 --demo --live --trade-controls
+  KALSHI_MARKET=kxvancemention-26jun14 ./cmd_adv --prod --live --over-the-air --trade-controls
+
+Manual trade controls:
+  Always enabled by cmd_adv. Passing --trade-controls is accepted but redundant.
+  Ctrl-Y YES | Ctrl-N NO | Ctrl-B BUY | Ctrl-S SELL mode | Ctrl-D DISQUALIFY mode | Ctrl-T edit selected-side size | Ctrl-R refresh | Ctrl-E then Enter END / display (typed END is ignored)
+  Ctrl-D then autocomplete + Enter excludes one market from automatic BUY and Ctrl-E BUY NO for this run.
+  Ctrl-T edits the selected side size: Ctrl-Y/Ctrl-N, Ctrl-T, type number, Enter.
+  Ctrl-E is the only END trigger. It arms the remaining-qualified NO batch; press Enter to submit it. Typed END is ordinary text. Esc or any other key cancels it.
+  Manual control orders use simple IOC if --execution-mode ioc-ladder is supplied; Ctrl-E retains the ladder.
+
+Advanced defaults:
+  --count-yes 100
+  --count-no 100
+  --read-rate-limit 270 calls/sec
+  --write-rate-limit 20 calls/sec
+  --order-workers 2
+  --execution-mode simple
+  --ws-snapshot-max-age-ms 750
+  --ws-fresh-order-wait-ms 100
+
+Feed profiles:
+  --over-the-air  YES +3c, NO +5c (default)
+  --web-stream    YES +5c, NO +7c
+
+Environment overrides:
+  KALSHI_MARKET
+  KALSHI_TRADER
+  KALSHI_PYTHON
+  KALSHI_RATE_TIER
+  KALSHI_COUNT_YES
+  KALSHI_COUNT_NO
+  KALSHI_READ_RATE_LIMIT
+  KALSHI_WRITE_RATE_LIMIT
+  KALSHI_MAX_429_RETRIES
+  KALSHI_ORDER_WORKERS
+  KALSHI_EXECUTION_MODE
+  KALSHI_WS_SNAPSHOT_MAX_AGE_MS
+  KALSHI_WS_FRESH_ORDER_WAIT_MS
+  KALSHI_SLIPPAGE_YES
+  KALSHI_SLIPPAGE_NO
+USAGE
+}
+
+market="${KALSHI_MARKET:-}"
+
+if (( $# > 0 )) && [[ "${1:-}" != -* ]]; then
+    market="$1"
+    shift
+fi
+
+if [[ -z "$market" ]]; then
+    echo "ERROR: provide market as \$1 or set KALSHI_MARKET." >&2
+    usage
+    exit 2
+fi
+
+if [[ ! -f "$TRADER" ]]; then
+    echo "ERROR: trader script not found: $TRADER" >&2
+    echo "Set KALSHI_TRADER=/path/to/kalshi_broadcast_word_trader.py if needed." >&2
+    exit 2
+fi
+
+if [[ ! -x "$PY" ]]; then
+    echo "ERROR: Python interpreter not executable: $PY" >&2
+    echo "Expected venv at: $ROOT/venv" >&2
+    echo "Either create it or set KALSHI_PYTHON=/path/to/python." >&2
+    exit 2
+fi
+
+has_env_mode=0
+has_live=0
+feed_profile="over-the-air"
+feed_profile_explicit=0
+pass_args=()
+
+for arg in "$@"; do
+    case "$arg" in
+        --prod|--demo)
+            has_env_mode=1
+            pass_args+=("$arg")
+            ;;
+        --live)
+            has_live=1
+            pass_args+=("$arg")
+            ;;
+        --over-the-air)
+            if [[ "$feed_profile_explicit" == "1" && "$feed_profile" != "over-the-air" ]]; then
+                echo "ERROR: choose only one feed profile: --over-the-air or --web-stream." >&2
+                exit 2
+            fi
+            feed_profile="over-the-air"
+            feed_profile_explicit=1
+            ;;
+        --web-stream)
+            if [[ "$feed_profile_explicit" == "1" && "$feed_profile" != "web-stream" ]]; then
+                echo "ERROR: choose only one feed profile: --over-the-air or --web-stream." >&2
+                exit 2
+            fi
+            feed_profile="web-stream"
+            feed_profile_explicit=1
+            ;;
+        --trade-controls)
+            # Always passed below; avoid duplicate argparse flags in the final command.
+            ;;
+        --no-trade-controls)
+            echo "ERROR: cmd_adv always enables --trade-controls." >&2
+            exit 2
+            ;;
+        *)
+            pass_args+=("$arg")
+            ;;
+    esac
+done
+
+if (( has_env_mode == 0 )); then
+    echo "ERROR: pass either --prod or --demo." >&2
+    echo "Example: ./cmd_adv $market --prod --live --trade-controls" >&2
+    exit 2
+fi
+
+if (( has_live == 0 )); then
+    echo "NOTE: --live not provided; the trader will run dry." >&2
+fi
+
+if [[ -n "${KALSHI_SLIPPAGE_YES:-}" ]]; then
+    slippage_yes="$KALSHI_SLIPPAGE_YES"
+elif [[ "$feed_profile" == "web-stream" ]]; then
+    slippage_yes=5
+else
+    slippage_yes=3
+fi
+
+if [[ -n "${KALSHI_SLIPPAGE_NO:-}" ]]; then
+    slippage_no="$KALSHI_SLIPPAGE_NO"
+elif [[ "$feed_profile" == "web-stream" ]]; then
+    slippage_no=7
+else
+    slippage_no=5
+fi
+
+echo "Kalshi Advanced wrapper:"
+echo "  tier=$RATE_TIER (read bucket=600/refill=300; write bucket=600/refill=300 tokens/sec)"
+echo "  root=$ROOT"
+echo "  python=$PY"
+echo "  trader=$TRADER"
+echo "  market=$market"
+echo "  feed_profile=$feed_profile"
+echo "  trade_controls=enabled"
+echo "  count_yes=$COUNT_YES count_no=$COUNT_NO"
+echo "  slippage_yes=$slippage_yes slippage_no=$slippage_no"
+echo "  read_rate_limit=$READ_RATE_LIMIT calls/sec"
+echo "  write_rate_limit=$WRITE_RATE_LIMIT calls/sec"
+echo "  order_workers=$ORDER_WORKERS"
+echo "  execution_mode=$EXECUTION_MODE"
+echo "  extra_args=${pass_args[*]:-(none)}"
+
+exec "$PY" "$TRADER" \
+    --ws-required \
+    --refresh-seconds 0 \
+    --no-spike-detect \
+    --trade-controls \
+    --full-name "$market" \
+    --count-yes "$COUNT_YES" \
+    --count-no "$COUNT_NO" \
+    --slippage-yes "$slippage_yes" \
+    --slippage-no "$slippage_no" \
+    --read-rate-limit "$READ_RATE_LIMIT" \
+    --write-rate-limit "$WRITE_RATE_LIMIT" \
+    --max-429-retries "$MAX_429_RETRIES" \
+    --execution-mode "$EXECUTION_MODE" \
+    --order-workers "$ORDER_WORKERS" \
+    --ws-snapshot-max-age-ms "$WS_SNAPSHOT_MAX_AGE_MS" \
+    --ws-fresh-order-wait-ms "$WS_FRESH_ORDER_WAIT_MS" \
+    "${pass_args[@]}"
