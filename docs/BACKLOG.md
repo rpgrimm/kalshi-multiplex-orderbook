@@ -2,8 +2,29 @@
 
 **Last updated:** 2026-08-03  
 **Product focus:** `kalshi_broadcast_word_trader.py` first; `kx_orderbooks` as the fast multiplex engine behind it.  
-**Source of truth today:** `~/kalshi_multiplex_orderbooks_v49_exit_confirm.tar`  
-**GitHub:** `rpgrimm/kalshi-multiplex-orderbook` (empty — no push without approval)
+**Local tree:** `~/kalshi-multiplex-orderbook`  
+**GitHub:** https://github.com/rpgrimm/kalshi-multiplex-orderbook · `main` · tag `v49-import`
+
+## GitHub tracking
+
+| Issue | Title |
+|------:|-------|
+| #1 | P0: Secret & path scrub checklist |
+| #2 | P0: Owner runbook (cmd_adv) |
+| #3 | P0: Coupling audit trader ↔ kx_orderbooks |
+| #4 | P0: Safety freeze regression checklist |
+| #5 | P1: Performance baseline harness |
+| #6 | P1: Order-path quote read optimization |
+| #7 | P1: WS apply path optimization |
+| #8 | P1: Faster word-match / autocomplete |
+| #9 | P1: END NO burst scheduling |
+| #10 | P1: WS freshness gates |
+| #11 | P2: Ctrl-H in-session key help |
+| #12 | P2: DISQUALIFY + Ctrl-Y/N mode coaching |
+| #13 | P2: Modularize trader |
+| #14 | P2: Regression tests + WS fixtures |
+| #15 | P2: pyproject / dependency hygiene |
+| #16 | P3: Transcript + book replay harness |
 
 Priority legend:
 - **P0** — Do first; unblocks formalization or protects live trading
