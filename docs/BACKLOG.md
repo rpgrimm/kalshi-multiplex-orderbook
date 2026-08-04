@@ -75,8 +75,8 @@ Status: `idea` · `ready` · `specced` · `in_progress` · `done` · `blocked`
 | P2-5 | **README rewrite for v49 reality** | Current README is stacked version notes | idea | Sections: quickstart, cmd_adv, keybinds, safety, library API, perf notes. |
 | P2-6 | **pyproject / deps hygiene** | Reproducible runs | idea | Declare trader extras (`kalshi_python_sync`, etc.); optional lockfile; document venv for `cmd_adv`. |
 | P2-7 | **Owner tweak inbox (small UX/defaults)** | Explicit “little tweaks as needed” bucket | idea | Fill from owner: keybinds, default sizes/slippage, END thresholds, display density, colors, sort toggles. |
-| P2-9 | **Ctrl-H in-session key help** | Operators forget binds mid-broadcast | ready | Spec: `docs/specs/UX-001-trade-control-help-and-mode-coaching.md`. Notation like Ctrl-Y. Bind `\x08`; Backspace stays DEL `\x7f` only (today both are backspace). |
-| P2-10 | **Mode coaching: side keys in DISQUALIFY** | Ctrl-D then Ctrl-Y felt like “BUY YES”; actually side-only | ready | Same spec UX-001. Ctrl-Y/N while DISQUALIFY → message: need Ctrl-B BUY or Ctrl-S SELL first; stay in DISQUALIFY. Richer MODE entry blurb; startup hints Ctrl-H and “Y/N=side, B/S/D=mode”. |
+| P2-9 | **Ctrl-H in-session key help** | Operators forget binds mid-broadcast | done | Spec: `docs/specs/UX-001-trade-control-help-and-mode-coaching.md`. Notation like Ctrl-Y. Bind `\x08`; Backspace stays DEL `\x7f` only (today both are backspace). |
+| P2-10 | **Mode coaching: side keys in DISQUALIFY** | Ctrl-D then Ctrl-Y felt like “BUY YES”; actually side-only | done | Same spec UX-001. Ctrl-Y/N while DISQUALIFY → message: need Ctrl-B BUY or Ctrl-S SELL first; stay in DISQUALIFY. Richer MODE entry blurb; startup hints Ctrl-H and “Y/N=side, B/S/D=mode”. |
 | P2-8 | **Demo rate-limit & fill rehearsal script** | Confidence before prod perf claims | idea | Curated dry/live-demo checklist using existing `--demo-rate-limit-test` and trade-controls. |
 
 ---
@@ -114,8 +114,8 @@ _Add items here as the owner names them; promote into P2-7 or P1 if performance-
 | Date | Tweak | Priority | Status |
 |------|-------|----------|--------|
 | 2026-08-03 | Formalize project; trader-main; max speed on library+trader; small tweaks as needed | — | direction captured |
-| 2026-08-03 | Ctrl-H shows key help in display (not Ctrl-?, not plus) | P2-9 | specced (UX-001) |
-| 2026-08-03 | After Ctrl-D, Ctrl-Y/N should coach: need BUY (Ctrl-B) or SELL (Ctrl-S) mode; generally more helpful mode messages | P2-10 | specced (UX-001) |
+| 2026-08-03 | Ctrl-H shows key help in display (not Ctrl-?, not plus) | P2-9 | done (ba3b5a2) |
+| 2026-08-03 | After Ctrl-D, Ctrl-Y/N should coach: need BUY (Ctrl-B) or SELL (Ctrl-S) mode; generally more helpful mode messages | P2-10 | done (ba3b5a2) |
 
 ---
 
