@@ -54,10 +54,10 @@ Examples:
 
 Manual trade controls:
   Always enabled by cmd_adv. Passing --trade-controls is accepted but redundant.
-  Ctrl-B/S/D = mode (BUY/SELL/DISQUALIFY); Ctrl-Y/N = side only (YES/NO).
+  Ctrl-B/S/D = mode (BUY/SELL/DISQUALIFY); Ctrl-Y/N = side (YES/NO; from DISQUALIFY → BUY).
   Ctrl-T size | Ctrl-R refresh | Ctrl-H help | Ctrl-E then Enter END (typed END ignored).
   Ctrl-D then autocomplete + Enter excludes one market from automatic BUY and Ctrl-E BUY NO for this run.
-  In DISQUALIFY, Ctrl-Y/N print a coach message — press Ctrl-B or Ctrl-S before choosing side.
+  In DISQUALIFY, Ctrl-Y/N switch to BUY YES/NO and print a clear mode-change message.
   Ctrl-T edits the selected side size: Ctrl-Y/Ctrl-N, Ctrl-T, type number, Enter.
   Ctrl-E is the only END trigger. It arms the remaining-qualified NO batch; press Enter to submit it. Typed END is ordinary text. Esc or any other key cancels it.
   Manual control orders use simple IOC if --execution-mode ioc-ladder is supplied; Ctrl-E retains the ladder.

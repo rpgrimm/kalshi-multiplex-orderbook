@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VERSION: 2026-08-03-v50-ctrl-h-help
+# VERSION: 2026-08-03-v50.1-disqualify-side-to-buy
 """
 kalshi_broadcast_word_trader.py
 
@@ -69,7 +69,7 @@ Controls while running:
   With --trade-controls: Ctrl-B/S/D select action (BUY/SELL/DISQUALIFY); Ctrl-Y/N
   select side only (YES/NO). Ctrl-T edits the selected-side order size. Choose one
   market with autocomplete + Enter. Ctrl-R refreshes/display bids, asks, and positions.
-  Ctrl-H shows in-session key help. In DISQUALIFY, Ctrl-Y/N coach you to pick BUY/SELL first.
+  Ctrl-H shows in-session key help. In DISQUALIFY, Ctrl-Y/N switch you to BUY YES/NO with a clear message.
   Press Ctrl-C to arm exit confirmation; Enter exits cleanly and Esc cancels.
   By default, transcript capture is disabled and order/API file logs are buffered
   in memory during order bursts, then flushed after the queue drains or at exit.
@@ -4297,6 +4297,7 @@ def print_key_help(state: SharedBroadcastState, args) -> None:
         "  Ctrl-B  BUY mode          Ctrl-S  SELL mode",
         "  Ctrl-D  DISQUALIFY mode   (excludes market from auto YES + Ctrl-E NO)",
         "  Ctrl-Y  side YES          Ctrl-N  side NO",
+        "           (from DISQUALIFY: switches to BUY YES / BUY NO)",
         "  Ctrl-T  edit size for the current side (digits, Enter)",
         "  Ctrl-R  refresh books + positions",
         "",
@@ -4321,23 +4322,30 @@ def print_key_help(state: SharedBroadcastState, args) -> None:
     record_transcript_event(args, "help_shown", {"hotkey": "Ctrl-H"})
 
 
-def print_mode_coach_disqualify_side(state: SharedBroadcastState, args, *, side_key: str) -> None:
-    """Explain that Ctrl-Y/N are side-only while DISQUALIFY is the active action."""
-    side_label = "YES" if side_key == "yes" else "NO"
+def switch_disqualify_side_to_buy(state: SharedBroadcastState, args, *, side_key: str) -> None:
+    """From DISQUALIFY, Ctrl-Y/N jump to BUY on that side with a plain-English notice.
+
+    Operators often press Ctrl-Y after Ctrl-D expecting BUY YES. Honor that intent:
+    leave DISQUALIFY, enter BUY, set the requested side, and say what changed.
+    """
+    side_key = "yes" if str(side_key).lower() == "yes" else "no"
+    side_label = side_key.upper()
+    hotkey = "Ctrl-Y" if side_key == "yes" else "Ctrl-N"
+    state.set_trade_control(action="buy", side=side_key)
     safe_print(
         "\n"
-        + color_text("MODE COACH", "yellow", "bold")
-        + f": you are in DISQUALIFY (not trading). Ctrl-{side_label[0]} only selects side after BUY/SELL."
+        + color_text("MODE CHANGED", "green", "bold")
+        + f": left DISQUALIFY → now BUY {side_label} (via {hotkey})."
     )
-    safe_print("  Ctrl-Y / Ctrl-N only select YES/NO side after you choose an order mode.")
-    safe_print("  Press Ctrl-B for BUY or Ctrl-S for SELL, then Ctrl-Y or Ctrl-N.")
-    safe_print("  Stay in DISQUALIFY: type a market and press Enter to exclude it.")
-    safe_print("  Help: Ctrl-H")
-    print_trade_control_status(state, args, prefix="STILL")
+    safe_print(
+        f"  You were excluding markets; {hotkey} switched you into trading on the {side_label} side."
+    )
+    safe_print("  Type a market and press Enter to BUY. Ctrl-D returns to DISQUALIFY. Ctrl-S for SELL. Help: Ctrl-H")
+    print_trade_control_status(state, args, prefix="NOW")
     record_transcript_event(
         args,
-        "mode_coach_disqualify_side",
-        {"side_key": side_key, "hotkey": f"Ctrl-{side_label[0]}"},
+        "disqualify_side_switched_to_buy",
+        {"side_key": side_key, "hotkey": hotkey, "new_action": "buy"},
     )
 
 
@@ -6106,20 +6114,20 @@ def input_worker(*, args, state: SharedBroadcastState, fd: int) -> None:
         # --trade-controls is supplied.  Ctrl-S requires IXON to be disabled
         # below so terminals pass XOFF through as a normal keypress.
         if getattr(args, "trade_controls", False):
-            if ch == "\x19":  # Ctrl-Y — side YES only (does not leave DISQUALIFY)
+            if ch == "\x19":  # Ctrl-Y — side YES; from DISQUALIFY jumps to BUY YES
                 action, _side = state.trade_control_snapshot()
                 clear_input_buffers()
                 if action == "disqualify":
-                    print_mode_coach_disqualify_side(state, args, side_key="yes")
+                    switch_disqualify_side_to_buy(state, args, side_key="yes")
                 else:
                     state.set_trade_control(side="yes")
                     print_trade_control_status(state, args, prefix="SIDE")
                 continue
-            if ch == "\x0e":  # Ctrl-N — side NO only (does not leave DISQUALIFY)
+            if ch == "\x0e":  # Ctrl-N — side NO; from DISQUALIFY jumps to BUY NO
                 action, _side = state.trade_control_snapshot()
                 clear_input_buffers()
                 if action == "disqualify":
-                    print_mode_coach_disqualify_side(state, args, side_key="no")
+                    switch_disqualify_side_to_buy(state, args, side_key="no")
                 else:
                     state.set_trade_control(side="no")
                     print_trade_control_status(state, args, prefix="SIDE")
@@ -6728,7 +6736,7 @@ def print_startup_summary(args, markets: list[dict], state: SharedBroadcastState
     if getattr(args, "trade_controls", False):
         safe_print(
             color_text("Trade controls enabled", "magenta", "bold")
-            + ": Ctrl-B/S/D = mode (BUY/SELL/DISQUALIFY); Ctrl-Y/N = side only (YES/NO). "
+            + ": Ctrl-B/S/D = mode (BUY/SELL/DISQUALIFY); Ctrl-Y/N = side (YES/NO; from DISQUALIFY → BUY). "
             + "Ctrl-T size, Ctrl-R refresh, Ctrl-H help. Type to highlight; Enter confirms. "
             + "Ctrl-E arms END; Enter confirms its BUY NO batch."
         )

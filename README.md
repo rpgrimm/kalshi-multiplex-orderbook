@@ -11,7 +11,7 @@ Type-as-you-hear **Kalshi mention/broadcast trader** backed by a **single-WebSoc
 | `docs/` | Product plan, backlog, safety freeze, UX specs |
 
 **Baseline import:** v49-exit-confirm (2026-07-07).  
-**Current trader:** v50-ctrl-h-help (Ctrl-H help + DISQUALIFY mode coaching).
+**Current trader:** v50.1-disqualify-side-to-buy (Ctrl-H help; DISQUALIFY+Ctrl-Y/N → BUY with message).
 
 ## Quick start
 
@@ -57,7 +57,7 @@ Or call the script directly:
 | Key | Meaning |
 |-----|---------|
 | Ctrl-B / Ctrl-S / Ctrl-D | Action: BUY / SELL / DISQUALIFY |
-| Ctrl-Y / Ctrl-N | Side: YES / NO (not a full mode switch) |
+| Ctrl-Y / Ctrl-N | Side: YES / NO; from DISQUALIFY → BUY YES / BUY NO |
 | Ctrl-T | Edit size for current side |
 | Ctrl-R | Refresh books + positions |
 | **Ctrl-H** | In-session key help |
@@ -65,7 +65,7 @@ Or call the script directly:
 | Ctrl-C then Enter | Exit (Esc cancels) |
 | Type + Enter | Confirm highlighted market action |
 
-In **DISQUALIFY**, Ctrl-Y/N print a coach message (press Ctrl-B or Ctrl-S first). Spec: `docs/specs/UX-001-trade-control-help-and-mode-coaching.md`.
+In **DISQUALIFY**, **Ctrl-Y / Ctrl-N** switch to **BUY YES / BUY NO** and print a clear mode-change message. Spec: `docs/specs/UX-001-trade-control-help-and-mode-coaching.md`.
 
 ## Safety
 
