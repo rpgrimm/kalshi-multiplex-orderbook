@@ -12,7 +12,9 @@ set -euo pipefail
 # are token-based. Override with KALSHI_WRITE_RATE_LIMIT when testing.
 #
 # Manual trade controls are ALWAYS enabled by this wrapper.
-#   Ctrl-Y YES | Ctrl-N NO | Ctrl-B BUY | Ctrl-S SELL mode | Ctrl-D DISQUALIFY mode | Ctrl-T edit selected-side size | Ctrl-R refresh | Ctrl-E then Enter END (typed END is ignored)
+#   Ctrl-B BUY | Ctrl-S SELL | Ctrl-D DISQUALIFY | Ctrl-Y YES side | Ctrl-N NO side
+#   Ctrl-T edit selected-side size | Ctrl-R refresh | Ctrl-H help
+#   Ctrl-E then Enter END (typed END is ignored)
 # Manual control orders remain simple IOC if --execution-mode ioc-ladder is supplied; Ctrl-E retains the ladder.
 #
 # Uses this directory's venv automatically; no `source venv/bin/activate`
@@ -52,8 +54,10 @@ Examples:
 
 Manual trade controls:
   Always enabled by cmd_adv. Passing --trade-controls is accepted but redundant.
-  Ctrl-Y YES | Ctrl-N NO | Ctrl-B BUY | Ctrl-S SELL mode | Ctrl-D DISQUALIFY mode | Ctrl-T edit selected-side size | Ctrl-R refresh | Ctrl-E then Enter END / display (typed END is ignored)
+  Ctrl-B/S/D = mode (BUY/SELL/DISQUALIFY); Ctrl-Y/N = side only (YES/NO).
+  Ctrl-T size | Ctrl-R refresh | Ctrl-H help | Ctrl-E then Enter END (typed END ignored).
   Ctrl-D then autocomplete + Enter excludes one market from automatic BUY and Ctrl-E BUY NO for this run.
+  In DISQUALIFY, Ctrl-Y/N print a coach message — press Ctrl-B or Ctrl-S before choosing side.
   Ctrl-T edits the selected side size: Ctrl-Y/Ctrl-N, Ctrl-T, type number, Enter.
   Ctrl-E is the only END trigger. It arms the remaining-qualified NO batch; press Enter to submit it. Typed END is ordinary text. Esc or any other key cancels it.
   Manual control orders use simple IOC if --execution-mode ioc-ladder is supplied; Ctrl-E retains the ladder.
@@ -195,7 +199,7 @@ echo "  python=$PY"
 echo "  trader=$TRADER"
 echo "  market=$market"
 echo "  feed_profile=$feed_profile"
-echo "  trade_controls=enabled"
+echo "  trade_controls=enabled (Ctrl-H help)"
 echo "  count_yes=$COUNT_YES count_no=$COUNT_NO"
 echo "  slippage_yes=$slippage_yes slippage_no=$slippage_no"
 echo "  read_rate_limit=$READ_RATE_LIMIT calls/sec"

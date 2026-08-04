@@ -1,6 +1,6 @@
 # UX-001 — In-session help (Ctrl-H) + trade-control mode coaching
 
-**Status:** ready for implement when coding is approved  
+**Status:** implemented 2026-08-03 (trader VERSION `2026-08-03-v50-ctrl-h-help`)  
 **Priority:** P2 tweak (operator clarity) — ship with next trader change slice  
 **Source:** Owner request 2026-08-03  
 **Baseline:** v49-exit-confirm `kalshi_broadcast_word_trader.py` + `cmd_adv` (trade-controls always on)

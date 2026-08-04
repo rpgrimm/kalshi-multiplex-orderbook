@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VERSION: 2026-07-07-v49-exit-confirm
+# VERSION: 2026-08-03-v50-ctrl-h-help
 """
 kalshi_broadcast_word_trader.py
 
@@ -66,10 +66,10 @@ Controls while running:
   Press Ctrl-E, then Enter to confirm before finishing the stream and queuing BUY NO
   on un-heard words. END queues remaining NOs by lowest NO ask first by default.
   Press < to reprint remaining open markets and toggle alpha vs YES-lowest-first sort.
-  With --trade-controls: Ctrl-Y selects YES, Ctrl-N selects NO, Ctrl-B selects BUY,
-  Ctrl-S selects SELL mode, Ctrl-D selects DISQUALIFY mode, and Ctrl-T edits the
-  selected-side order size. Choose one market with autocomplete + Enter. Ctrl-R refreshes/display bids,
-  asks, and positions.
+  With --trade-controls: Ctrl-B/S/D select action (BUY/SELL/DISQUALIFY); Ctrl-Y/N
+  select side only (YES/NO). Ctrl-T edits the selected-side order size. Choose one
+  market with autocomplete + Enter. Ctrl-R refreshes/display bids, asks, and positions.
+  Ctrl-H shows in-session key help. In DISQUALIFY, Ctrl-Y/N coach you to pick BUY/SELL first.
   Press Ctrl-C to arm exit confirmation; Enter exits cleanly and Esc cancels.
   By default, transcript capture is disabled and order/API file logs are buffered
   in memory during order bursts, then flushed after the queue drains or at exit.
@@ -4289,6 +4289,84 @@ def print_trade_control_status(state: SharedBroadcastState, args, *, prefix: str
     safe_print("\n" + color_text(prefix, "magenta", "bold") + ": " + trade_control_status_line(state, args))
 
 
+def print_key_help(state: SharedBroadcastState, args) -> None:
+    """Print the in-session key help panel (Ctrl-H), then the current mode line."""
+    lines = [
+        "═══ KEY HELP ═══",
+        "Modes (pick action + side):",
+        "  Ctrl-B  BUY mode          Ctrl-S  SELL mode",
+        "  Ctrl-D  DISQUALIFY mode   (excludes market from auto YES + Ctrl-E NO)",
+        "  Ctrl-Y  side YES          Ctrl-N  side NO",
+        "  Ctrl-T  edit size for the current side (digits, Enter)",
+        "  Ctrl-R  refresh books + positions",
+        "",
+        "Trading:",
+        "  Type to filter/highlight  Enter  confirm highlighted action",
+        "  Ctrl-E then Enter         BUY NO on remaining qualified markets",
+        "  Typed END                 plain text (not a command)",
+        "",
+        "Exit / cancel:",
+        "  Ctrl-C then Enter         exit    Esc  cancel pending confirm",
+        "  Esc / other key           cancel armed END or exit confirm",
+        "",
+        "Help: Ctrl-H  (this panel)",
+        "Backspace: terminal DEL key (not Ctrl-H)",
+        "",
+        "Current: " + trade_control_status_line(state, args),
+        "════════════════",
+    ]
+    safe_print("\n" + "\n".join(lines))
+    if getattr(args, "trade_controls", False):
+        print_trade_control_status(state, args, prefix="CURRENT MODE")
+    record_transcript_event(args, "help_shown", {"hotkey": "Ctrl-H"})
+
+
+def print_mode_coach_disqualify_side(state: SharedBroadcastState, args, *, side_key: str) -> None:
+    """Explain that Ctrl-Y/N are side-only while DISQUALIFY is the active action."""
+    side_label = "YES" if side_key == "yes" else "NO"
+    safe_print(
+        "\n"
+        + color_text("MODE COACH", "yellow", "bold")
+        + f": you are in DISQUALIFY (not trading). Ctrl-{side_label[0]} only selects side after BUY/SELL."
+    )
+    safe_print("  Ctrl-Y / Ctrl-N only select YES/NO side after you choose an order mode.")
+    safe_print("  Press Ctrl-B for BUY or Ctrl-S for SELL, then Ctrl-Y or Ctrl-N.")
+    safe_print("  Stay in DISQUALIFY: type a market and press Enter to exclude it.")
+    safe_print("  Help: Ctrl-H")
+    print_trade_control_status(state, args, prefix="STILL")
+    record_transcript_event(
+        args,
+        "mode_coach_disqualify_side",
+        {"side_key": side_key, "hotkey": f"Ctrl-{side_label[0]}"},
+    )
+
+
+def print_mode_entry_coach(state: SharedBroadcastState, args, *, action: str) -> None:
+    """Print a plain-English blurb when entering BUY, SELL, or DISQUALIFY."""
+    action = str(action or "").lower()
+    if action == "disqualify":
+        safe_print(
+            color_text("MODE COACH", "cyan", "bold")
+            + ": DISQUALIFY mode — no orders. Type a market + Enter to exclude it from auto YES and Ctrl-E NO."
+        )
+        safe_print("  Press Ctrl-B for BUY or Ctrl-S for SELL to trade again. Help: Ctrl-H")
+    elif action == "sell":
+        _action, side = state.trade_control_snapshot()
+        safe_print(
+            color_text("MODE COACH", "cyan", "bold")
+            + f": SELL mode — type an owned market + Enter for reduce-only close on side {side.upper()}."
+        )
+        safe_print("  Ctrl-Y/N pick side. Help: Ctrl-H")
+    else:
+        _action, side = state.trade_control_snapshot()
+        safe_print(
+            color_text("MODE COACH", "cyan", "bold")
+            + f": BUY mode — type a market + Enter to buy {side.upper()}."
+        )
+        safe_print("  Ctrl-Y/N pick side only; Ctrl-B/S/D change action. Help: Ctrl-H")
+    print_trade_control_status(state, args, prefix="MODE CHANGED")
+
+
 def print_trade_control_board(state: SharedBroadcastState, args, *, heading: str = "TRADE CONTROL BOOK") -> None:
     """Print selected mode, cached positions, and current WS best books."""
     safe_print("\n" + color_text(heading, "yellow", "bold") + ": " + trade_control_status_line(state, args))
@@ -4319,7 +4397,7 @@ def print_trade_control_board(state: SharedBroadcastState, args, *, heading: str
     safe_print(
         "  "
         + color_text("Controls", "cyan", "bold")
-        + ": Ctrl-Y YES, Ctrl-N NO, Ctrl-B BUY, Ctrl-S SELL, Ctrl-D DISQUALIFY, Ctrl-T edit selected-side size, Ctrl-R refresh/display"
+        + ": Ctrl-B/S/D action, Ctrl-Y/N side, Ctrl-T size, Ctrl-R refresh, Ctrl-H help"
         + suffix
     )
     safe_print("  " + color_text("Current", "cyan", "bold") + ": " + trade_control_status_line(state, args))
@@ -5982,7 +6060,12 @@ def input_worker(*, args, state: SharedBroadcastState, fd: int) -> None:
                 clear_input_buffers()
                 print_trade_control_status(state, args, prefix="ORDER SIZE CHANGED")
                 continue
-            if ch in ("\x7f", "\b"):
+            if ch == "\x08":  # Ctrl-H help (not backspace)
+                cancel_size_edit("help")
+                clear_input_buffers()
+                print_key_help(state, args)
+                continue
+            if ch == "\x7f":  # Backspace / DEL only
                 size_edit_buffer = size_edit_buffer[:-1]
                 print_size_edit_prompt()
                 continue
@@ -5992,6 +6075,16 @@ def input_worker(*, args, state: SharedBroadcastState, fd: int) -> None:
                 continue
             cancel_size_edit("non-number key pressed")
             clear_input_buffers()
+            continue
+
+        # Ctrl-H: in-session key help. ASCII BS (\x08) is help, not backspace.
+        # Terminal Backspace is expected as DEL (\x7f).
+        if ch == "\x08":
+            cancel_pending_end_confirmation(state=state, args=args, reason="help")
+            if size_edit_side is not None:
+                cancel_size_edit("help")
+            clear_input_buffers()
+            print_key_help(state, args)
             continue
 
         # An armed END batch must never survive unrelated typing or mode changes.
@@ -6013,34 +6106,50 @@ def input_worker(*, args, state: SharedBroadcastState, fd: int) -> None:
         # --trade-controls is supplied.  Ctrl-S requires IXON to be disabled
         # below so terminals pass XOFF through as a normal keypress.
         if getattr(args, "trade_controls", False):
-            if ch == "\x19":  # Ctrl-Y
-                state.set_trade_control(side="yes")
+            if ch == "\x19":  # Ctrl-Y — side YES only (does not leave DISQUALIFY)
+                action, _side = state.trade_control_snapshot()
                 clear_input_buffers()
-                print_trade_control_status(state, args, prefix="MODE CHANGED")
+                if action == "disqualify":
+                    print_mode_coach_disqualify_side(state, args, side_key="yes")
+                else:
+                    state.set_trade_control(side="yes")
+                    print_trade_control_status(state, args, prefix="SIDE")
                 continue
-            if ch == "\x0e":  # Ctrl-N
-                state.set_trade_control(side="no")
+            if ch == "\x0e":  # Ctrl-N — side NO only (does not leave DISQUALIFY)
+                action, _side = state.trade_control_snapshot()
                 clear_input_buffers()
-                print_trade_control_status(state, args, prefix="MODE CHANGED")
+                if action == "disqualify":
+                    print_mode_coach_disqualify_side(state, args, side_key="no")
+                else:
+                    state.set_trade_control(side="no")
+                    print_trade_control_status(state, args, prefix="SIDE")
                 continue
             if ch == "\x02":  # Ctrl-B
                 state.set_trade_control(action="buy")
                 clear_input_buffers()
-                print_trade_control_status(state, args, prefix="MODE CHANGED")
+                print_mode_entry_coach(state, args, action="buy")
                 continue
             if ch == "\x13":  # Ctrl-S
                 state.set_trade_control(action="sell")
                 clear_input_buffers()
-                print_trade_control_status(state, args, prefix="MODE CHANGED")
+                print_mode_entry_coach(state, args, action="sell")
                 continue
             if ch == "\x04":  # Ctrl-D
                 state.set_trade_control(action="disqualify")
                 clear_input_buffers()
-                print_trade_control_status(state, args, prefix="MODE CHANGED")
+                print_mode_entry_coach(state, args, action="disqualify")
                 continue
             if ch == "\x14":  # Ctrl-T
                 cancel_pending_end_confirmation(state=state, args=args, reason="size edit")
                 clear_input_buffers()
+                action, side = state.trade_control_snapshot()
+                if action == "disqualify":
+                    safe_print(
+                        "\n"
+                        + color_text("MODE COACH", "cyan", "bold")
+                        + f": editing {side.upper()} size while in DISQUALIFY; sizes apply when you return to BUY/SELL."
+                    )
+                    safe_print("  Help: Ctrl-H")
                 begin_size_edit()
                 continue
             if ch == "\x12":  # Ctrl-R
@@ -6124,8 +6233,8 @@ def input_worker(*, args, state: SharedBroadcastState, fd: int) -> None:
                 refresh_suggestions()
             continue
 
-        # Backspace/delete support.
-        if ch in ("\x7f", "\b"):
+        # Backspace/delete support. DEL (\x7f) only — Ctrl-H (\x08) is help above.
+        if ch == "\x7f":
             raw_token = raw_token[:-1]
             recent_norm = recent_norm[:-1]
             recent_compact = recent_compact[:-1]
@@ -6619,8 +6728,11 @@ def print_startup_summary(args, markets: list[dict], state: SharedBroadcastState
     if getattr(args, "trade_controls", False):
         safe_print(
             color_text("Trade controls enabled", "magenta", "bold")
-            + ": Ctrl-Y YES, Ctrl-N NO, Ctrl-B BUY, Ctrl-S SELL mode, Ctrl-D DISQUALIFY mode, Ctrl-T edit selected-side size. Type to highlight; Enter confirms BUY/SELL/DISQUALIFY. Ctrl-E arms END; Enter confirms its BUY NO batch. Ctrl-R refresh/display."
+            + ": Ctrl-B/S/D = mode (BUY/SELL/DISQUALIFY); Ctrl-Y/N = side only (YES/NO). "
+            + "Ctrl-T size, Ctrl-R refresh, Ctrl-H help. Type to highlight; Enter confirms. "
+            + "Ctrl-E arms END; Enter confirms its BUY NO batch."
         )
+        print_trade_control_status(state, args, prefix="STARTING MODE")
 
     with state.lock:
         trigger_aliases = sorted(state.word_to_keys.keys())
@@ -7419,9 +7531,10 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Enable manual side/action controls: Ctrl-Y YES, Ctrl-N NO, Ctrl-B BUY, "
-            "Ctrl-S SELL mode, Ctrl-D DISQUALIFY mode, Ctrl-T edit selected-side size. With these controls, typing only highlights a market; "
-            "Enter is required to select it for BUY, SELL, or DISQUALIFY. Ctrl-R refreshes/displays positions and books. "
+            "Enable manual side/action controls: Ctrl-B BUY, Ctrl-S SELL, Ctrl-D DISQUALIFY, "
+            "Ctrl-Y YES side, Ctrl-N NO side, Ctrl-T edit selected-side size, Ctrl-H help. "
+            "With these controls, typing only highlights a market; Enter is required to select it "
+            "for BUY, SELL, or DISQUALIFY. Ctrl-R refreshes/displays positions and books. "
             "Default: disabled."
         ),
     )
