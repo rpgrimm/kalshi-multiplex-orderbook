@@ -22,6 +22,8 @@ Status: `idea` · `ready` · `specced` · `in_progress` · `done` · `blocked` �
 | S1-4 | Candidate series registry (NFL game-scoped) | Completeness | done | Priority list + auto KXNFL filter |
 | S1-5 | 429 backoff + concurrency limits on discovery | Reliability | done | Retry/backoff + inter-series pause |
 | S1-6 | Coverage summary line | Trust | done | Coverage-by-series block |
+| S1-7 | WebSocket books after discovery (`--watch`) | Save REST for orders | done | Uses `kx_orderbooks` multiplex WS; catalog still REST |
+| S1-8 | Cut discovery 429s (priority series + `/events` nested) | Operator pain | done | Default no longer scans all KXNFL series |
 | S2-1 | Category classifier v1 | Navigation prep | idea | game lines / player props / team props / game props |
 | S2-2 | Grouped print / section headers | Readability | idea | |
 | S3-1 | Keyboard browser (shortcuts) | Core UX | idea | Inspired by broadcast trader; iterate with owner |
@@ -84,3 +86,4 @@ Carry-forward from previous backlog; do not starve sports unless owner repriorit
 | 2026-09-13 | Include all statuses by default (`--status all`) |
 | 2026-09-13 | Public REST discovery for slice 1 |
 | 2026-09-13 | Docs push approved |
+| 2026-09-13 | Live sports books via Trade API WebSocket (`--watch`); REST catalog only |
