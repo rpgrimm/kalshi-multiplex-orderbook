@@ -686,7 +686,7 @@ def run_watch(
     last_summary = time.time()
     try:
         while not stop:
-            store.wait(timeout=1.0)
+            store.wait_for_update(timeout=1.0)
             if print_every > 0 and time.time() - last_summary >= print_every:
                 last_summary = time.time()
                 print("\n--- TOP BOOKS ---")
