@@ -4,7 +4,8 @@ Type-as-you-hear **Kalshi mention/broadcast trader** backed by a **single-WebSoc
 
 | Piece | Role |
 |-------|------|
-| `kalshi_broadcast_word_trader.py` | Main product — live operator tool |
+| `kalshi_broadcast_word_trader.py` | Mention/broadcast trader — live operator tool |
+| `kalshi_sports_trader.py` | Sports game trader (slice 1: list related markets) |
 | `kx_orderbooks/` | Multiplex orderbook engine (one WS, many markets) |
 | `cmd_adv` | Advanced-tier launcher (trade-controls always on) |
 | `examples/` | Library watch / poll / callback demos |

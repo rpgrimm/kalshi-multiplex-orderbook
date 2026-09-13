@@ -15,13 +15,13 @@ Status: `idea` · `ready` · `specced` · `in_progress` · `done` · `blocked` �
 | ID | Item | Why | Status | Notes |
 |----|------|-----|--------|-------|
 | S0-1 | Takeover plan + backlog refresh | New factory direction | done | docs updated 2026-09-13 |
-| S0-2 | Confirm script filename spelling | Avoid churn | ready | Owner wrote `kalsh_...`; recommend `kalshi_sports_trader.py` |
-| S1-1 | **Slice 1 spec: game → print all related markets** | First build | ready | Input parse, series×game_code discovery, print format, backoff |
-| S1-2 | **Implement `kalshi_sports_trader.py` lister MVP** | Owner-testable | ready | No TUI/orders; public REST pagination; print tickers/titles |
-| S1-3 | Game-code parser + URL tail accept | UX | ready | `kxnflgame-26sep13atlpit` / full URL / mixed case |
-| S1-4 | Candidate series registry (NFL game-scoped) | Completeness | ready | Seed from known hits; don’t scan all season-long series blindly |
-| S1-5 | 429 backoff + concurrency limits on discovery | Reliability | ready | Easy to trip unauthenticated fan-out |
-| S1-6 | Coverage summary line | Trust | ready | counts by series + total markets + elapsed |
+| S0-2 | Confirm script filename spelling | Avoid churn | done | Owner confirmed `kalshi_sports_trader.py` |
+| S1-1 | **Slice 1 spec: game → print all related markets** | First build | done | Implemented in script docstring + CLI |
+| S1-2 | **Implement `kalshi_sports_trader.py` lister MVP** | Owner-testable | done | ~791 markets / 57 series on ATL@PIT probe |
+| S1-3 | Game-code parser + URL tail accept | UX | done | |
+| S1-4 | Candidate series registry (NFL game-scoped) | Completeness | done | Priority list + auto KXNFL filter |
+| S1-5 | 429 backoff + concurrency limits on discovery | Reliability | done | Retry/backoff + inter-series pause |
+| S1-6 | Coverage summary line | Trust | done | Coverage-by-series block |
 | S2-1 | Category classifier v1 | Navigation prep | idea | game lines / player props / team props / game props |
 | S2-2 | Grouped print / section headers | Readability | idea | |
 | S3-1 | Keyboard browser (shortcuts) | Core UX | idea | Inspired by broadcast trader; iterate with owner |
@@ -74,3 +74,13 @@ Carry-forward from previous backlog; do not starve sports unless owner repriorit
 - Pushing commits / opening PRs
 - Live order placement
 - Editing mention-trader behavior
+
+## Decisions log
+
+| Date | Decision |
+|------|----------|
+| 2026-09-13 | Script name: `kalshi_sports_trader.py` |
+| 2026-09-13 | NFL-first vertical OK |
+| 2026-09-13 | Include all statuses by default (`--status all`) |
+| 2026-09-13 | Public REST discovery for slice 1 |
+| 2026-09-13 | Docs push approved |
