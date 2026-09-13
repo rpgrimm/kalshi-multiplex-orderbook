@@ -1,209 +1,199 @@
-# Product Plan — kalshi-multiplex-orderbook
+# Product Plan — kalshi-multiplex-orderbook (factory takeover)
 
-**Status:** Initial plan (2026-08-03)  
-**Owner direction:** Formalize the project; primary product is `kalshi_broadcast_word_trader.py`; keep `kx_orderbooks` and the trader **as fast as possible**; apply small tweaks as needed.  
-**Constraints:** No code/publish in this planning pass. GitHub `rpgrimm/kalshi-multiplex-orderbook` exists but is empty. Canonical local source today: `~/kalshi_multiplex_orderbooks_v49_exit_confirm.tar` (v49-exit-confirm, 2026-07-07).
-
----
-
-## 1. One-sentence product
-
-A **latency-sensitive, terminal-first Kalshi broadcast/mention trader** that multiplexes live orderbooks for an entire series/event on one WebSocket and lets the operator type words as they hear them to buy YES, then confirm a gated BUY NO sweep on the rest.
+**Status:** Takeover plan (2026-09-13)
+**Owner:** rpgrimm
+**Repo:** https://github.com/rpgrimm/kalshi-multiplex-orderbook
+**Local tree:** factory `product-repo` clone (no push in this planning pass)
 
 ---
 
-## 2. Primary user & job-to-be-done
+## 1. One-sentence product (updated)
 
-| | |
-|---|---|
-| **User** | Solo operator (owner) during live broadcasts / mention markets |
-| **Job** | Hear a word → commit capital on the matching market **immediately** with correct book pricing, without fighting the UI or missing the rest of the board at END |
-| **Environment** | Local terminal, prod or demo Kalshi API, Advanced-tier rate limits via `cmd_adv` |
-| **Success feeling** | “I typed it, it armed/filled fast, books were fresh, nothing dangerous fired without confirmation.” |
+A **terminal-first Kalshi operator toolkit**: keep the battle-tested **mention/broadcast trader**, and add a new **sports game trader** that lets the owner jump a live game’s lines/props with keyboard-heavy navigation and fast order entry.
 
 ---
 
-## 3. Product shape (what we are formalizing)
+## 2. What already exists
 
-### 3.1 Main product (P0 focus)
+| Asset | State |
+|-------|-------|
+| `kalshi_broadcast_word_trader.py` (~8.1k lines, v50.1) | Main mention/broadcast product; type-as-you-hear YES + gated END NO |
+| `cmd_adv` | Advanced-tier launcher / trade-control defaults |
+| `kx_orderbooks/` | Single-WS multiplex orderbook library |
+| `examples/` | Series watch / poll / callback demos |
+| `docs/` | Prior product plan, backlog, safety freeze, UX-001 |
+| GitHub `main` | Imported and active (not empty) |
 
-**`kalshi_broadcast_word_trader.py`** — the live operator tool.
-
-Core loop:
-1. Resolve series/event → load open mention markets.
-2. Start **one** multiplexed orderbook WebSocket for all tickers.
-3. Read keystrokes; match market words/aliases from the typed tail.
-4. Queue **BUY YES** on heard markets (mark heard even if order fails — safety).
-5. **Ctrl-E → Enter** confirms **BUY NO** on remaining markets under safety gates.
-6. Optional manual trade controls (YES/NO/BUY/SELL/DISQUALIFY/size/refresh).
-7. Dry-run by default; `--demo`/`--prod` required; `--live` for real orders.
-8. Clean exit is confirmed (**Ctrl-C → Enter**).
-
-**`cmd_adv`** — preferred launch wrapper (Advanced defaults, trade-controls always on, OTA vs web-stream slippage profiles).
-
-### 3.2 Supporting library (critical dependency, not a separate product yet)
-
-**`kx_orderbooks`** — multiplex orderbook engine used (or to be cleanly used) by the trader:
-
-- Auth WS handshake
-- Single-socket subscribe to many `market_tickers` with `use_yes_price=true`
-- Snapshot/delta books, best quotes, dynamic add/delete/snapshot refresh
-- Thread-safe store + callback/poll APIs
-
-Formalization goal: library stays a **fast, tight dependency** of the trader — not a science project, not abandoned glue.
-
-### 3.3 Non-products (for now)
-
-Unless owner reopens scope:
-- GUI / web dashboard
-- Multi-user or hosted SaaS
-- Speech-to-text automation (typing remains the input)
-- Multi-exchange aggregation
-- Fully autonomous market-making
-- Public packaging/PyPI release process beyond making the monorepo healthy
+Prior factory focus: formalize + speed/safety on the **mention** path. Several backlog items remain open (perf baselines, coupling audit, modularization, tests).
 
 ---
 
-## 4. Current state assessment
+## 3. New owner direction (this factory)
 
-### Strengths
-- Real, battle-evolved operator UX (v47–v49 safety: Ctrl-E confirm, typed END inert, exit confirm, disqualify, size controls).
-- Correct architectural instinct: **one WS, many books**, YES-price scale.
-- Serious production concerns already encoded: rate limits, 429 backoff, deferred logging during bursts, WS freshness gates, IOC vs ladder, positions/reduce-only sells.
-- Clear dry-run vs live split and demo/prod endpoint selection.
+### Goal
+CLI for trading **sports events as they happen** — game lines, player props, team props, game props — with efficient keyboard navigation and autocomplete.
 
-### Risks / drag
-- **Empty GitHub** vs ~8k-line trader + library only in a tarball — no history, no issues, no CI, easy to lose the canonical tree.
-- **Monolith trader** (~8022 lines) mixes I/O, strategy, terminal UI, order protocol, and ops concerns → harder to optimize and test hot paths safely.
-- **Library vs trader coupling** unclear at import time (package exists; trader is large enough it may duplicate or only partially lean on the package).
-- **No automated tests** visible in the tarball.
-- **Docs fragmented** (README stacks v47/v48/v49 notes).
-- Performance work without baselines will thrash: need measurements before “make faster.”
+### New entrypoint
+`kalshi_sports_trader.py`
+- Owner message also wrote `kalsh_sports_trader.py` (typo?). Default to **`kalshi_sports_trader.py`** unless owner insists otherwise.
+- Inspiration: `kalshi_broadcast_word_trader.py` (text-focused, shortcut-heavy), but **do not** start by forking the whole monolith.
 
-### Performance-sensitive surfaces (hypotheses to verify)
-1. WS message parse → book apply → best quote read on order path  
-2. Order worker queue depth / lock contention under burst YES then END NO  
-3. Keystroke matching / autocomplete over large market lists  
-4. Logging and API stats during write bursts  
-5. Snapshot freshness waits before submit  
-6. REST fallbacks when WS quote is stale  
-7. Python startup + market discovery time before first keystroke is useful  
+### Target UX (multi-iteration)
+1. Accept a game/event id such as `kxnflgame-26sep13atlpit` (from URL tail).
+2. Discover **all markets associated with that game**.
+3. Present a keyboard UI to navigate categories:
+   - Game lines
+   - Player props
+   - Team props
+   - Game props
+4. Autocomplete wherever possible.
+5. Later: submit orders (still dry-run by default; live explicit).
+
+### Operating style
+- **Small iterations**
+- Owner tests each slice
+- No big-bang rewrite
+
+---
+
+## 4. Critical discovery fact (blocks naive v1)
+
+For `KXNFLGAME-26SEP13ATLPIT`:
+
+- `GET /markets?event_ticker=KXNFLGAME-26SEP13ATLPIT` → **only moneyline** (2 markets: ATL / PIT)
+- Related books live under **other series** with the **same game code** `26SEP13ATLPIT`, e.g.:
+  - `KXNFLSPREAD-26SEP13ATLPIT`
+  - `KXNFLTOTAL-26SEP13ATLPIT`
+  - `KXNFLTEAMTOTAL-26SEP13ATLPIT`
+  - `KXNFLREC-26SEP13ATLPIT`, `KXNFLPASSYDS-…`, `KXNFLRSHYDS-…`, `KXNFLFIRSTTD-…`, quarters/halves, etc.
+
+So “markets for this game” means:
+
+```text
+parse input → series + game_code
+enumerate candidate sports series (NFL/league family)
+for each series: query event_ticker = SERIES-GAMECODE (paginate)
+merge + classify + print
+```
+
+Not: “only markets under the KXNFLGAME event ticker.”
+
+Rate limits: naive fan-out across ~100 series will 429. Need caching, bounded candidate sets, backoff, and/or smarter series filters.
 
 ---
 
 ## 5. Product principles
 
-1. **Trader-first.** Library changes earn their keep by making the trader faster, safer, or simpler.
-2. **Speed with safety.** Faster paths must not weaken confirmations, heard-marking, dry-run defaults, or price clamps.
-3. **Measure, then cut.** Every performance claim needs a before/after on a named path (e.g. delta→best, keystroke→queue, queue→submit).
-4. **Small tweaks over rewrites.** Prefer surgical wins inside the working v49 behavior.
-5. **Demo before prod.** Performance and behavior validation on demo/`--live` demo where possible; prod changes explicit.
-6. **No silent publish.** Repo import, pushes, releases only with owner approval.
+1. **Sports trader is additive** — don’t break mention-trader safety freeze while building sports.
+2. **Steal patterns, not the whole file** — reuse auth/host, public REST pagination ideas, keyboard philosophy; keep sports script thin at first.
+3. **Read path before write path** — discovery → browse → quotes → orders.
+4. **Dry-run default** when orders appear; `--demo`/`--prod` + `--live` discipline stays.
+5. **Iterate with owner at the keyboard** — each slice must be manually testable.
+6. **No publish/spend/live-prod changes** without explicit approval.
 
 ---
 
-## 6. Goals
+## 6. Architecture direction (evolutionary)
 
-### Near-term (formalize + baseline)
-- Canonical tree in git (local first; GitHub when owner approves).
-- Clear package layout: `kx_orderbooks` + trader + `cmd_adv` + examples.
-- Documented runbook for demo/prod dry-run/live.
-- Performance baseline harness for hot paths.
-- Inventory coupling: trader → library call graph; eliminate accidental duplication where it costs latency or correctness.
+```text
+kalshi_sports_trader.py          (new operator app)
+  ├── CLI parse game id / URL tail
+  ├── sports_discovery             (series×game_code market gather)
+  ├── category classifier          (game lines / player / team / game props)
+  ├── text UI + keybindings + autocomplete   (later slices)
+  ├── order entry (later)          (reuse safety gates mindset)
+  └── optional kx_orderbooks       (when live quotes needed)
 
-### Mid-term (fast path)
-- Reduce lock/queue/copy overhead on book updates and order pricing reads.
-- Keep END/YES bursts within Advanced-tier limits without artificial slowness.
-- Faster word match / autocomplete on large boards.
-- Tighter WS freshness without extra RTTs when book is already good.
-- Small UX/safety tweaks as owner requests (confirmations, defaults, display).
-
-### Longer-term (only if needed)
-- Split trader modules (input / orders / quotes / state) **without** behavior drift.
-- Optional replay harness from transcripts + recorded books.
-- Public-ready library docs — only if owner wants external use.
-
----
-
-## 7. Non-goals (initial)
-
-- Rewriting in another language unless measurement proves Python is the ceiling *and* owner wants that cost.
-- Changing Kalshi market selection strategy beyond mention/broadcast workflow.
-- Cloud deployment, always-on bots, or unattended live trading.
-- Expanding to non-mention market types before the mention path is formalized and fast.
-
----
-
-## 8. Architecture sketch (target, evolutionary)
-
-```
-cmd_adv / CLI
-    │
-    ▼
-kalshi_broadcast_word_trader  (operator app)
-    ├── terminal input + confirms
-    ├── word/alias match
-    ├── order queue workers + rate limits
-    ├── positions / REST helpers
-    └── quote access ──────────────► kx_orderbooks
-                                        ├── discovery
-                                        ├── MultiplexOrderbookWorker (1 WS)
-                                        ├── OrderbookStore (apply snapshot/delta)
-                                        └── BestQuote / views
+kalshi_broadcast_word_trader.py (existing; maintain)
+kx_orderbooks/                   (shared engine)
 ```
 
-**Performance boundary:**  
-Anything on the path `WS frame → apply → best quote → order price → submit` is sacred. UI chrome and deferred logs stay off that path.
+Shared library extraction only when duplication hurts (discovery helpers, auth, REST pagination).
 
 ---
 
-## 9. Operating model (this factory)
+## 7. Near-term goals
 
-| Role | Agent | Responsibility |
-|------|--------|----------------|
-| Coordinator | `kalshi-multiplex-orderbook-factory` (Ledger) | Plan, backlog, owner interview, prioritization |
-| Spec | `...-spec` | Turn backlog items into precise change specs |
-| Implement | `...-implement` | Code changes in attached workspace/repo |
-| Verify | `...-verify` | Tests, perf checks, regression of safety behavior |
-| Ship | `...-ship` | Packaging, commits, PRs — only with approval |
+### Slice 0 — Planning (this pass)
+- Attach repo, capture direction, backlog, discovery reality
 
-Until a working tree is imported into a repo workspace, coordinator stays on **planning, specs, backlog**.
+### Slice 1 — Market lister (FIRST BUILD)
+- Input: `kxnflgame-26sep13atlpit` (case-insensitive; allow URL or bare id)
+- Resolve game code + league family
+- Fetch associated markets across relevant series
+- Print a clear text listing (ticker, title, series/event, status)
+- Handle pagination + basic 429 backoff
+- No orders, no curses UI yet
 
----
+### Slice 2 — Classification
+- Bucket into game lines / player props / team props / game props
+- Stable sorting + counts per bucket
 
-## 10. Success metrics
+### Slice 3 — Keyboard browser
+- Navigate buckets and markets with shortcuts
+- Filter/autocomplete on player/team/line text
 
-| Metric | Intent |
-|--------|--------|
-| Time to first useful keystroke | Discovery + WS subscribe + initial snapshots |
-| WS delta → readable best quote | Book hot path |
-| Heard-word → order enqueued | Input/match/queue path |
-| Enqueued → submit attempt | Worker + rate limiter |
-| END confirm → first NO submit | Burst path |
-| Safety regressions | Zero: dry-run default, confirms, heard semantics, clamps |
-| Operator trust | Owner willing to run `cmd_adv --prod --live` without fear of UX footguns |
+### Slice 4 — Quotes
+- Subscribe selected markets via `kx_orderbooks` multiplex WS
+- Show top-of-book in the text UI
 
-Exact numeric targets TBD after first baseline run on owner hardware/network.
-
----
-
-## 11. Open decisions (need owner input when relevant)
-
-1. GitHub visibility: keep public empty repo vs private for trader secrets-adjacent ops docs?
-2. Is v49 tarball the sole canonical source, or merge bits from older trees?
-3. Preferred Python version / deploy host for live sessions?
-4. Which tweaks are already on your mental list (display, defaults, keybinds, END gates, sizes)?
-5. Acceptable risk for live prod perf experiments vs demo-only?
+### Slice 5 — Order actions
+- Keyboard order entry with dry-run default and confirmations
+- Start narrow (single market IOC) before fancy batch flows
 
 ---
 
-## 12. Immediate recommended sequence
+## 8. Non-goals (for now)
 
-1. **Import plan** — unpack v49 into a clean monorepo layout (no publish yet).  
-2. **Safety freeze checklist** — behaviors that tests/specs must not break.  
-3. **Perf baseline** — instrument or microbench the hot paths.  
-4. **Fastest safe wins** — eliminate obvious copies/contention/log I/O on order path.  
-5. **Small tweaks** — owner-directed UX/defaults, one at a time.  
-6. **GitHub** — push only after owner review of tree + scrubbed secrets.
+- Replacing or rewriting the mention trader
+- GUI/web dashboard
+- Autonomous in-game botting / unattended live trading
+- Speech-to-text
+- Multi-league perfection on day one (NFL game path first is enough)
+- PyPI release
 
-See `docs/BACKLOG.md` for prioritized items.
+---
+
+## 9. Risks
+
+| Risk | Mitigation |
+|------|------------|
+| Incomplete market set if series list is wrong | Start with known hit series + expandable registry; print series coverage stats |
+| 429s during discovery | Backoff, concurrency limit, cache series list, optional `--series` filter |
+| Category mislabels | Heuristic v1 from series ticker/title; owner-correctable mapping table |
+| Monolith gravity | New file; extract shared utils only with clear specs |
+| Safety regressions on mention path | Don’t edit mention hot path unless required; keep SAFETY_FREEZE |
+
+---
+
+## 10. Success metrics (early)
+
+- Given `kxnflgame-26sep13atlpit`, lister returns moneyline **and** spreads/totals/props families, not just 2 markets
+- Runtime acceptable for pre-game warm-up (target: tens of seconds max with backoff, improve later)
+- Owner can scan the printout and say “yes, that’s the board”
+- Later: keystroke path feels as deliberate as the broadcast trader
+
+---
+
+## 11. Open questions for owner
+
+1. Confirm script name: `kalshi_sports_trader.py` vs `kalsh_sports_trader.py`
+2. NFL-only for first vertical, or also NBA/MLB/etc. immediately?
+3. Should “associated markets” include closed/settled, or open/active only? (default: open/active)
+4. Preferred auth for discovery-only: public REST unauthenticated (like mention trader’s public market fetch) vs always signed SDK?
+5. When we add orders: demo-first only for a while?
+6. Any must-keep keybind philosophy from broadcast trader (Ctrl-Y/N side, Ctrl-B/S mode, etc.)?
+
+---
+
+## 12. Factory operating model
+
+| Role | Agent |
+|------|-------|
+| Coordinator | `kalshi-multiplex-orderbook-foreman` |
+| Spec | `...-spec` |
+| Implement | `...-implement` |
+| Verify | `...-verify` |
+| Ship | `...-ship` |
+
+No unsolicited cron/autonomy. Ship/publish only on explicit approval.
