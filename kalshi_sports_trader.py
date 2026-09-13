@@ -21,6 +21,7 @@ REST orderbooks continuously.
 
 Examples:
     ./kalshi_sports_trader.py kxnflgame-26sep13atlpit
+    ./kalshi_sports_trader.py kxnflgame-26sep13atlpit --browse
     ./kalshi_sports_trader.py kxnflgame-26sep13atlpit --watch
     ./kalshi_sports_trader.py kxnflgame-26sep13atlpit --watch --watch-limit 40
 
@@ -37,13 +38,16 @@ import json
 import os
 import random
 import re
+import select
 import signal
 import sys
+import termios
 import time
+import tty
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 DEFAULT_REST_HOST = "https://api.elections.kalshi.com/trade-api/v2"
@@ -745,11 +749,767 @@ def print_discovery_text(
             print(f"  ... {len(errors) - 30} more")
 
 
+
+CATEGORY_ORDER = (
+    "game_lines",
+    "player_props",
+    "team_props",
+    "game_props",
+    "other",
+)
+
+CATEGORY_LABELS = {
+    "game_lines": "Game lines",
+    "player_props": "Player props",
+    "team_props": "Team props",
+    "game_props": "Game props",
+    "other": "Other",
+}
+
+
+def classify_market(row: MarketRow) -> str:
+    """Bucket a market into the sports browser categories."""
+    series = (row.series_ticker or "").upper()
+    title = f"{row.title} {row.yes_sub_title} {row.no_sub_title}".lower()
+
+    if any(tok in series for tok in ("TEAMTOTAL", "TEAMTD", "TEAMYDS", "TEAMSACK", "FIRSTTDTEAM")):
+        return "team_props"
+    if series.endswith("TEAM") and "GAME" not in series:
+        return "team_props"
+
+    player_series = (
+        "PASSYDS", "PASSTDS", "PASSATT", "PASSCOMP", "PASSINT",
+        "RSHYDS", "RSHATT", "REC", "RECYDS", "RRYDS",
+        "ANYTD", "FIRSTTD", "FFPTS", "LONGREC", "LONGRSH",
+        "MOSTREC", "MOSTRSH", "TOTALTD",
+    )
+    if any(tok in series for tok in player_series):
+        # FIRSTTDTEAM already handled; bare FIRSTTD is player props
+        if "TEAM" in series and "FIRSTTDTEAM" not in series and series.endswith("TEAM"):
+            return "team_props"
+        return "player_props"
+    if "player" in title or re.search(r"\b(qb|rb|wr|te)\b", title):
+        return "player_props"
+
+    game_line_series = (
+        "GAME", "SPREAD", "TOTAL", "WINMARGIN", "MONEYLINE", "ML",
+        "1H", "2H", "1Q", "2Q", "3Q", "4Q",
+    )
+    # TEAMTOTAL already returned; plain TOTAL/SPREAD/GAME are lines
+    if any(tok in series for tok in game_line_series) and "TEAM" not in series:
+        # quarters/halves totals/spreads are still game lines
+        if not any(tok in series for tok in ("PASS", "RSH", "REC", "TD", "FG", "SACK", "FFPTS")):
+            return "game_lines"
+        # e.g. unexpected mix
+    if series in {"KXNFLGAME", "KXNFLSPREAD", "KXNFLTOTAL", "KXNFLWINMARGIN"} or re.fullmatch(r"KXNFL[1234]Q(SPREAD|TOTAL)?", series) or re.fullmatch(r"KXNFL[12]H(SPREAD|TOTAL|FT)?", series):
+        return "game_lines"
+
+    game_prop_series = (
+        "BOTH", "GAMESPECIALS", "GAMETD", "GAMEFG", "GAMESACK", "FG", "SACK", "TD",
+    )
+    if any(tok in series for tok in game_prop_series):
+        return "game_props"
+
+    return "other"
+
+
+def market_haystack(row: MarketRow) -> str:
+    return " ".join(
+        [
+            row.ticker,
+            row.title,
+            row.yes_sub_title,
+            row.no_sub_title,
+            row.series_ticker,
+            row.event_ticker,
+            row.status,
+            CATEGORY_LABELS.get(classify_market(row), ""),
+        ]
+    ).lower()
+
+
+def short_label(text: str, max_len: int = 56) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max(1, max_len - 1)] + "…"
+
+
+@dataclass
+class QuoteSnap:
+    yes_bid: int | None = None
+    yes_ask: int | None = None
+    no_bid: int | None = None
+    no_ask: int | None = None
+    spread: int | None = None
+    ready: bool = False
+    seq: int | None = None
+    updated_ts: float = 0.0
+
+
+class BackgroundBookTracker:
+    """Silently maintain live books over one multiplex WebSocket."""
+
+    def __init__(
+        self,
+        rows: list[MarketRow],
+        *,
+        ws_url: str,
+        watch_limit: int,
+        log_raw: bool = False,
+    ):
+        self.rows = rows
+        self.ws_url = ws_url
+        self.watch_limit = watch_limit
+        self.log_raw = log_raw
+        self.store = None
+        self.worker = None
+        self.enabled = False
+        self.status = "off"
+        self.auth_label = ""
+        self.error: str | None = None
+        self.subscribed_n = 0
+        self._quotes: dict[str, QuoteSnap] = {}
+        self._lock_err = ""
+
+    def start(self) -> None:
+        try:
+            from kx_orderbooks.store import OrderbookStore
+            from kx_orderbooks.ws_multiplex import MultiplexOrderbookWorker
+        except ImportError as exc:
+            self.status = "no-deps"
+            self.error = f"kx_orderbooks import failed: {exc}"
+            return
+
+        try:
+            api_key_id, private_key, auth_label = resolve_ws_auth()
+        except Exception as exc:  # noqa: BLE001
+            self.status = "no-auth"
+            self.error = str(exc)
+            return
+
+        chosen = select_watch_rows(self.rows, watch_limit=self.watch_limit)
+        if not chosen:
+            self.status = "no-markets"
+            self.error = "no markets to subscribe"
+            return
+
+        tickers = [r.ticker for r in chosen]
+        self.subscribed_n = len(tickers)
+        self.auth_label = auth_label
+        self.store = OrderbookStore()
+        self.worker = MultiplexOrderbookWorker(
+            market_tickers=tickers,
+            store=self.store,
+            ws_url=self.ws_url,
+            api_key_id=api_key_id,
+            private_key=private_key,
+            use_yes_price=True,
+            reconnect=True,
+            log_raw=self.log_raw,
+        )
+
+        def _on_update(update) -> None:  # noqa: ANN001
+            # Silent tracking only — UI pulls snapshots on redraw.
+            try:
+                b = update.view.best
+                self._quotes[update.market_ticker.upper()] = QuoteSnap(
+                    yes_bid=b.yes_bid_cents,
+                    yes_ask=b.yes_ask_cents,
+                    no_bid=b.no_bid_cents,
+                    no_ask=b.no_ask_cents,
+                    spread=b.spread_cents,
+                    ready=bool(update.view.ready),
+                    seq=update.seq if isinstance(update.seq, int) else None,
+                    updated_ts=time.time(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._lock_err = str(exc)
+
+        self.store.register_callback(_on_update)
+        self.worker.start()
+        self.enabled = True
+        self.status = "starting"
+
+        # Brief non-blocking wait so first UI frame can show connect state.
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if self.worker.subscribed:
+                self.status = "live"
+                break
+            if self.worker.last_error is not None and not self.worker.connected:
+                self.status = "error"
+                self.error = repr(self.worker.last_error)
+                break
+            time.sleep(0.05)
+        else:
+            if self.worker.connected:
+                self.status = "connected"
+            else:
+                self.status = "connecting"
+
+    def poll_status(self) -> None:
+        if not self.enabled or self.worker is None:
+            return
+        if self.worker.last_error is not None and not self.worker.connected:
+            self.status = "error"
+            self.error = repr(self.worker.last_error)
+        elif self.worker.subscribed:
+            self.status = "live"
+        elif self.worker.connected:
+            self.status = "connected"
+        else:
+            self.status = "connecting"
+
+    def quote(self, ticker: str) -> QuoteSnap | None:
+        t = ticker.upper()
+        q = self._quotes.get(t)
+        if q is not None:
+            return q
+        if self.store is None:
+            return None
+        view = self.store.get_view(t)
+        if view is None:
+            return None
+        b = view.best
+        q = QuoteSnap(
+            yes_bid=b.yes_bid_cents,
+            yes_ask=b.yes_ask_cents,
+            no_bid=b.no_bid_cents,
+            no_ask=b.no_ask_cents,
+            spread=b.spread_cents,
+            ready=bool(view.ready),
+            seq=view.seq if isinstance(view.seq, int) else None,
+            updated_ts=view.last_local_ts or time.time(),
+        )
+        self._quotes[t] = q
+        return q
+
+    def ready_count(self) -> int:
+        if self.store is None:
+            return len([q for q in self._quotes.values() if q.ready])
+        return sum(1 for v in self.store.views() if v.ready)
+
+    def stop(self) -> None:
+        if self.worker is not None:
+            try:
+                self.worker.stop()
+                self.worker.join(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+        self.status = "stopped"
+
+
+def read_terminal_key(fd: int) -> tuple[str, str]:
+    """Read one keypress from raw terminal fd. Returns (kind, value)."""
+    ch = os.read(fd, 1)
+    if not ch:
+        return "empty", ""
+    if ch == b"\x1b":
+        seq = bytearray(ch)
+        deadline = time.time() + 0.03
+        while len(seq) < 8 and time.time() < deadline:
+            readable, _, _ = select.select([fd], [], [], 0.005)
+            if not readable:
+                break
+            try:
+                b = os.read(fd, 1)
+            except OSError:
+                break
+            if not b:
+                break
+            seq.extend(b)
+        mapping = {
+            b"\x1b[A": "up",
+            b"\x1b[B": "down",
+            b"\x1b[C": "right",
+            b"\x1b[D": "left",
+            b"\x1b[5~": "pageup",
+            b"\x1b[6~": "pagedown",
+            b"\x1b[H": "home",
+            b"\x1b[F": "end",
+        }
+        key = mapping.get(bytes(seq))
+        if key:
+            return key, bytes(seq).decode("ascii", errors="ignore")
+        if bytes(seq) == b"\x1b":
+            return "escape", "esc"
+        return "escape", bytes(seq).decode("ascii", errors="ignore")
+    if ch == b"\x08":
+        return "ctrl", "h"  # Ctrl-H help (not backspace)
+    if ch == b"\x7f":
+        return "backspace", "del"
+    if ch in (b"\r", b"\n"):
+        return "enter", "enter"
+    if ch == b"\x03":
+        return "ctrl", "c"
+    if ch == b"\x0c":
+        return "ctrl", "l"
+    if ch == b"\x12":
+        return "ctrl", "r"
+    if ch == b"\x04":
+        return "ctrl", "d"
+    if ch == b"\x15":
+        return "ctrl", "u"
+    try:
+        s = ch.decode("utf-8")
+    except UnicodeDecodeError:
+        return "unknown", ""
+    if s.isprintable() or s == "\t":
+        return "char", s
+    if 0 < ch[0] < 32:
+        return "ctrl", chr(ch[0] + 96)
+    return "unknown", s
+def clear_screen() -> None:
+    sys.stdout.write("\033[H\033[J")
+    sys.stdout.flush()
+
+
+def help_text() -> str:
+    return """
+SPORTS TRADER — KEYBOARD HELP (Ctrl-H)
+======================================
+Navigation
+  ↑ / k / Ctrl-P     move up
+  ↓ / j / Ctrl-N     move down
+  PgUp / PgDn        page up/down
+  Home / End / g/G   first / last row
+  Enter              open category or market
+  Esc / Backspace    go back
+  1-5                jump to category (on category screen)
+  a                  show All markets category
+  / or plain typing  filter current list (ticker/title/series)
+  Ctrl-U             clear filter
+  Ctrl-L / Ctrl-R    redraw
+  Ctrl-H             this help
+  q                  quit browser
+
+Quotes
+  Background WebSocket keeps books silently (no spam).
+  YES bid/ask appears when a book snapshot has arrived.
+  Browse works without API keys; quotes need KALSHI_* auth.
+
+Screens
+  Categories → Markets → Market detail
+""".strip()
+
+
+@dataclass
+class BrowserState:
+    seed_series: str
+    game_code: str
+    rows: list[MarketRow]
+    tracker: BackgroundBookTracker
+    mode: str = "categories"  # categories | markets | detail | help
+    category: str = "game_lines"
+    filter_text: str = ""
+    cursor: int = 0
+    offset: int = 0
+    page_size: int = 18
+    selected_ticker: str = ""
+    message: str = ""
+    prev_mode: str = "categories"
+
+    def category_counts(self) -> dict[str, int]:
+        counts = {k: 0 for k in CATEGORY_ORDER}
+        for row in self.rows:
+            counts[classify_market(row)] = counts.get(classify_market(row), 0) + 1
+        return counts
+
+    def filtered_rows(self) -> list[MarketRow]:
+        needle = self.filter_text.strip().lower()
+        out: list[MarketRow] = []
+        for row in self.rows:
+            if self.category != "all" and classify_market(row) != self.category:
+                continue
+            if needle and needle not in market_haystack(row):
+                continue
+            out.append(row)
+        out.sort(key=lambda r: (r.series_ticker, r.ticker))
+        return out
+
+    def category_items(self) -> list[tuple[str, str, int]]:
+        counts = self.category_counts()
+        items = [(key, CATEGORY_LABELS[key], counts.get(key, 0)) for key in CATEGORY_ORDER]
+        items.append(("all", "All markets", len(self.rows)))
+        if self.filter_text.strip():
+            # show filtered totals in labels? keep simple
+            pass
+        return items
+
+
+def clamp_cursor(state: BrowserState, n_items: int) -> None:
+    if n_items <= 0:
+        state.cursor = 0
+        state.offset = 0
+        return
+    state.cursor = max(0, min(state.cursor, n_items - 1))
+    if state.cursor < state.offset:
+        state.offset = state.cursor
+    if state.cursor >= state.offset + state.page_size:
+        state.offset = state.cursor - state.page_size + 1
+
+
+def move_cursor(state: BrowserState, delta: int, n_items: int) -> None:
+    if n_items <= 0:
+        return
+    state.cursor = max(0, min(n_items - 1, state.cursor + delta))
+    clamp_cursor(state, n_items)
+
+
+def format_quote_cell(q: QuoteSnap | None) -> str:
+    if q is None or not q.ready:
+        return "  -- x -- "
+    return f"{fmt_cents(q.yes_bid):>4} x {fmt_cents(q.yes_ask):<4}"
+
+
+def render_browser(state: BrowserState) -> None:
+    state.tracker.poll_status()
+    ready = state.tracker.ready_count()
+    sub_n = state.tracker.subscribed_n
+    ws = state.tracker.status
+    if state.tracker.error and ws in {"error", "no-auth", "no-deps"}:
+        ws_line = f"WS {ws}: {short_label(state.tracker.error, 40)}"
+    else:
+        ws_line = f"WS {ws}  books {ready}/{sub_n}" if sub_n else f"WS {ws}"
+
+    lines: list[str] = []
+    lines.append(
+        f"{state.seed_series}-{state.game_code}   markets={len(state.rows)}   {ws_line}"
+    )
+    lines.append(f"filter: {state.filter_text}_" if state.mode != "help" else "filter: (paused on help)")
+    if state.message:
+        lines.append(state.message)
+    lines.append("")
+
+    if state.mode == "help":
+        lines.extend(help_text().splitlines())
+        lines.append("")
+        lines.append("Press Esc / Backspace / q to return.")
+    elif state.mode == "categories":
+        lines.append("CATEGORIES")
+        items = state.category_items()
+        clamp_cursor(state, len(items))
+        for idx, (key, label, count) in enumerate(items):
+            if idx < state.offset or idx >= state.offset + state.page_size:
+                continue
+            mark = ">" if idx == state.cursor else " "
+            num = "A" if key == "all" else str(CATEGORY_ORDER.index(key) + 1 if key in CATEGORY_ORDER else " ")
+            lines.append(f" {mark} {num}  {label:<14}  ({count})")
+        lines.append("")
+        lines.append("Enter open · 1-5/A jump · type to filter markets after open · Ctrl-H help · q quit")
+    elif state.mode == "markets":
+        rows = state.filtered_rows()
+        label = CATEGORY_LABELS.get(state.category, "All markets" if state.category == "all" else state.category)
+        lines.append(f"MARKETS — {label}  showing {len(rows)}")
+        clamp_cursor(state, len(rows))
+        if not rows:
+            lines.append("  (no markets match)")
+        else:
+            lines.append(f" {'':1} {'YES bid x ask':^11}  {'STATUS':<8}  {'SERIES':<16}  TICKER / TITLE")
+            end = min(len(rows), state.offset + state.page_size)
+            for idx in range(state.offset, end):
+                row = rows[idx]
+                mark = ">" if idx == state.cursor else " "
+                q = state.tracker.quote(row.ticker)
+                title = short_label(row.title or row.yes_sub_title or "", 42)
+                lines.append(
+                    f" {mark} {format_quote_cell(q)}  {(row.status or '-'):<8}  "
+                    f"{row.series_ticker:<16}  {row.ticker}"
+                )
+                lines.append(f"      {title}")
+        lines.append("")
+        lines.append("Enter detail · Esc back · type filter · Ctrl-U clear filter · Ctrl-H help · q quit")
+    elif state.mode == "detail":
+        row = next((r for r in state.rows if r.ticker == state.selected_ticker), None)
+        if row is None:
+            lines.append("Market not found.")
+        else:
+            q = state.tracker.quote(row.ticker)
+            lines.append("MARKET DETAIL")
+            lines.append(f"  ticker : {row.ticker}")
+            lines.append(f"  series : {row.series_ticker}")
+            lines.append(f"  event  : {row.event_ticker}")
+            lines.append(f"  status : {row.status}")
+            lines.append(f"  cat    : {CATEGORY_LABELS.get(classify_market(row), classify_market(row))}")
+            lines.append(f"  title  : {row.title}")
+            if row.yes_sub_title:
+                lines.append(f"  yes    : {row.yes_sub_title}")
+            if row.no_sub_title:
+                lines.append(f"  no     : {row.no_sub_title}")
+            lines.append("")
+            if q and q.ready:
+                lines.append(
+                    f"  YES {fmt_cents(q.yes_bid)} x {fmt_cents(q.yes_ask)}"
+                    f"   NO {fmt_cents(q.no_bid)} x {fmt_cents(q.no_ask)}"
+                    f"   spr {fmt_cents(q.spread)}"
+                )
+                if q.updated_ts:
+                    age = max(0.0, time.time() - q.updated_ts)
+                    lines.append(f"  book age: {age:.1f}s   seq={q.seq}")
+            else:
+                lines.append("  book: (waiting for websocket snapshot)")
+            lines.append("")
+            lines.append("Esc/Backspace back · Ctrl-H help · q quit")
+            lines.append("Orders not enabled in this slice.")
+
+    lines.append("")
+    clear_screen()
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
+def open_category(state: BrowserState, key: str) -> None:
+    state.category = key
+    state.mode = "markets"
+    state.cursor = 0
+    state.offset = 0
+    state.message = ""
+
+
+def handle_enter(state: BrowserState) -> None:
+    if state.mode == "categories":
+        items = state.category_items()
+        if not items:
+            return
+        clamp_cursor(state, len(items))
+        key = items[state.cursor][0]
+        open_category(state, key)
+    elif state.mode == "markets":
+        rows = state.filtered_rows()
+        if not rows:
+            return
+        clamp_cursor(state, len(rows))
+        state.selected_ticker = rows[state.cursor].ticker
+        state.mode = "detail"
+        state.message = ""
+    elif state.mode == "help":
+        state.mode = state.prev_mode
+
+
+def handle_back(state: BrowserState) -> bool:
+    """Return True if caller should quit."""
+    if state.mode == "help":
+        state.mode = state.prev_mode
+        return False
+    if state.mode == "detail":
+        state.mode = "markets"
+        return False
+    if state.mode == "markets":
+        state.mode = "categories"
+        state.cursor = 0
+        state.offset = 0
+        return False
+    return False
+
+
+def run_browser(
+    *,
+    seed_series: str,
+    game_code: str,
+    rows: list[MarketRow],
+    ws_url: str,
+    watch_limit: int,
+    log_raw: bool,
+    no_ws: bool,
+) -> int:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        eprint("error: --browse requires an interactive TTY")
+        return 2
+
+    tracker = BackgroundBookTracker(
+        rows,
+        ws_url=ws_url,
+        watch_limit=0 if watch_limit < 0 else watch_limit,
+        log_raw=log_raw,
+    )
+    if no_ws:
+        tracker.status = "disabled"
+    else:
+        # Start WS silently in background; UI does not dump ticks.
+        eprint("starting background websocket book tracker (silent)...")
+        tracker.start()
+        if tracker.error and tracker.status in {"no-auth", "no-deps"}:
+            eprint(f"browser continues without live quotes: {tracker.error}")
+        elif tracker.enabled:
+            eprint(
+                f"ws tracker: status={tracker.status} subscribed={tracker.subscribed_n} "
+                f"auth={tracker.auth_label or '-'}"
+            )
+
+    state = BrowserState(
+        seed_series=seed_series,
+        game_code=game_code,
+        rows=rows,
+        tracker=tracker,
+        message="Ctrl-H help · discover done · books update in background",
+    )
+
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    stop = False
+
+    def _sig(_signum, _frame):  # noqa: ANN001
+        nonlocal stop
+        stop = True
+
+    prev_int = signal.signal(signal.SIGINT, _sig)
+    prev_term = signal.signal(signal.SIGTERM, _sig)
+
+    try:
+        tty.setcbreak(fd)
+        # Disable OS XON/XOFF so Ctrl-S etc. are available later; leave ISIG for Ctrl-C path via handler if needed
+        attrs = termios.tcgetattr(fd)
+        attrs[0] &= ~termios.IXON
+        termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+
+        last_draw = 0.0
+        while not stop:
+            now = time.time()
+            # periodic redraw so quotes fill in without keypresses
+            if now - last_draw > 1.0:
+                render_browser(state)
+                last_draw = now
+            else:
+                render_browser(state)
+                last_draw = now
+
+            readable, _, _ = select.select([fd], [], [], 0.5)
+            if not readable:
+                continue
+            kind, value = read_terminal_key(fd)
+
+            if kind == "ctrl" and value == "c":
+                stop = True
+                break
+            if kind == "ctrl" and value == "h":
+                state.prev_mode = state.mode if state.mode != "help" else state.prev_mode
+                state.mode = "help"
+                continue
+            if kind == "char" and value in {"q", "Q"} and state.mode == "help":
+                state.mode = state.prev_mode
+                continue
+            if kind == "char" and value in {"q", "Q"}:
+                stop = True
+                break
+            if kind in {"escape", "backspace"} and state.mode == "help":
+                state.mode = state.prev_mode
+                continue
+            if kind == "ctrl" and value in {"l", "r"}:
+                state.message = "redraw"
+                continue
+
+            if state.mode == "help":
+                continue
+
+            # filtering / typing
+            if kind == "ctrl" and value == "u":
+                state.filter_text = ""
+                state.cursor = 0
+                state.offset = 0
+                state.message = "filter cleared"
+                continue
+            if kind == "backspace":
+                if state.filter_text:
+                    state.filter_text = state.filter_text[:-1]
+                    state.cursor = 0
+                    state.offset = 0
+                else:
+                    if handle_back(state):
+                        stop = True
+                continue
+            if kind == "escape":
+                if handle_back(state):
+                    stop = True
+                continue
+            if kind == "enter":
+                handle_enter(state)
+                continue
+
+            n_items = (
+                len(state.category_items())
+                if state.mode == "categories"
+                else len(state.filtered_rows())
+                if state.mode == "markets"
+                else 0
+            )
+
+            if kind == "up" or (kind == "char" and value in {"k", "K"}) or (kind == "ctrl" and value == "p"):
+                move_cursor(state, -1, n_items)
+                continue
+            if kind == "down" or (kind == "char" and value in {"j", "J"}) or (kind == "ctrl" and value == "n"):
+                move_cursor(state, 1, n_items)
+                continue
+            if kind == "pageup":
+                move_cursor(state, -state.page_size, n_items)
+                continue
+            if kind == "pagedown":
+                move_cursor(state, state.page_size, n_items)
+                continue
+            if kind == "home" or (kind == "char" and value == "g" and state.mode != "categories"):
+                state.cursor = 0
+                clamp_cursor(state, n_items)
+                continue
+            if kind == "end" or (kind == "char" and value == "G"):
+                state.cursor = max(0, n_items - 1)
+                clamp_cursor(state, n_items)
+                continue
+
+            if state.mode == "categories" and kind == "char":
+                if value in {"1", "2", "3", "4", "5"}:
+                    idx = int(value) - 1
+                    if 0 <= idx < len(CATEGORY_ORDER):
+                        open_category(state, CATEGORY_ORDER[idx])
+                    continue
+                if value in {"a", "A"}:
+                    open_category(state, "all")
+                    continue
+                if value == "/":
+                    state.message = "type to filter after opening a category"
+                    continue
+                # typing on category screen starts All + filter
+                if value.isprintable():
+                    state.filter_text += value
+                    open_category(state, "all")
+                    state.message = "filtering all markets"
+                    continue
+
+            if state.mode == "markets" and kind == "char":
+                if value == "/":
+                    state.message = "typing filters this list"
+                    continue
+                if value.isprintable():
+                    state.filter_text += value
+                    state.cursor = 0
+                    state.offset = 0
+                    continue
+
+            if state.mode == "detail" and kind == "char" and value == "g":
+                state.mode = "categories"
+                state.cursor = 0
+                state.offset = 0
+                continue
+
+    finally:
+        signal.signal(signal.SIGINT, prev_int)
+        signal.signal(signal.SIGTERM, prev_term)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        tracker.stop()
+        # leave a clean line after raw mode
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    eprint("browser exit")
+    return 0
+
+
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Discover Kalshi sports markets for a game id; optional WebSocket "
-            "orderbook watch (no REST book polling)."
+            "Discover Kalshi sports markets for a game id; keyboard browser "
+            "and/or WebSocket orderbook tracking (no REST book polling)."
         )
     )
     p.add_argument(
@@ -818,11 +1578,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Suppress stderr progress.",
     )
     p.add_argument(
+        "--browse",
+        action="store_true",
+        help=(
+            "After discovery, open keyboard market browser. Starts a silent "
+            "background WebSocket book tracker when auth is available. Ctrl-H help."
+        ),
+    )
+    p.add_argument(
+        "--no-ws",
+        action="store_true",
+        help="With --browse, do not start the background WebSocket tracker.",
+    )
+    p.add_argument(
+        "--list-only",
+        action="store_true",
+        help="Print discovery table only (default when not using --browse/--watch).",
+    )
+    p.add_argument(
         "--watch",
         action="store_true",
         help=(
             "After discovery, stream orderbooks over one authenticated Kalshi "
-            "WebSocket (kx_orderbooks multiplex). Requires API key env."
+            "WebSocket (kx_orderbooks multiplex). Requires API key env. "
+            "Prints ticks (use --browse for silent tracking + UI)."
         ),
     )
     p.add_argument(
@@ -895,6 +1674,47 @@ def main(argv: list[str] | None = None) -> int:
     )
     elapsed = time.time() - t0
 
+    if not rows:
+        eprint("no markets found")
+        # still print empty discovery for list mode
+        if args.json and not args.browse and not args.watch:
+            print(json.dumps({
+                "seed_series": seed_series,
+                "game_code": game_code,
+                "league_prefix": league,
+                "market_count": 0,
+                "series_hits": hits,
+                "errors": errors,
+                "elapsed_seconds": round(elapsed, 3),
+                "markets": [],
+            }, indent=2, sort_keys=True))
+        elif not args.browse:
+            print_discovery_text(
+                seed_series=seed_series,
+                game_code=game_code,
+                rows=rows,
+                hits=hits,
+                errors=errors,
+                elapsed=elapsed,
+            )
+        return 1
+
+    if args.browse:
+        # Compact discovery summary on stderr; UI owns the screen.
+        eprint(
+            f"discovered {len(rows)} markets across {len(hits)} series "
+            f"in {elapsed:.1f}s; opening browser"
+        )
+        return run_browser(
+            seed_series=seed_series,
+            game_code=game_code,
+            rows=rows,
+            ws_url=str(args.ws_url),
+            watch_limit=int(args.watch_limit),
+            log_raw=bool(args.log_raw),
+            no_ws=bool(args.no_ws),
+        )
+
     if args.json and not args.watch:
         payload = {
             "seed_series": seed_series,
@@ -928,10 +1748,6 @@ def main(argv: list[str] | None = None) -> int:
             errors=errors,
             elapsed=elapsed,
         )
-
-    if not rows:
-        eprint("no markets found")
-        return 1
 
     if args.watch:
         return run_watch(
