@@ -36,6 +36,21 @@ export KALSHI_PROD_PRIVATE_KEY_FILE="$HOME/path/to/prod_private_key.pem"
 python3 examples/watch_series_orderbooks.py KXTRUMPMENTIONB
 ```
 
+### Sports trader (list markets for a game)
+
+Public REST only for now — no API keys required for listing.
+
+```bash
+./kalshi_sports_trader.py kxnflgame-26sep13atlpit
+./kalshi_sports_trader.py KXNFLGAME-26SEP13ATLPIT --status all
+# optional: limit which series are probed
+./kalshi_sports_trader.py kxnflgame-26sep13atlpit --series KXNFLGAME --series KXNFLSPREAD --series KXNFLTOTAL
+```
+
+Kalshi splits one game across many series that share the same game code
+(`26SEP13ATLPIT` on `KXNFLSPREAD`, `KXNFLREC`, …). The sports lister probes those
+related series and prints ticker / status / series / title.
+
 ### Broadcast trader
 
 Dry-run requires `--demo` or `--prod`. Real orders need `--live`.
