@@ -1728,7 +1728,7 @@ NORMAL navigation
   a                  show All markets category
   Ctrl-L / Ctrl-R    redraw
   Ctrl-H             this help
-  q                  quit browser
+  q                  ask to quit · Enter confirms · Esc/other cancels
 
 Orders
   Enter on a market  BUY YES for --count-yes contracts (default 1)
@@ -1775,6 +1775,7 @@ class BrowserState:
     prev_mode: str = "categories"
     order_busy: bool = False
     last_order_ts: float = 0.0
+    quit_confirm: bool = False
 
     def category_counts(self) -> dict[str, int]:
         counts = {k: 0 for k in CATEGORY_ORDER}
@@ -1931,7 +1932,7 @@ def render_browser(state: BrowserState) -> None:
         if state.input_mode == "filter":
             lines.append("FILTER mode · type letters/digits/space · Esc/Enter normal · Ctrl-U clear · q is a letter")
         else:
-            lines.append("NORMAL · Enter open · 1-5/A jump · f filter · j/k move · q quit · Ctrl-H help")
+            lines.append("NORMAL · Enter open · 1-5/A jump · f filter · j/k move · q quit? · Ctrl-H help")
     elif state.mode == "markets":
         rows = market_rows if market_rows is not None else state.filtered_rows()
         label = CATEGORY_LABELS.get(state.category, "All markets" if state.category == "all" else state.category)
@@ -1964,7 +1965,7 @@ def render_browser(state: BrowserState) -> None:
             count_yes = effective_count_yes(state.args)
             mode = "LIVE" if state.args.live else "DRY-RUN"
             lines.append(
-                f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · d detail · Esc back · f filter · q quit"
+                f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · d detail · Esc back · f filter · q quit?"
             )
     elif state.mode == "detail":
         row = next((r for r in state.rows if r.ticker == state.selected_ticker), None)
@@ -2000,7 +2001,7 @@ def render_browser(state: BrowserState) -> None:
             count_yes = effective_count_yes(state.args)
             mode = "LIVE" if state.args.live else "DRY-RUN"
             lines.append(
-                f"Enter BUY YES x{count_yes} ({mode}) · Esc back · f filter · q quit"
+                f"Enter BUY YES x{count_yes} ({mode}) · Esc back · f filter · q quit?"
             )
 
     lines.append("")
@@ -2072,7 +2073,21 @@ def handle_buy_yes(state: BrowserState) -> None:
         open_market_detail(state, row.ticker)
 
 
+def cancel_quit_confirm(state: BrowserState, *, message: str = "quit cancelled") -> None:
+    if state.quit_confirm:
+        state.quit_confirm = False
+        state.message = message
+
+
+def request_quit_confirm(state: BrowserState) -> None:
+    state.quit_confirm = True
+    state.message = "Quit? Press Enter to confirm (Esc/other cancels)"
+
+
 def handle_enter(state: BrowserState) -> None:
+    if state.quit_confirm:
+        # Enter confirms quit; caller checks quit_confirm after this.
+        return
     if state.input_mode == "filter":
         leave_filter_mode(state)
         return
@@ -2225,6 +2240,16 @@ def run_browser(
             if kind == "ctrl" and value == "c":
                 stop = True
                 break
+
+            # Quit confirm: q arms it; Enter confirms; anything else cancels.
+            if state.quit_confirm:
+                if kind == "enter":
+                    stop = True
+                    break
+                cancel_quit_confirm(state)
+                # Swallow the cancel key so it does not also act.
+                continue
+
             if kind == "ctrl" and value == "h":
                 # Help is always available; leave filter input first.
                 if state.input_mode == "filter":
@@ -2342,8 +2367,8 @@ def run_browser(
                 continue
 
             if kind == "char" and value in {"q", "Q"}:
-                stop = True
-                break
+                request_quit_confirm(state)
+                continue
 
             if kind == "char" and value in {"f", "F", "/"}:
                 # f or / enters FILTER mode. From categories, open All so the query applies.
