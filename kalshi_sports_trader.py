@@ -31,6 +31,7 @@ Environment gates (same safety model as broadcast trader):
     --demo or --prod is required (no implicit host).
     Default is dry-run. Real BUY YES only with --live.
     Browser Enter on a market buys YES for --count-yes contracts.
+    Order events stay in memory during submit and dump to disk when idle/exit.
 
 Auth for --watch / --browse WS books (env vars or config files):
     ~/.config/kalshi-multiplex-orderbook/prod.env
@@ -178,6 +179,127 @@ class MarketRow:
 
 def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
+
+
+@dataclass
+class OrderLogEvent:
+    """One in-memory order event (no secrets)."""
+
+    ts: float
+    kind: str
+    summary: str
+    detail: str = ""
+    ticker: str = ""
+    mode: str = ""
+    live: bool = False
+    ok: bool | None = None
+    http_status: int | None = None
+
+    def render(self) -> str:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.ts))
+        lines = [f"[{stamp}] {self.summary}"]
+        if self.detail:
+            lines.append(self.detail)
+        return "\n".join(lines)
+
+
+class OrderMemoryLog:
+    """Ring buffer of order events. No disk writes during submit; dump on idle/exit."""
+
+    def __init__(self, *, capacity: int = 500):
+        self.capacity = max(50, int(capacity))
+        self.events: list[OrderLogEvent] = []
+        self._dirty = False
+        self._last_event_ts = 0.0
+        self._last_dump_ts = 0.0
+        self.path: str | None = None
+        self.idle_dump_s = 2.0
+        self.enabled = True
+
+    def configure(
+        self,
+        *,
+        path: str | None,
+        idle_dump_s: float = 2.0,
+        capacity: int = 500,
+        enabled: bool = True,
+    ) -> None:
+        self.path = str(Path(path).expanduser()) if path else None
+        self.idle_dump_s = max(0.25, float(idle_dump_s))
+        self.capacity = max(50, int(capacity))
+        self.enabled = bool(enabled)
+
+    def record(
+        self,
+        summary: str,
+        *,
+        kind: str = "order",
+        detail: str = "",
+        ticker: str = "",
+        mode: str = "",
+        live: bool = False,
+        ok: bool | None = None,
+        http_status: int | None = None,
+    ) -> OrderLogEvent:
+        ev = OrderLogEvent(
+            ts=time.time(),
+            kind=kind,
+            summary=summary,
+            detail=detail or "",
+            ticker=ticker or "",
+            mode=mode or "",
+            live=bool(live),
+            ok=ok,
+            http_status=http_status,
+        )
+        if not self.enabled:
+            return ev
+        self.events.append(ev)
+        if len(self.events) > self.capacity:
+            self.events = self.events[-self.capacity :]
+        self._dirty = True
+        self._last_event_ts = ev.ts
+        return ev
+
+    def recent(self, n: int = 8) -> list[OrderLogEvent]:
+        if n <= 0:
+            return []
+        return self.events[-n:]
+
+    def maybe_dump_idle(self, *, force: bool = False) -> str | None:
+        """If dirty and idle long enough (or force), write memory log to path."""
+        if not self.enabled or not self.path or not self._dirty:
+            return None
+        now = time.time()
+        if not force and (now - self._last_event_ts) < self.idle_dump_s:
+            return None
+        return self.dump(reason="idle" if not force else "force")
+
+    def dump(self, *, reason: str = "manual") -> str | None:
+        if not self.enabled or not self.path:
+            return None
+        if not self.events and not self._dirty:
+            return None
+        out = Path(self.path).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        header = (
+            f"# kalshi_sports_trader order memory log\n"
+            f"# dumped_at={time.strftime('%Y-%m-%d %H:%M:%S')} reason={reason}\n"
+            f"# events={len(self.events)} (no secrets)\n\n"
+        )
+        body = "\n\n".join(ev.render() for ev in self.events) + "\n"
+        out.write_text(header + body, encoding="utf-8")
+        try:
+            os.chmod(out, 0o600)
+        except OSError:
+            pass
+        self._dirty = False
+        self._last_dump_ts = time.time()
+        return str(out)
+
+
+# Process-wide memory log used by order path + browser idle flusher.
+ORDER_LOG = OrderMemoryLog()
 
 
 def normalize_status_filter(status: str | None) -> set[str]:
@@ -796,12 +918,20 @@ def buy_yes_for_market(
         f"slip=+{slip}c tif={legacy['time_in_force']}"
     )
 
-    # Always log the would-be order on stderr (no secrets).
-    eprint(summary)
-    eprint(f"order payload v2: {json.dumps(v2, sort_keys=True)}")
+    # Memory-only during submit (no disk I/O, no stderr spam that breaks TUI).
+    detail = f"payload_v2={json.dumps(v2, sort_keys=True)}"
+    ORDER_LOG.record(
+        summary,
+        kind="order_built",
+        detail=detail,
+        ticker=row.ticker,
+        mode=mode,
+        live=bool(args.live),
+        ok=None if args.live else True,
+    )
 
     if not args.live:
-        return True, summary + " (not submitted)"
+        return True, summary + " (not submitted; memory-log)"
 
     try:
         info = signed_json_request(
@@ -812,15 +942,40 @@ def buy_yes_for_market(
             timeout=float(getattr(args, "order_submit_timeout", 10.0)),
         )
     except Exception as exc:  # noqa: BLE001
-        return False, f"ORDER FAIL {row.ticker}: {exc}"
+        fail = f"ORDER FAIL {row.ticker}: {exc}"
+        ORDER_LOG.record(
+            fail,
+            kind="order_error",
+            detail=str(exc),
+            ticker=row.ticker,
+            mode=mode,
+            live=True,
+            ok=False,
+        )
+        return False, fail
 
     http_status = info.get("http_status")
     resp = info.get("response")
-    eprint(f"order response http={http_status} body={json.dumps(resp, default=str)[:500]}")
+    resp_s = json.dumps(resp, default=str)[:800]
     ok = http_status is None or (isinstance(http_status, int) and 200 <= http_status < 300)
     if ok:
-        return True, f"LIVE OK BUY YES {row.ticker} count={count} limit={fmt_cents(limit_cents)} http={http_status}"
-    return False, f"LIVE REJECT BUY YES {row.ticker} http={http_status}"
+        msg = (
+            f"LIVE OK BUY YES {row.ticker} count={count} "
+            f"limit={fmt_cents(limit_cents)} http={http_status}"
+        )
+    else:
+        msg = f"LIVE REJECT BUY YES {row.ticker} http={http_status}"
+    ORDER_LOG.record(
+        msg,
+        kind="order_response",
+        detail=f"http={http_status} body={resp_s}",
+        ticker=row.ticker,
+        mode=mode,
+        live=True,
+        ok=ok,
+        http_status=http_status if isinstance(http_status, int) else None,
+    )
+    return ok, msg
 
 
 
@@ -1578,8 +1733,10 @@ NORMAL navigation
 Orders
   Enter on a market  BUY YES for --count-yes contracts (default 1)
   Price              YES ask + --slippage-cents (default 1), IOC limit
-  Dry-run default    logs payload only; add --live to submit
+  Dry-run default    memory-logs payload only; add --live to submit
+  Order log          in-memory; dumps to file when idle / on exit
   Prefer --demo      for first live tests
+  L                  show recent memory log + force dump
 
 FILTER matching
   Multi-word, order-independent: "patrick mahomes td"
@@ -1996,6 +2153,28 @@ def run_browser(
                 f"auth={tracker.auth_label or '-'}"
             )
 
+    # Order log stays in memory during submit; dump only when idle / exit.
+    default_log = str(
+        Path.home()
+        / ".local"
+        / "share"
+        / "kalshi-multiplex-orderbook"
+        / "sports-order-memory.log"
+    )
+    log_path = getattr(args, "order_log_file", None)
+    if getattr(args, "no_order_log_file", False) or log_path == "":
+        ORDER_LOG.configure(path=None, enabled=True)  # memory only; no disk
+        log_path_disp = "(memory-only; no disk dump)"
+    else:
+        ORDER_LOG.configure(
+            path=str(log_path) if log_path else default_log,
+            idle_dump_s=float(getattr(args, "order_log_idle_s", 2.0) or 2.0),
+            capacity=int(getattr(args, "order_log_capacity", 500) or 500),
+            enabled=True,
+        )
+        log_path_disp = ORDER_LOG.path or default_log
+    eprint(f"order memory log: {log_path_disp} (no write during submit)")
+
     count_yes = effective_count_yes(args)
     mode = "LIVE" if args.live else "DRY-RUN"
     state = BrowserState(
@@ -2005,7 +2184,7 @@ def run_browser(
         tracker=tracker,
         args=args,
         message=(
-            f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · d detail · f filter · Ctrl-H help"
+            f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · d detail · L log · f filter · Ctrl-H help"
         ),
     )
 
@@ -2033,9 +2212,13 @@ def run_browser(
             # periodic redraw so quotes fill in without keypresses
             render_browser(state)
             last_draw = now
+            dumped = ORDER_LOG.maybe_dump_idle()
+            if dumped and not state.message:
+                state.message = f"order log dumped → {short_label(dumped, 48)}"
 
             readable, _, _ = select.select([fd], [], [], 0.5)
             if not readable:
+                ORDER_LOG.maybe_dump_idle()
                 continue
             kind, value = read_terminal_key(fd)
 
@@ -2167,6 +2350,17 @@ def run_browser(
                 enter_filter_mode(state, jump_all=(state.mode == "categories"))
                 continue
 
+            if kind == "char" and value in {"l", "L"} and state.mode != "help":
+                recent = ORDER_LOG.recent(3)
+                if not recent:
+                    state.message = "order memory log empty"
+                else:
+                    state.message = " | ".join(short_label(ev.summary, 42) for ev in recent)
+                    dumped = ORDER_LOG.maybe_dump_idle(force=True)
+                    if dumped:
+                        state.message += f" · dumped {short_label(dumped, 36)}"
+                continue
+
             if state.mode == "markets" and kind == "char" and value in {"d", "D", " "}:
                 rows = state.filtered_rows()
                 if rows:
@@ -2199,9 +2393,12 @@ def run_browser(
         signal.signal(signal.SIGTERM, prev_term)
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
         tracker.stop()
+        dumped = ORDER_LOG.maybe_dump_idle(force=True)
         # leave a clean line after raw mode
         sys.stdout.write("\n")
         sys.stdout.flush()
+        if dumped:
+            eprint(f"order memory log dumped: {dumped}")
 
     eprint("browser exit")
     return 0
@@ -2285,6 +2482,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=10.0,
         help="HTTP timeout seconds for live order submit. Default: 10",
+    )
+    p.add_argument(
+        "--order-log-file",
+        default=None,
+        help=(
+            "Where to dump the in-memory order log when idle/exit. "
+            "Default: ~/.local/share/kalshi-multiplex-orderbook/sports-order-memory.log. "
+            "Use --no-order-log-file for memory-only."
+        ),
+    )
+    p.add_argument(
+        "--order-log-idle-s",
+        type=float,
+        default=2.0,
+        help="Seconds after last order event before dumping memory log to disk. Default: 2",
+    )
+    p.add_argument(
+        "--order-log-capacity",
+        type=int,
+        default=500,
+        help="Max in-memory order events retained. Default: 500",
+    )
+    p.add_argument(
+        "--no-order-log-file",
+        action="store_true",
+        help="Keep order log in memory only; never dump to disk.",
     )
 
     p.add_argument(
@@ -2440,6 +2663,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     apply_env_endpoints(args)
+    if getattr(args, "no_order_log_file", False):
+        args.order_log_file = ""
 
     if args.quiet:
         def _quiet_eprint(*_a: Any, **_k: Any) -> None:
