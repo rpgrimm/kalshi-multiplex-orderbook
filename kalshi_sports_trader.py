@@ -828,6 +828,24 @@ def market_haystack(row: MarketRow) -> str:
     ).lower()
 
 
+def filter_tokens(text: str) -> list[str]:
+    """Whitespace-split query tokens (order-independent matching)."""
+    return [tok for tok in str(text or "").lower().split() if tok]
+
+
+def row_matches_filter(row: MarketRow, filter_text: str) -> bool:
+    """Loose multi-word match: every token must appear somewhere in haystack.
+
+    Example: "patrick mahomes td" matches a market whose title/ticker contains
+    those words in any order (and with other text in between).
+    """
+    tokens = filter_tokens(filter_text)
+    if not tokens:
+        return True
+    hay = market_haystack(row)
+    return all(tok in hay for tok in tokens)
+
+
 def short_label(text: str, max_len: int = 56) -> str:
     text = re.sub(r"\s+", " ", str(text or "")).strip()
     if len(text) <= max_len:
@@ -1069,20 +1087,31 @@ def help_text() -> str:
     return """
 SPORTS TRADER — KEYBOARD HELP (Ctrl-H)
 ======================================
-Navigation
+Modes (vim-style)
+  NORMAL             navigate; letters are commands (default)
+  FILTER             type query; all letters/digits/space go to filter>
+  f or /             enter FILTER mode
+  Esc / Enter        leave FILTER → NORMAL (keeps query)
+  Ctrl-U             clear filter text
+
+NORMAL navigation
   ↑ / k / Ctrl-P     move up
   ↓ / j / Ctrl-N     move down
   PgUp / PgDn        page up/down
   Home / End / g/G   first / last row
   Enter              open category or market
-  Esc / Backspace    go back
+  Esc / Backspace    clear filter if set, else go back
   1-5                jump to category (on category screen)
   a                  show All markets category
-  / or plain typing  live filter (see filter> bar update as you type)
-  Ctrl-U             clear filter
   Ctrl-L / Ctrl-R    redraw
   Ctrl-H             this help
   q                  quit browser
+
+FILTER matching
+  Multi-word, order-independent: "patrick mahomes td"
+  matches markets containing all of those tokens anywhere
+  in ticker/title/series (any order).
+  q / k / j / numbers all type into the filter in FILTER mode.
 
 Quotes
   Background WebSocket keeps books silently (no spam).
@@ -1101,6 +1130,7 @@ class BrowserState:
     rows: list[MarketRow]
     tracker: BackgroundBookTracker
     mode: str = "categories"  # categories | markets | detail | help
+    input_mode: str = "normal"  # normal | filter
     category: str = "game_lines"
     filter_text: str = ""
     cursor: int = 0
@@ -1117,12 +1147,11 @@ class BrowserState:
         return counts
 
     def filtered_rows(self) -> list[MarketRow]:
-        needle = self.filter_text.strip().lower()
         out: list[MarketRow] = []
         for row in self.rows:
             if self.category != "all" and classify_market(row) != self.category:
                 continue
-            if needle and needle not in market_haystack(row):
+            if not row_matches_filter(row, self.filter_text):
                 continue
             out.append(row)
         out.sort(key=lambda r: (r.series_ticker, r.ticker))
@@ -1132,9 +1161,6 @@ class BrowserState:
         counts = self.category_counts()
         items = [(key, CATEGORY_LABELS[key], counts.get(key, 0)) for key in CATEGORY_ORDER]
         items.append(("all", "All markets", len(self.rows)))
-        if self.filter_text.strip():
-            # show filtered totals in labels? keep simple
-            pass
         return items
 
 
@@ -1164,17 +1190,59 @@ def format_quote_cell(q: QuoteSnap | None) -> str:
 
 
 def format_filter_line(state: BrowserState, match_count: int | None = None) -> str:
-    """Visible live filter bar. Characters appear here as you type."""
+    """Visible filter bar. Live caret only while input_mode == filter."""
     if state.mode == "help":
         return "filter> (paused on help)"
     needle = state.filter_text
+    filtering = state.input_mode == "filter"
     if match_count is None:
-        suffix = "  · type to filter"
+        count_bit = ""
     else:
         unit = "match" if match_count == 1 else "matches"
-        suffix = f"  · {match_count} {unit}"
-    # Block caret so the typed query is obvious even before we park the tty cursor.
-    return f"filter> {needle}█{suffix}"
+        count_bit = f"  · {match_count} {unit}"
+    if filtering:
+        # Block caret so typed chars are obvious; real tty cursor parks here too.
+        return f"FILTER> {needle}█{count_bit}  · Esc/Enter normal · Ctrl-U clear"
+    if needle:
+        return f"filter: {needle}{count_bit}  · f filter · Ctrl-U clear · NORMAL"
+    return f"filter: (empty){count_bit}  · f filter · NORMAL"
+
+
+def enter_filter_mode(state: BrowserState, *, jump_all: bool = False) -> None:
+    """Enter FILTER input mode; optionally open All markets."""
+    if state.mode == "detail":
+        state.mode = "markets"
+    if jump_all and state.mode == "categories":
+        open_category(state, "all")
+    if state.mode not in {"categories", "markets"}:
+        return
+    state.input_mode = "filter"
+    state.message = ""
+    state.cursor = 0
+    state.offset = 0
+
+
+def leave_filter_mode(state: BrowserState) -> None:
+    state.input_mode = "normal"
+    state.message = ""
+
+
+def clear_filter(state: BrowserState) -> None:
+    state.filter_text = ""
+    state.cursor = 0
+    state.offset = 0
+    state.message = ""
+
+
+def append_filter_char(state: BrowserState, ch: str) -> None:
+    """Append one character to the live filter query."""
+    state.filter_text += ch
+    state.cursor = 0
+    state.offset = 0
+    state.message = ""
+    # Typing from categories with an active filter jumps into All markets.
+    if state.mode == "categories":
+        open_category(state, "all")
 
 
 def render_browser(state: BrowserState) -> None:
@@ -1193,17 +1261,14 @@ def render_browser(state: BrowserState) -> None:
     if state.mode == "markets":
         market_rows = state.filtered_rows()
         match_count = len(market_rows)
-    elif state.mode == "categories" and state.filter_text.strip():
-        # Typing on categories jumps to All; still show what the needle would hit.
-        match_count = sum(
-            1
-            for row in state.rows
-            if state.filter_text.strip().lower() in market_haystack(row)
-        )
+    elif state.filter_text.strip():
+        match_count = sum(1 for row in state.rows if row_matches_filter(row, state.filter_text))
 
     lines: list[str] = []
+    mode_tag = "FILTER" if state.input_mode == "filter" else "NORMAL"
     lines.append(
-        f"{state.seed_series}-{state.game_code}   markets={len(state.rows)}   {ws_line}"
+        f"{state.seed_series}-{state.game_code}   markets={len(state.rows)}   "
+        f"{mode_tag}   {ws_line}"
     )
     filter_line_idx = len(lines)  # 0-based index in lines; terminal row = idx + 1
     filter_line = format_filter_line(state, match_count)
@@ -1227,7 +1292,10 @@ def render_browser(state: BrowserState) -> None:
             num = "A" if key == "all" else str(CATEGORY_ORDER.index(key) + 1 if key in CATEGORY_ORDER else " ")
             lines.append(f" {mark} {num}  {label:<14}  ({count})")
         lines.append("")
-        lines.append("Enter open · 1-5/A jump · type to filter (live) · Ctrl-U clear · Ctrl-H help · q quit")
+        if state.input_mode == "filter":
+            lines.append("FILTER mode · type letters/digits/space · Esc/Enter normal · Ctrl-U clear · q is a letter")
+        else:
+            lines.append("NORMAL · Enter open · 1-5/A jump · f filter · j/k move · q quit · Ctrl-H help")
     elif state.mode == "markets":
         rows = market_rows if market_rows is not None else state.filtered_rows()
         label = CATEGORY_LABELS.get(state.category, "All markets" if state.category == "all" else state.category)
@@ -1250,7 +1318,10 @@ def render_browser(state: BrowserState) -> None:
                 )
                 lines.append(f"      {title}")
         lines.append("")
-        lines.append("Enter detail · Esc back · type filter (live) · Ctrl-U clear · Ctrl-H help · q quit")
+        if state.input_mode == "filter":
+            lines.append("FILTER mode · type freely (q/k/j ok) · Esc/Enter normal · Ctrl-U clear")
+        else:
+            lines.append("NORMAL · Enter detail · Esc back · f filter · j/k move · q quit · Ctrl-H help")
     elif state.mode == "detail":
         row = next((r for r in state.rows if r.ticker == state.selected_ticker), None)
         if row is None:
@@ -1281,15 +1352,15 @@ def render_browser(state: BrowserState) -> None:
             else:
                 lines.append("  book: (waiting for websocket snapshot)")
             lines.append("")
-            lines.append("Esc/Backspace back · Ctrl-H help · q quit")
+            lines.append("NORMAL · Esc/Backspace back · f filter · q quit · Ctrl-H help")
             lines.append("Orders not enabled in this slice.")
 
     lines.append("")
     clear_screen()
     sys.stdout.write("\n".join(lines) + "\n")
-    # Park the real terminal cursor on the filter caret so typing feels live.
-    if state.mode in {"categories", "markets"}:
-        # "filter> " prefix is 8 chars; caret sits on the █ after needle.
+    # Park the real terminal cursor on the filter caret only in FILTER mode.
+    if state.input_mode == "filter" and state.mode in {"categories", "markets"}:
+        # "FILTER> " prefix is 8 chars; caret sits on the █ after needle.
         caret_col = 8 + len(state.filter_text) + 1  # 1-based columns
         caret_row = filter_line_idx + 1  # 1-based rows after clear+home
         sys.stdout.write(f"\033[{caret_row};{caret_col}H")
@@ -1305,6 +1376,9 @@ def open_category(state: BrowserState, key: str) -> None:
 
 
 def handle_enter(state: BrowserState) -> None:
+    if state.input_mode == "filter":
+        leave_filter_mode(state)
+        return
     if state.mode == "categories":
         items = state.category_items()
         if not items:
@@ -1319,6 +1393,7 @@ def handle_enter(state: BrowserState) -> None:
         clamp_cursor(state, len(rows))
         state.selected_ticker = rows[state.cursor].ticker
         state.mode = "detail"
+        state.input_mode = "normal"
         state.message = ""
     elif state.mode == "help":
         state.mode = state.prev_mode
@@ -1326,16 +1401,28 @@ def handle_enter(state: BrowserState) -> None:
 
 def handle_back(state: BrowserState) -> bool:
     """Return True if caller should quit."""
+    if state.input_mode == "filter":
+        leave_filter_mode(state)
+        return False
     if state.mode == "help":
         state.mode = state.prev_mode
         return False
     if state.mode == "detail":
         state.mode = "markets"
+        state.input_mode = "normal"
         return False
     if state.mode == "markets":
+        # Prefer clearing an active filter before leaving the market list.
+        if state.filter_text:
+            clear_filter(state)
+            return False
         state.mode = "categories"
+        state.input_mode = "normal"
         state.cursor = 0
         state.offset = 0
+        return False
+    if state.mode == "categories" and state.filter_text:
+        clear_filter(state)
         return False
     return False
 
@@ -1379,7 +1466,7 @@ def run_browser(
         game_code=game_code,
         rows=rows,
         tracker=tracker,
-        message="Ctrl-H help · discover done · books update in background",
+        message="NORMAL mode · f filter · Ctrl-H help · books update in background",
     )
 
     fd = sys.stdin.fileno()
@@ -1404,12 +1491,8 @@ def run_browser(
         while not stop:
             now = time.time()
             # periodic redraw so quotes fill in without keypresses
-            if now - last_draw > 1.0:
-                render_browser(state)
-                last_draw = now
-            else:
-                render_browser(state)
-                last_draw = now
+            render_browser(state)
+            last_draw = now
 
             readable, _, _ = select.select([fd], [], [], 0.5)
             if not readable:
@@ -1420,41 +1503,83 @@ def run_browser(
                 stop = True
                 break
             if kind == "ctrl" and value == "h":
+                # Help is always available; leave filter input first.
+                if state.input_mode == "filter":
+                    leave_filter_mode(state)
                 state.prev_mode = state.mode if state.mode != "help" else state.prev_mode
                 state.mode = "help"
-                continue
-            if kind == "char" and value in {"q", "Q"} and state.mode == "help":
-                state.mode = state.prev_mode
-                continue
-            if kind == "char" and value in {"q", "Q"}:
-                stop = True
-                break
-            if kind in {"escape", "backspace"} and state.mode == "help":
-                state.mode = state.prev_mode
                 continue
             if kind == "ctrl" and value in {"l", "r"}:
                 state.message = "redraw"
                 continue
 
+            # ---- HELP screen ----
             if state.mode == "help":
+                if kind in {"escape", "backspace"} or (kind == "char" and value in {"q", "Q"}):
+                    state.mode = state.prev_mode
+                    state.input_mode = "normal"
                 continue
 
-            # filtering / typing
+            # ---- global clear filter ----
             if kind == "ctrl" and value == "u":
-                state.filter_text = ""
-                state.cursor = 0
-                state.offset = 0
-                state.message = ""
+                clear_filter(state)
                 continue
-            if kind == "backspace":
-                if state.filter_text:
-                    state.filter_text = state.filter_text[:-1]
+
+            # ---- FILTER input mode: all printable chars type into the query ----
+            if state.input_mode == "filter":
+                if kind == "escape":
+                    leave_filter_mode(state)
+                    continue
+                if kind == "enter":
+                    leave_filter_mode(state)
+                    continue
+                if kind == "backspace":
+                    if state.filter_text:
+                        state.filter_text = state.filter_text[:-1]
+                        state.cursor = 0
+                        state.offset = 0
+                        state.message = ""
+                    else:
+                        leave_filter_mode(state)
+                    continue
+                # Arrows still navigate the filtered list while typing.
+                n_items = (
+                    len(state.category_items())
+                    if state.mode == "categories"
+                    else len(state.filtered_rows())
+                    if state.mode == "markets"
+                    else 0
+                )
+                if kind == "up" or (kind == "ctrl" and value == "p"):
+                    move_cursor(state, -1, n_items)
+                    continue
+                if kind == "down" or (kind == "ctrl" and value == "n"):
+                    move_cursor(state, 1, n_items)
+                    continue
+                if kind == "pageup":
+                    move_cursor(state, -state.page_size, n_items)
+                    continue
+                if kind == "pagedown":
+                    move_cursor(state, state.page_size, n_items)
+                    continue
+                if kind == "home":
                     state.cursor = 0
-                    state.offset = 0
-                    state.message = ""
-                else:
-                    if handle_back(state):
-                        stop = True
+                    clamp_cursor(state, n_items)
+                    continue
+                if kind == "end":
+                    state.cursor = max(0, n_items - 1)
+                    clamp_cursor(state, n_items)
+                    continue
+                if kind == "char" and value.isprintable():
+                    # Accept letters, digits, space, punctuation — including q/k/j.
+                    append_filter_char(state, value)
+                    continue
+                continue
+
+            # ---- NORMAL mode from here ----
+            if kind == "backspace":
+                if handle_back(state):
+                    stop = True
                 continue
             if kind == "escape":
                 if handle_back(state):
@@ -1493,39 +1618,31 @@ def run_browser(
                 clamp_cursor(state, n_items)
                 continue
 
+            if kind == "char" and value in {"q", "Q"}:
+                stop = True
+                break
+
+            if kind == "char" and value in {"f", "F", "/"}:
+                # f or / enters FILTER mode. From categories, open All so the query applies.
+                enter_filter_mode(state, jump_all=(state.mode == "categories"))
+                continue
+
             if state.mode == "categories" and kind == "char":
                 if value in {"1", "2", "3", "4", "5"}:
                     idx = int(value) - 1
                     if 0 <= idx < len(CATEGORY_ORDER):
                         open_category(state, CATEGORY_ORDER[idx])
+                        state.input_mode = "normal"
                     continue
                 if value in {"a", "A"}:
                     open_category(state, "all")
+                    state.input_mode = "normal"
                     continue
-                if value == "/":
-                    # Focus filter bar; characters echo on filter> line.
-                    state.message = ""
-                    continue
-                # typing on category screen starts All + filter (live echo on filter>)
-                if value.isprintable():
-                    state.filter_text += value
-                    open_category(state, "all")
-                    state.message = ""
-                    continue
-
-            if state.mode == "markets" and kind == "char":
-                if value == "/":
-                    state.message = ""
-                    continue
-                if value.isprintable():
-                    state.filter_text += value
-                    state.cursor = 0
-                    state.offset = 0
-                    state.message = ""
-                    continue
+                continue
 
             if state.mode == "detail" and kind == "char" and value == "g":
                 state.mode = "categories"
+                state.input_mode = "normal"
                 state.cursor = 0
                 state.offset = 0
                 continue
