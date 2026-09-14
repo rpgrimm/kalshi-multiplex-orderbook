@@ -52,6 +52,8 @@ Catalog discovery uses public REST (no keys). Live books via `--browse` / `--wat
 ./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit
 ./kalshi_sports_trader.py --prod KXNFLGAME-26SEP13ATLPIT --status all
 ./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit --browse
+./kalshi_sports_trader.py --demo kxnflgame-26sep14denkc --browse --count-yes 5
+./kalshi_sports_trader.py --demo kxnflgame-26sep14denkc --browse --count-yes 5 --live
 ./kalshi_sports_trader.py --demo kxnflgame-26sep13atlpit --watch --watch-limit 40
 # optional: limit which series are probed
 ./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit --series KXNFLGAME --series KXNFLSPREAD --series KXNFLTOTAL

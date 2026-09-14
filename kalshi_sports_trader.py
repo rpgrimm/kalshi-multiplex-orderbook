@@ -21,14 +21,16 @@ REST orderbooks continuously.
 
 Examples:
     ./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit
+    ./kalshi_sports_trader.py --demo kxnflgame-26sep14denkc --browse --count-yes 5
+    ./kalshi_sports_trader.py --demo kxnflgame-26sep14denkc --browse --count-yes 5 --live
     ./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit --browse
     ./kalshi_sports_trader.py --demo kxnflgame-26sep13atlpit --watch
     ./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit --watch --watch-limit 40
 
 Environment gates (same safety model as broadcast trader):
     --demo or --prod is required (no implicit host).
-    Default is dry-run. --live is accepted for parity / future orders;
-    this slice still does not place orders even with --live.
+    Default is dry-run. Real BUY YES only with --live.
+    Browser Enter on a market buys YES for --count-yes contracts.
 
 Auth for --watch / --browse WS books (env vars or config files):
     ~/.config/kalshi-multiplex-orderbook/prod.env
@@ -39,6 +41,7 @@ Auth for --watch / --browse WS books (env vars or config files):
 from __future__ import annotations
 
 import argparse
+import uuid
 import json
 import os
 import random
@@ -55,6 +58,9 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 PROD_REST_HOST = "https://api.elections.kalshi.com/trade-api/v2"
 PROD_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
@@ -75,7 +81,7 @@ DEFAULT_PRIVATE_KEY_FILE = "grimm.txt"
 # Backward-compatible aliases used by older sports-trader call sites/docs.
 DEFAULT_REST_HOST = PROD_REST_HOST
 DEFAULT_WS_URL = PROD_WS_URL
-USER_AGENT = "kalshi-sports-trader/0.3"
+USER_AGENT = "kalshi-sports-trader/0.4"
 
 SEASON_LONG_HINTS = (
     "WINS",
@@ -587,20 +593,276 @@ def fmt_cents(v: int | None) -> str:
     return "--" if v is None else f"{v:02d}c"
 
 
+def cents_to_dollars(cents: int | None) -> str:
+    if cents is None:
+        return "--"
+    return f"${cents / 100:.2f}"
+
+
+def clamp_price_cents(cents: int) -> int:
+    return max(1, min(99, int(cents)))
+
+
+def fixed_contract_count(count: int | float | str) -> str:
+    return f"{float(count):.2f}"
+
+
+def fixed_dollar_price_from_cents(cents: int | float | str) -> str:
+    return f"{(float(cents) / 100.0):.4f}"
+
+
+def load_pem_private_key(private_key_file: str) -> Any:
+    with Path(private_key_file).expanduser().open("rb") as f:
+        return serialization.load_pem_private_key(f.read(), password=None)
+
+
+def sign_private_key_text(private_key: Any, text: str) -> str:
+    import base64
+
+    signature = private_key.sign(
+        text.encode("utf-8"),
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.DIGEST_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+    return base64.b64encode(signature).decode("utf-8")
+
+
+def headers_to_dict(headers: Any) -> Any:
+    if headers is None:
+        return None
+    if isinstance(headers, dict):
+        return {str(k): str(v) for k, v in headers.items()}
+    try:
+        return {str(k): str(v) for k, v in dict(headers).items()}
+    except Exception:
+        return str(headers)
+
+
+def make_buy_yes_limit_payload(
+    *,
+    ticker: str,
+    count: int,
+    yes_limit_cents: int,
+    time_in_force: str = "immediate_or_cancel",
+) -> dict[str, Any]:
+    """Legacy-shaped BUY YES limit payload (pre-V2 conversion)."""
+    return {
+        "ticker": ticker,
+        "action": "buy",
+        "side": "yes",
+        "count": int(count),
+        "type": "limit",
+        "client_order_id": str(uuid.uuid4()),
+        "yes_price": clamp_price_cents(yes_limit_cents),
+        "time_in_force": time_in_force,
+    }
+
+
+def make_event_order_v2_payload(legacy_payload: dict[str, Any]) -> dict[str, Any]:
+    """Convert legacy BUY YES payload to Kalshi V2 event-order shape."""
+    if str(legacy_payload.get("type") or "") != "limit":
+        raise ValueError("sports trader currently supports limit orders only")
+    action = str(legacy_payload.get("action") or "").lower()
+    side = str(legacy_payload.get("side") or "").lower()
+    if action != "buy" or side != "yes":
+        raise ValueError(f"unsupported order shape action={action!r} side={side!r}")
+    yes_price = legacy_payload.get("yes_price")
+    if yes_price is None:
+        raise ValueError("BUY YES limit order missing yes_price")
+    tif = legacy_payload.get("time_in_force") or "immediate_or_cancel"
+    if tif == "GTT":
+        tif = "good_till_canceled"
+    return {
+        "ticker": legacy_payload["ticker"],
+        "client_order_id": legacy_payload.get("client_order_id") or str(uuid.uuid4()),
+        "side": "bid",
+        "count": fixed_contract_count(legacy_payload["count"]),
+        "price": fixed_dollar_price_from_cents(yes_price),
+        "time_in_force": tif,
+        "self_trade_prevention_type": "taker_at_cross",
+        "post_only": False,
+        "cancel_order_on_pause": False,
+        "reduce_only": False,
+    }
+
+
+def signed_json_request(
+    args: argparse.Namespace,
+    *,
+    method: str,
+    path: str,
+    body: dict | None = None,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Raw signed Kalshi REST request. Never logs secret values."""
+    if not getattr(args, "_auth_api_key_id", None) or not getattr(args, "_auth_private_key_file", None):
+        raise RuntimeError("Resolved auth settings are required before signed REST requests")
+
+    signed_path = str(path).split("?", 1)[0]
+    url = str(args.api_host).rstrip("/") + signed_path.removeprefix("/trade-api/v2")
+    timestamp = str(int(time.time() * 1000))
+    private_key = getattr(args, "_raw_rest_private_key", None)
+    if private_key is None:
+        private_key = load_pem_private_key(args._auth_private_key_file)
+        args._raw_rest_private_key = private_key
+    signature = sign_private_key_text(private_key, timestamp + method.upper() + signed_path)
+    data = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
+    headers = {
+        "KALSHI-ACCESS-KEY": args._auth_api_key_id,
+        "KALSHI-ACCESS-TIMESTAMP": timestamp,
+        "KALSHI-ACCESS-SIGNATURE": signature,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                response_body = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                response_body = {"raw": raw}
+            return {
+                "method": f"raw.{method.upper()} {path}",
+                "http_status": getattr(resp, "status", None) or getattr(resp, "code", None),
+                "headers": headers_to_dict(getattr(resp, "headers", None)),
+                "response": response_body,
+            }
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(4096).decode("utf-8", errors="replace")
+        try:
+            body_obj = json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            body_obj = raw
+        raise RuntimeError(
+            f"HTTP {exc.code} {method.upper()} {path}: {body_obj}"
+        ) from exc
+
+
+def effective_count_yes(args: argparse.Namespace) -> int:
+    if getattr(args, "count_yes", None) is not None:
+        return int(args.count_yes)
+    return int(getattr(args, "count", 1) or 1)
+
+
+def buy_yes_for_market(
+    *,
+    args: argparse.Namespace,
+    row: "MarketRow",
+    quote: "QuoteSnap | None",
+) -> tuple[bool, str]:
+    """BUY YES for --count-yes contracts. Dry-run unless --live.
+
+    Prices from live YES ask + slippage (default 1c), IOC limit via V2 events API.
+    """
+    count = effective_count_yes(args)
+    if count <= 0:
+        return False, "ORDER ERROR: --count-yes must be positive"
+
+    # Ensure auth is resolved for both dry-run metadata and live submit.
+    try:
+        resolve_auth_settings(args, required=True)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"ORDER ERROR auth: {exc}"
+
+    ask = quote.yes_ask if quote is not None else None
+    if ask is None:
+        return False, (
+            f"ORDER BLOCKED {row.ticker}: no YES ask yet "
+            "(wait for book / ensure market is on-screen)"
+        )
+
+    slip = int(getattr(args, "slippage_cents", 1) or 0)
+    limit_cents = clamp_price_cents(int(ask) + slip)
+    legacy = make_buy_yes_limit_payload(
+        ticker=row.ticker,
+        count=count,
+        yes_limit_cents=limit_cents,
+        time_in_force=str(getattr(args, "time_in_force", "immediate_or_cancel")),
+    )
+    try:
+        v2 = make_event_order_v2_payload(legacy)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"ORDER ERROR payload: {exc}"
+
+    mode = "LIVE" if args.live else "DRY-RUN"
+    summary = (
+        f"{mode} BUY YES {row.ticker} count={count} "
+        f"ask={fmt_cents(ask)} limit={fmt_cents(limit_cents)} "
+        f"slip=+{slip}c tif={legacy['time_in_force']}"
+    )
+
+    # Always log the would-be order on stderr (no secrets).
+    eprint(summary)
+    eprint(f"order payload v2: {json.dumps(v2, sort_keys=True)}")
+
+    if not args.live:
+        return True, summary + " (not submitted)"
+
+    try:
+        info = signed_json_request(
+            args,
+            method="POST",
+            path="/trade-api/v2/portfolio/events/orders",
+            body=v2,
+            timeout=float(getattr(args, "order_submit_timeout", 10.0)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"ORDER FAIL {row.ticker}: {exc}"
+
+    http_status = info.get("http_status")
+    resp = info.get("response")
+    eprint(f"order response http={http_status} body={json.dumps(resp, default=str)[:500]}")
+    ok = http_status is None or (isinstance(http_status, int) and 200 <= http_status < 300)
+    if ok:
+        return True, f"LIVE OK BUY YES {row.ticker} count={count} limit={fmt_cents(limit_cents)} http={http_status}"
+    return False, f"LIVE REJECT BUY YES {row.ticker} http={http_status}"
+
+
+
+
+
+def _import_kx_auth():
+    """Import kx_orderbooks.auth without requiring full package extras."""
+    try:
+        from kx_orderbooks import auth as auth_mod
+        return auth_mod
+    except Exception:
+        pass
+    import importlib.util
+    import sys
+    auth_path = Path(__file__).resolve().parent / "kx_orderbooks" / "auth.py"
+    if not auth_path.is_file():
+        raise ImportError(f"kx_orderbooks.auth not found at {auth_path}")
+    if "kx_orderbooks" not in sys.modules:
+        pkg = importlib.util.module_from_spec(
+            importlib.util.spec_from_loader("kx_orderbooks", loader=None)
+        )
+        pkg.__path__ = [str(auth_path.parent)]
+        sys.modules["kx_orderbooks"] = pkg
+    spec = importlib.util.spec_from_file_location("kx_orderbooks.auth", auth_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["kx_orderbooks.auth"] = mod
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def auth_env_candidates(kalshi_env: str) -> list[tuple[str, str]]:
     """Return auth env-var pairs in preferred order for demo or prod."""
-    from kx_orderbooks.auth import auth_env_candidates as _cands
-    return _cands(kalshi_env)
+    return _import_kx_auth().auth_env_candidates(kalshi_env)
 
 
 def default_auth_env_names(kalshi_env: str) -> tuple[str, str]:
-    from kx_orderbooks.auth import default_auth_env_names as _names
-    return _names(kalshi_env)
+    return _import_kx_auth().default_auth_env_names(kalshi_env)
 
 
 def key_id_hint(api_key_id: str) -> str:
-    from kx_orderbooks.auth import key_id_hint as _hint
-    return _hint(api_key_id)
+    return _import_kx_auth().key_id_hint(api_key_id)
 
 
 def default_hosts_for_env(kalshi_env: str, *, demo_host_style: str = "external") -> tuple[str, str]:
@@ -639,16 +901,16 @@ def resolve_auth_settings(args: argparse.Namespace, *, required: bool) -> bool:
     Never prints secret values.
     """
     try:
-        from kx_orderbooks.auth import resolve_kalshi_auth
-    except ImportError as exc:
+        auth_mod = _import_kx_auth()
+    except Exception as exc:
         if required:
             raise RuntimeError(
-                "kx_orderbooks is required for auth resolution. Run: pip install -e ."
+                "kx_orderbooks.auth is required for auth resolution. Run: pip install -e ."
             ) from exc
         return False
 
     try:
-        auth = resolve_kalshi_auth(
+        auth = auth_mod.resolve_kalshi_auth(
             args.kalshi_env,
             private_key_file=getattr(args, "private_key_file", None),
             api_key_id_env=getattr(args, "api_key_id_env", None),
@@ -675,15 +937,15 @@ def resolve_auth_settings(args: argparse.Namespace, *, required: bool) -> bool:
 def resolve_ws_auth(args: argparse.Namespace | None = None) -> tuple[str, Any, str]:
     """Return (api_key_id, private_key, source_label) for WebSocket workers."""
     try:
-        from kx_orderbooks.auth import load_private_key, resolve_kalshi_auth
-    except ImportError as exc:
+        auth_mod = _import_kx_auth()
+    except Exception as exc:
         raise RuntimeError(
-            "kx_orderbooks is required for --watch/--browse WS. Run: pip install -e ."
+            "kx_orderbooks.auth is required for --watch/--browse WS. Run: pip install -e ."
         ) from exc
 
     if args is None:
         for probe in ("prod", "demo"):
-            auth = resolve_kalshi_auth(probe, required=False)
+            auth = auth_mod.resolve_kalshi_auth(probe, required=False)
             if auth is not None:
                 return (
                     auth.api_key_id,
@@ -699,7 +961,7 @@ def resolve_ws_auth(args: argparse.Namespace | None = None) -> tuple[str, Any, s
         raise RuntimeError("auth resolution failed")
     return (
         args._auth_api_key_id,
-        load_private_key(args._auth_private_key_file),
+        auth_mod.load_private_key(args._auth_private_key_file),
         f"{args.kalshi_env}:{args._auth_api_key_env}",
     )
 
@@ -1304,13 +1566,20 @@ NORMAL navigation
   ↓ / j / Ctrl-N     move down
   PgUp / PgDn        page up/down
   Home / End / g/G   first / last row
-  Enter              open category or market
+  Enter              categories: open · markets/detail: BUY YES (--count-yes)
+  d / Space           open market detail (no order)
   Esc / Backspace    clear filter if set, else go back
   1-5                jump to category (on category screen)
   a                  show All markets category
   Ctrl-L / Ctrl-R    redraw
   Ctrl-H             this help
   q                  quit browser
+
+Orders
+  Enter on a market  BUY YES for --count-yes contracts (default 1)
+  Price              YES ask + --slippage-cents (default 1), IOC limit
+  Dry-run default    logs payload only; add --live to submit
+  Prefer --demo      for first live tests
 
 FILTER matching
   Multi-word, order-independent: "patrick mahomes td"
@@ -1336,6 +1605,7 @@ class BrowserState:
     game_code: str
     rows: list[MarketRow]
     tracker: BackgroundBookTracker
+    args: argparse.Namespace
     mode: str = "categories"  # categories | markets | detail | help
     input_mode: str = "normal"  # normal | filter
     category: str = "game_lines"
@@ -1346,6 +1616,8 @@ class BrowserState:
     selected_ticker: str = ""
     message: str = ""
     prev_mode: str = "categories"
+    order_busy: bool = False
+    last_order_ts: float = 0.0
 
     def category_counts(self) -> dict[str, int]:
         counts = {k: 0 for k in CATEGORY_ORDER}
@@ -1532,7 +1804,11 @@ def render_browser(state: BrowserState) -> None:
         if state.input_mode == "filter":
             lines.append("FILTER mode · type freely (q/k/j ok) · Esc/Enter normal · Ctrl-U clear")
         else:
-            lines.append("NORMAL · Enter detail · Esc back · f filter · j/k move · q quit · Ctrl-H help")
+            count_yes = effective_count_yes(state.args)
+            mode = "LIVE" if state.args.live else "DRY-RUN"
+            lines.append(
+                f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · d detail · Esc back · f filter · q quit"
+            )
     elif state.mode == "detail":
         row = next((r for r in state.rows if r.ticker == state.selected_ticker), None)
         if row is None:
@@ -1564,8 +1840,11 @@ def render_browser(state: BrowserState) -> None:
             else:
                 lines.append("  book: (waiting for websocket snapshot)")
             lines.append("")
-            lines.append("NORMAL · Esc/Backspace back · f filter · q quit · Ctrl-H help")
-            lines.append("Orders not enabled in this slice.")
+            count_yes = effective_count_yes(state.args)
+            mode = "LIVE" if state.args.live else "DRY-RUN"
+            lines.append(
+                f"Enter BUY YES x{count_yes} ({mode}) · Esc back · f filter · q quit"
+            )
 
     lines.append("")
     clear_screen()
@@ -1587,6 +1866,55 @@ def open_category(state: BrowserState, key: str) -> None:
     state.message = ""
 
 
+def open_market_detail(state: BrowserState, ticker: str) -> None:
+    state.selected_ticker = ticker
+    state.mode = "detail"
+    state.input_mode = "normal"
+    state.message = ""
+
+
+def selected_market_row(state: BrowserState) -> MarketRow | None:
+    if state.mode == "markets":
+        rows = state.filtered_rows()
+        if not rows:
+            return None
+        clamp_cursor(state, len(rows))
+        return rows[state.cursor]
+    if state.mode == "detail" and state.selected_ticker:
+        return next((r for r in state.rows if r.ticker == state.selected_ticker), None)
+    return None
+
+
+def handle_buy_yes(state: BrowserState) -> None:
+    """Enter on market/detail: BUY YES for --count-yes."""
+    if state.order_busy:
+        state.message = "order already in flight"
+        return
+    # simple debounce against double Enter
+    now = time.time()
+    if now - state.last_order_ts < 0.35:
+        state.message = "order debounced — wait a moment"
+        return
+
+    row = selected_market_row(state)
+    if row is None:
+        state.message = "no market selected"
+        return
+
+    state.tracker.ensure_quotes([row.ticker], force=True)
+    quote = state.tracker.quote(row.ticker)
+    state.order_busy = True
+    try:
+        ok, status = buy_yes_for_market(args=state.args, row=row, quote=quote)
+    finally:
+        state.order_busy = False
+        state.last_order_ts = time.time()
+    state.message = status if ok else status
+    # Keep selection on the market; jump to detail so the status is readable.
+    if state.mode == "markets":
+        open_market_detail(state, row.ticker)
+
+
 def handle_enter(state: BrowserState) -> None:
     if state.input_mode == "filter":
         leave_filter_mode(state)
@@ -1598,15 +1926,8 @@ def handle_enter(state: BrowserState) -> None:
         clamp_cursor(state, len(items))
         key = items[state.cursor][0]
         open_category(state, key)
-    elif state.mode == "markets":
-        rows = state.filtered_rows()
-        if not rows:
-            return
-        clamp_cursor(state, len(rows))
-        state.selected_ticker = rows[state.cursor].ticker
-        state.mode = "detail"
-        state.input_mode = "normal"
-        state.message = ""
+    elif state.mode in {"markets", "detail"}:
+        handle_buy_yes(state)
     elif state.mode == "help":
         state.mode = state.prev_mode
 
@@ -1675,13 +1996,16 @@ def run_browser(
                 f"auth={tracker.auth_label or '-'}"
             )
 
+    count_yes = effective_count_yes(args)
+    mode = "LIVE" if args.live else "DRY-RUN"
     state = BrowserState(
         seed_series=seed_series,
         game_code=game_code,
         rows=rows,
         tracker=tracker,
+        args=args,
         message=(
-            "NORMAL · f filter · Ctrl-H help · books refresh for visible markets"
+            f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · d detail · f filter · Ctrl-H help"
         ),
     )
 
@@ -1843,6 +2167,13 @@ def run_browser(
                 enter_filter_mode(state, jump_all=(state.mode == "categories"))
                 continue
 
+            if state.mode == "markets" and kind == "char" and value in {"d", "D", " "}:
+                rows = state.filtered_rows()
+                if rows:
+                    clamp_cursor(state, len(rows))
+                    open_market_detail(state, rows[state.cursor].ticker)
+                continue
+
             if state.mode == "categories" and kind == "char":
                 if value in {"1", "2", "3", "4", "5"}:
                     idx = int(value) - 1
@@ -1883,8 +2214,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description=(
             "Discover Kalshi sports markets for a game id; keyboard browser "
             "and/or WebSocket orderbook tracking (no REST book polling). "
-            "Requires --demo or --prod. Default is dry-run; --live is accepted "
-            "for parity with the broadcast trader (orders not enabled yet)."
+            "Requires --demo or --prod. Default is dry-run; --live submits real "
+            "BUY YES orders from the browser (Enter on a market)."
         )
     )
 
@@ -1917,9 +2248,43 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--live",
         action="store_true",
         help=(
-            "Request live trading mode. Default is dry-run. This sports slice still "
-            "does not place orders; flag is accepted for operator parity / future use."
+            "Submit real orders. Default is dry-run (logs BUY YES payload only). "
+            "Prefer --demo --live for first tests."
         ),
+    )
+    p.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        help="Fallback contracts per BUY YES when --count-yes is omitted. Default: 1",
+    )
+    p.add_argument(
+        "--count-yes",
+        type=int,
+        default=None,
+        help=(
+            "Contracts to BUY YES when pressing Enter on a market/detail. "
+            "Default: --count (1)."
+        ),
+    )
+    p.add_argument(
+        "--slippage-cents",
+        "--slippage",
+        type=int,
+        default=1,
+        help="BUY YES limit = YES ask + this many cents (clamped 1..99). Default: 1",
+    )
+    p.add_argument(
+        "--time-in-force",
+        default="immediate_or_cancel",
+        choices=["immediate_or_cancel", "good_till_canceled", "fill_or_kill"],
+        help="Limit order time-in-force for Enter BUY YES. Default: immediate_or_cancel",
+    )
+    p.add_argument(
+        "--order-submit-timeout",
+        type=float,
+        default=10.0,
+        help="HTTP timeout seconds for live order submit. Default: 10",
     )
 
     p.add_argument(
@@ -2083,10 +2448,24 @@ def main(argv: list[str] | None = None) -> int:
         globals()["eprint"] = _quiet_eprint
 
     mode = "LIVE" if args.live else "DRY-RUN"
+    if args.count is not None and args.count <= 0:
+        eprint("error: --count must be positive")
+        return 2
+    if args.count_yes is not None and args.count_yes <= 0:
+        eprint("error: --count-yes must be positive")
+        return 2
+    if args.slippage_cents < 0:
+        eprint("error: --slippage-cents must be >= 0")
+        return 2
     if args.live:
         eprint(
-            "note: --live requested, but this sports slice still does not place orders; "
-            "running discovery/browse/watch only."
+            f"LIVE mode: Enter on a market will BUY YES x{effective_count_yes(args)} "
+            f"(ask+{args.slippage_cents}c IOC). Prefer --demo for first tests."
+        )
+    else:
+        eprint(
+            f"DRY-RUN mode: Enter logs BUY YES x{effective_count_yes(args)} payload only "
+            "(add --live to submit)."
         )
 
     try:
