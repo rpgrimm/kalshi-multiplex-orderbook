@@ -37,15 +37,19 @@ export KALSHI_PROD_PRIVATE_KEY_FILE="$HOME/path/to/prod_private_key.pem"
 python3 examples/watch_series_orderbooks.py KXTRUMPMENTIONB
 ```
 
-### Sports trader (list markets for a game)
+### Sports trader (list / browse / watch markets for a game)
 
-Public REST only for now — no API keys required for listing.
+Same env gates as the broadcast trader: **`--demo` or `--prod` required**. Default is dry-run; `--live` is accepted for parity but this slice still does not place orders.
+
+Catalog discovery uses public REST (no keys). Live books via `--browse` / `--watch` need env-matching API keys (`KALSHI_PROD_*` or `KALSHI_DEMO_*`).
 
 ```bash
-./kalshi_sports_trader.py kxnflgame-26sep13atlpit
-./kalshi_sports_trader.py KXNFLGAME-26SEP13ATLPIT --status all
+./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit
+./kalshi_sports_trader.py --prod KXNFLGAME-26SEP13ATLPIT --status all
+./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit --browse
+./kalshi_sports_trader.py --demo kxnflgame-26sep13atlpit --watch --watch-limit 40
 # optional: limit which series are probed
-./kalshi_sports_trader.py kxnflgame-26sep13atlpit --series KXNFLGAME --series KXNFLSPREAD --series KXNFLTOTAL
+./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit --series KXNFLGAME --series KXNFLSPREAD --series KXNFLTOTAL
 ```
 
 Kalshi splits one game across many series that share the same game code

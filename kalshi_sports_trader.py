@@ -20,15 +20,20 @@ Keep REST budget for discovery + later orders/account snapshots. Do not poll
 REST orderbooks continuously.
 
 Examples:
-    ./kalshi_sports_trader.py kxnflgame-26sep13atlpit
-    ./kalshi_sports_trader.py kxnflgame-26sep13atlpit --browse
-    ./kalshi_sports_trader.py kxnflgame-26sep13atlpit --watch
-    ./kalshi_sports_trader.py kxnflgame-26sep13atlpit --watch --watch-limit 40
+    ./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit
+    ./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit --browse
+    ./kalshi_sports_trader.py --demo kxnflgame-26sep13atlpit --watch
+    ./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit --watch --watch-limit 40
 
-Auth for --watch (same as kx_orderbooks / broadcast trader):
-    export KALSHI_API_KEY_ID=...
-    export KALSHI_PRIVATE_KEY_FILE=/path/to/key.pem
-  or KALSHI_PROD_* / KALSHI_DEMO_* variants.
+Environment gates (same safety model as broadcast trader):
+    --demo or --prod is required (no implicit host).
+    Default is dry-run. --live is accepted for parity / future orders;
+    this slice still does not place orders even with --live.
+
+Auth for --watch / --browse WS books:
+    demo:  KALSHI_DEMO_API_KEY_ID + KALSHI_DEMO_PRIVATE_KEY_FILE
+    prod:  KALSHI_PROD_API_KEY_ID + KALSHI_PROD_PRIVATE_KEY_FILE
+           (legacy fallback: KALSHI_API_KEY_ID + KALSHI_PRIVATE_KEY_FILE)
 """
 
 from __future__ import annotations
@@ -48,11 +53,29 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable
 
-DEFAULT_REST_HOST = "https://api.elections.kalshi.com/trade-api/v2"
-DEFAULT_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
-USER_AGENT = "kalshi-sports-trader/0.2"
+PROD_REST_HOST = "https://api.elections.kalshi.com/trade-api/v2"
+PROD_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
+DEMO_REST_HOST = "https://external-api.demo.kalshi.co/trade-api/v2"
+DEMO_REST_HOST_ALT = "https://demo-api.kalshi.co/trade-api/v2"
+DEMO_WS_URL = "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2"
+DEMO_WS_URL_ALT = "wss://demo-api.kalshi.co/trade-api/ws/v2"
+
+# Preferred environment-specific auth variables (match broadcast trader).
+PROD_API_KEY_ID_ENV = "KALSHI_PROD_API_KEY_ID"
+PROD_PRIVATE_KEY_FILE_ENV = "KALSHI_PROD_PRIVATE_KEY_FILE"
+DEMO_API_KEY_ID_ENV = "KALSHI_DEMO_API_KEY_ID"
+DEMO_PRIVATE_KEY_FILE_ENV = "KALSHI_DEMO_PRIVATE_KEY_FILE"
+LEGACY_PROD_API_KEY_ID_ENV = "KALSHI_API_KEY_ID"
+LEGACY_PROD_PRIVATE_KEY_FILE_ENV = "KALSHI_PRIVATE_KEY_FILE"
+DEFAULT_PRIVATE_KEY_FILE = "grimm.txt"
+
+# Backward-compatible aliases used by older sports-trader call sites/docs.
+DEFAULT_REST_HOST = PROD_REST_HOST
+DEFAULT_WS_URL = PROD_WS_URL
+USER_AGENT = "kalshi-sports-trader/0.3"
 
 SEASON_LONG_HINTS = (
     "WINS",
@@ -564,29 +587,156 @@ def fmt_cents(v: int | None) -> str:
     return "--" if v is None else f"{v:02d}c"
 
 
-def resolve_ws_auth() -> tuple[str, Any, str]:
-    """Return (api_key_id, private_key, source_label)."""
+def auth_env_candidates(kalshi_env: str) -> list[tuple[str, str]]:
+    """Return auth env-var pairs in preferred order for demo or prod."""
+    if kalshi_env == "demo":
+        return [(DEMO_API_KEY_ID_ENV, DEMO_PRIVATE_KEY_FILE_ENV)]
+    return [
+        (PROD_API_KEY_ID_ENV, PROD_PRIVATE_KEY_FILE_ENV),
+        (LEGACY_PROD_API_KEY_ID_ENV, LEGACY_PROD_PRIVATE_KEY_FILE_ENV),
+    ]
+
+
+def default_auth_env_names(kalshi_env: str) -> tuple[str, str]:
+    return auth_env_candidates(kalshi_env)[0]
+
+
+def key_id_hint(api_key_id: str) -> str:
+    """Non-secret key hint for logs."""
+    text = str(api_key_id or "")
+    if len(text) <= 12:
+        return "set"
+    return f"{text[:8]}...{text[-4:]}"
+
+
+def default_hosts_for_env(kalshi_env: str, *, demo_host_style: str = "external") -> tuple[str, str]:
+    """Return (rest_host, ws_url) for --demo/--prod."""
+    if kalshi_env == "demo":
+        if demo_host_style == "direct":
+            return DEMO_REST_HOST_ALT, DEMO_WS_URL_ALT
+        return DEMO_REST_HOST, DEMO_WS_URL
+    return PROD_REST_HOST, PROD_WS_URL
+
+
+def apply_env_endpoints(args: argparse.Namespace) -> None:
+    """Fill api_host / ws_url from --demo/--prod unless explicitly overridden."""
+    rest_default, ws_default = default_hosts_for_env(
+        args.kalshi_env,
+        demo_host_style=str(getattr(args, "demo_host_style", "external") or "external"),
+    )
+    # Prefer explicit --api-host, then --host, else env default.
+    host_override = getattr(args, "host", None)
+    api_host_override = getattr(args, "api_host", None)
+    if api_host_override:
+        args.api_host = str(api_host_override).rstrip("/")
+    elif host_override:
+        args.api_host = str(host_override).rstrip("/")
+    else:
+        args.api_host = rest_default.rstrip("/")
+    # Keep --host in sync for discovery call sites that still read args.host.
+    args.host = args.api_host
+
+    ws_override = getattr(args, "ws_url", None)
+    args.ws_url = str(ws_override) if ws_override else ws_default
+
+
+def choose_auth_env_pair(args: argparse.Namespace) -> tuple[str, str]:
+    preferred_api_env, preferred_private_env = default_auth_env_names(args.kalshi_env)
+    api_key_id_env = getattr(args, "api_key_id_env", None)
+    private_key_file_env = getattr(args, "private_key_file_env", None)
+    if api_key_id_env or private_key_file_env:
+        return (
+            api_key_id_env or preferred_api_env,
+            private_key_file_env or preferred_private_env,
+        )
+    for api_env, private_env in auth_env_candidates(args.kalshi_env):
+        if os.environ.get(api_env) or os.environ.get(private_env):
+            return api_env, private_env
+    return preferred_api_env, preferred_private_env
+
+
+def resolve_auth_settings(args: argparse.Namespace, *, required: bool) -> bool:
+    """Resolve auth onto args. Return True if auth is available.
+
+    When required=True, raise RuntimeError on missing credentials.
+    Never prints secret values.
+    """
+    api_key_env, private_key_file_env = choose_auth_env_pair(args)
+    api_key_id = os.environ.get(api_key_env)
+    private_key_file = getattr(args, "private_key_file", None) or os.environ.get(private_key_file_env)
+
+    # Prod-only legacy fallback used by broadcast trader.
+    if (
+        not private_key_file
+        and args.kalshi_env == "prod"
+        and Path(DEFAULT_PRIVATE_KEY_FILE).expanduser().exists()
+    ):
+        private_key_file = DEFAULT_PRIVATE_KEY_FILE
+        private_key_file_env = "(fallback: ./grimm.txt)"
+
+    if not api_key_id or not private_key_file:
+        if not required:
+            return False
+        candidates_k = ", ".join(a for a, _ in auth_env_candidates(args.kalshi_env))
+        candidates_p = ", ".join(p for _, p in auth_env_candidates(args.kalshi_env))
+        missing = []
+        if not api_key_id:
+            missing.append(f"API key env ({api_key_env}; candidates: {candidates_k})")
+        if not private_key_file:
+            missing.append(
+                f"private key file ({private_key_file_env}; candidates: {candidates_p} "
+                f"or --private-key-file)"
+            )
+        raise RuntimeError(
+            f"Missing auth for {args.kalshi_env}: " + "; ".join(missing)
+        )
+
+    private_key_path = str(Path(private_key_file).expanduser())
+    if not Path(private_key_path).exists():
+        if not required:
+            return False
+        raise RuntimeError(f"Private key file not found: {private_key_path}")
+
+    args._auth_api_key_id = api_key_id
+    args._auth_api_key_hint = key_id_hint(api_key_id)
+    args._auth_api_key_env = api_key_env
+    args._auth_private_key_file = private_key_path
+    args._auth_private_key_file_env = private_key_file_env
+    return True
+
+
+def resolve_ws_auth(args: argparse.Namespace | None = None) -> tuple[str, Any, str]:
+    """Return (api_key_id, private_key, source_label) for WebSocket workers."""
     try:
-        from kx_orderbooks.auth import load_auth_from_env, load_private_key
+        from kx_orderbooks.auth import load_private_key
     except ImportError as exc:
         raise RuntimeError(
-            "kx_orderbooks is required for --watch. Run: pip install -e ."
+            "kx_orderbooks is required for --watch/--browse WS. Run: pip install -e ."
         ) from exc
 
-    pairs = [
-        ("KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_FILE", "KALSHI_*"),
-        ("KALSHI_PROD_API_KEY_ID", "KALSHI_PROD_PRIVATE_KEY_FILE", "KALSHI_PROD_*"),
-        ("KALSHI_DEMO_API_KEY_ID", "KALSHI_DEMO_PRIVATE_KEY_FILE", "KALSHI_DEMO_*"),
-    ]
-    for key_env, pem_env, label in pairs:
-        key = os.environ.get(key_env)
-        pem = os.environ.get(pem_env)
-        if key and pem:
-            return key, load_private_key(pem), label
+    if args is None:
+        # Legacy path: probe env without --demo/--prod context (should be rare).
+        pairs = [
+            (PROD_API_KEY_ID_ENV, PROD_PRIVATE_KEY_FILE_ENV, "KALSHI_PROD_*"),
+            (LEGACY_PROD_API_KEY_ID_ENV, LEGACY_PROD_PRIVATE_KEY_FILE_ENV, "KALSHI_*"),
+            (DEMO_API_KEY_ID_ENV, DEMO_PRIVATE_KEY_FILE_ENV, "KALSHI_DEMO_*"),
+        ]
+        for key_env, pem_env, label in pairs:
+            key = os.environ.get(key_env)
+            pem = os.environ.get(pem_env)
+            if key and pem:
+                return key, load_private_key(pem), label
+        raise RuntimeError(
+            "Set KALSHI_PROD_* or KALSHI_DEMO_* (or legacy KALSHI_*) auth env vars."
+        )
 
-    # Fall back to default env names used by kx_orderbooks.
-    key, private_key = load_auth_from_env()
-    return key, private_key, "KALSHI_*"
+    if not resolve_auth_settings(args, required=True):
+        raise RuntimeError("auth resolution failed")
+    return (
+        args._auth_api_key_id,
+        load_private_key(args._auth_private_key_file),
+        f"{args.kalshi_env}:{args._auth_api_key_env}",
+    )
 
 
 def select_watch_rows(rows: list[MarketRow], *, watch_limit: int) -> list[MarketRow]:
@@ -602,6 +752,7 @@ def select_watch_rows(rows: list[MarketRow], *, watch_limit: int) -> list[Market
 def run_watch(
     rows: list[MarketRow],
     *,
+    args: argparse.Namespace,
     ws_url: str,
     watch_limit: int,
     print_every: float,
@@ -616,12 +767,13 @@ def run_watch(
         return 2
 
     try:
-        api_key_id, private_key, auth_label = resolve_ws_auth()
+        api_key_id, private_key, auth_label = resolve_ws_auth(args)
     except Exception as exc:  # noqa: BLE001
         eprint(f"error: WebSocket auth not configured: {exc}")
+        pref_k, pref_p = default_auth_env_names(args.kalshi_env)
         eprint(
-            "Set KALSHI_API_KEY_ID + KALSHI_PRIVATE_KEY_FILE "
-            "(or KALSHI_PROD_* / KALSHI_DEMO_*)."
+            f"For --{args.kalshi_env}, set {pref_k} + {pref_p} "
+            f"(prod also accepts legacy KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_FILE)."
         )
         return 2
 
@@ -875,11 +1027,13 @@ class BackgroundBookTracker:
         ws_url: str,
         watch_limit: int,
         log_raw: bool = False,
+        args: argparse.Namespace | None = None,
     ):
         self.rows = rows
         self.ws_url = ws_url
         self.watch_limit = watch_limit
         self.log_raw = log_raw
+        self.args = args
         self.store = None
         self.worker = None
         self.enabled = False
@@ -900,7 +1054,7 @@ class BackgroundBookTracker:
             return
 
         try:
-            api_key_id, private_key, auth_label = resolve_ws_auth()
+            api_key_id, private_key, auth_label = resolve_ws_auth(self.args)
         except Exception as exc:  # noqa: BLE001
             self.status = "no-auth"
             self.error = str(exc)
@@ -1432,6 +1586,7 @@ def run_browser(
     seed_series: str,
     game_code: str,
     rows: list[MarketRow],
+    args: argparse.Namespace,
     ws_url: str,
     watch_limit: int,
     log_raw: bool,
@@ -1446,6 +1601,7 @@ def run_browser(
         ws_url=ws_url,
         watch_limit=0 if watch_limit < 0 else watch_limit,
         log_raw=log_raw,
+        args=args,
     )
     if no_ws:
         tracker.status = "disabled"
@@ -1666,17 +1822,59 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Discover Kalshi sports markets for a game id; keyboard browser "
-            "and/or WebSocket orderbook tracking (no REST book polling)."
+            "and/or WebSocket orderbook tracking (no REST book polling). "
+            "Requires --demo or --prod. Default is dry-run; --live is accepted "
+            "for parity with the broadcast trader (orders not enabled yet)."
         )
     )
+
+    env = p.add_mutually_exclusive_group(required=True)
+    env.add_argument(
+        "--demo",
+        dest="kalshi_env",
+        action="store_const",
+        const="demo",
+        help="Use Kalshi demo REST/WS endpoints. Required choice: --demo or --prod.",
+    )
+    env.add_argument(
+        "--prod",
+        dest="kalshi_env",
+        action="store_const",
+        const="prod",
+        help="Use Kalshi production REST/WS endpoints. Required choice: --demo or --prod.",
+    )
+
+    p.add_argument(
+        "--demo-host-style",
+        choices=["external", "direct"],
+        default="external",
+        help=(
+            "Demo endpoint pair. external = external-api.demo / external-api-ws.demo; "
+            "direct = demo-api REST + demo-api WS. Default: external"
+        ),
+    )
+    p.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Request live trading mode. Default is dry-run. This sports slice still "
+            "does not place orders; flag is accepted for operator parity / future use."
+        ),
+    )
+
     p.add_argument(
         "game",
         help="Game/event id or URL tail, e.g. kxnflgame-26sep13atlpit",
     )
     p.add_argument(
         "--host",
-        default=DEFAULT_REST_HOST,
-        help=f"REST host for catalog discovery (default {DEFAULT_REST_HOST})",
+        default=None,
+        help="Override REST catalog host selected by --demo/--prod.",
+    )
+    p.add_argument(
+        "--api-host",
+        default=None,
+        help="Alias for --host (broadcast-trader naming). Overrides --demo/--prod REST host.",
     )
     p.add_argument(
         "--status",
@@ -1757,7 +1955,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "After discovery, stream orderbooks over one authenticated Kalshi "
-            "WebSocket (kx_orderbooks multiplex). Requires API key env. "
+            "WebSocket (kx_orderbooks multiplex). Requires env-matching API keys. "
             "Prints ticks (use --browse for silent tracking + UI)."
         ),
     )
@@ -1769,8 +1967,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--ws-url",
-        default=DEFAULT_WS_URL,
-        help=f"WebSocket URL (default {DEFAULT_WS_URL})",
+        default=None,
+        help="Override the WebSocket URL selected by --demo/--prod.",
     )
     p.add_argument(
         "--print-every",
@@ -1783,17 +1981,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="With --watch, log raw websocket messages.",
     )
+    p.add_argument(
+        "--api-key-id-env",
+        default=None,
+        help=(
+            "Env var holding API key id. Defaults: "
+            f"demo={DEMO_API_KEY_ID_ENV}, prod={PROD_API_KEY_ID_ENV} "
+            f"(legacy prod {LEGACY_PROD_API_KEY_ID_ENV})."
+        ),
+    )
+    p.add_argument(
+        "--private-key-file-env",
+        default=None,
+        help=(
+            "Env var holding private-key PEM path. Defaults: "
+            f"demo={DEMO_PRIVATE_KEY_FILE_ENV}, prod={PROD_PRIVATE_KEY_FILE_ENV} "
+            f"(legacy prod {LEGACY_PROD_PRIVATE_KEY_FILE_ENV})."
+        ),
+    )
+    p.add_argument(
+        "--private-key-file",
+        default=None,
+        help="Private key PEM path (overrides env-var file path).",
+    )
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    apply_env_endpoints(args)
 
     if args.quiet:
         def _quiet_eprint(*_a: Any, **_k: Any) -> None:
             return None
 
         globals()["eprint"] = _quiet_eprint
+
+    mode = "LIVE" if args.live else "DRY-RUN"
+    if args.live:
+        eprint(
+            "note: --live requested, but this sports slice still does not place orders; "
+            "running discovery/browse/watch only."
+        )
 
     try:
         seed_series, game_code = parse_game_input(args.game)
@@ -1805,6 +2034,9 @@ def main(argv: list[str] | None = None) -> int:
     league = league_prefix_from_series(seed_series)
 
     t0 = time.time()
+    eprint(
+        f"env={args.kalshi_env} mode={mode} rest={args.api_host} ws={args.ws_url}"
+    )
     eprint(f"game_code={game_code} seed_series={seed_series} league_prefix={league}")
     eprint(f"status_filter={'all' if not statuses else ','.join(sorted(statuses))}")
     eprint(f"discovery={args.discovery} scan_all_series={bool(args.scan_all_series)}")
@@ -1839,6 +2071,10 @@ def main(argv: list[str] | None = None) -> int:
                 "seed_series": seed_series,
                 "game_code": game_code,
                 "league_prefix": league,
+                "kalshi_env": args.kalshi_env,
+                "mode": mode.lower().replace("-", "_"),
+                "api_host": args.api_host,
+                "ws_url": args.ws_url,
                 "market_count": 0,
                 "series_hits": hits,
                 "errors": errors,
@@ -1860,12 +2096,13 @@ def main(argv: list[str] | None = None) -> int:
         # Compact discovery summary on stderr; UI owns the screen.
         eprint(
             f"discovered {len(rows)} markets across {len(hits)} series "
-            f"in {elapsed:.1f}s; opening browser"
+            f"in {elapsed:.1f}s; opening browser ({args.kalshi_env}/{mode})"
         )
         return run_browser(
             seed_series=seed_series,
             game_code=game_code,
             rows=rows,
+            args=args,
             ws_url=str(args.ws_url),
             watch_limit=int(args.watch_limit),
             log_raw=bool(args.log_raw),
@@ -1877,6 +2114,10 @@ def main(argv: list[str] | None = None) -> int:
             "seed_series": seed_series,
             "game_code": game_code,
             "league_prefix": league,
+            "kalshi_env": args.kalshi_env,
+            "mode": mode.lower().replace("-", "_"),
+            "api_host": args.api_host,
+            "ws_url": args.ws_url,
             "market_count": len(rows),
             "series_hits": hits,
             "errors": errors,
@@ -1909,6 +2150,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.watch:
         return run_watch(
             rows,
+            args=args,
             ws_url=str(args.ws_url),
             watch_limit=int(args.watch_limit),
             print_every=float(args.print_every),
