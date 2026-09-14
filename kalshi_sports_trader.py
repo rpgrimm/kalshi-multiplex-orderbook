@@ -29,8 +29,9 @@ Examples:
 
 Environment gates (same safety model as broadcast trader):
     --demo or --prod is required (no implicit host).
-    Default is dry-run. Real BUY YES only with --live.
+    Default is dry-run. Real BUY/SELL only with --live.
     Browser Enter on a market buys YES for --count-yes contracts.
+    o opens ORDERS/positions; Enter there SELL YES EXIT ALL (confirm).
     Order events stay in memory during submit and dump to disk when idle/exit.
 
 Auth for --watch / --browse WS books (env vars or config files):
@@ -783,31 +784,52 @@ def make_buy_yes_limit_payload(
     }
 
 
+def make_sell_yes_limit_payload(
+    *,
+    ticker: str,
+    count: int,
+    yes_limit_cents: int,
+    time_in_force: str = "immediate_or_cancel",
+) -> dict[str, Any]:
+    """Legacy-shaped SELL YES (exit long YES) limit payload."""
+    return {
+        "ticker": ticker,
+        "action": "sell",
+        "side": "yes",
+        "count": int(count),
+        "type": "limit",
+        "client_order_id": str(uuid.uuid4()),
+        "yes_price": clamp_price_cents(yes_limit_cents),
+        "time_in_force": time_in_force,
+    }
+
+
 def make_event_order_v2_payload(legacy_payload: dict[str, Any]) -> dict[str, Any]:
-    """Convert legacy BUY YES payload to Kalshi V2 event-order shape."""
+    """Convert legacy BUY/SELL YES payload to Kalshi V2 event-order shape."""
     if str(legacy_payload.get("type") or "") != "limit":
         raise ValueError("sports trader currently supports limit orders only")
     action = str(legacy_payload.get("action") or "").lower()
     side = str(legacy_payload.get("side") or "").lower()
-    if action != "buy" or side != "yes":
+    if side != "yes" or action not in {"buy", "sell"}:
         raise ValueError(f"unsupported order shape action={action!r} side={side!r}")
     yes_price = legacy_payload.get("yes_price")
     if yes_price is None:
-        raise ValueError("BUY YES limit order missing yes_price")
+        raise ValueError(f"{action.upper()} YES limit order missing yes_price")
     tif = legacy_payload.get("time_in_force") or "immediate_or_cancel"
     if tif == "GTT":
         tif = "good_till_canceled"
+    # V2 YES book: BUY YES = bid, SELL YES = ask (reduce_only).
     return {
         "ticker": legacy_payload["ticker"],
         "client_order_id": legacy_payload.get("client_order_id") or str(uuid.uuid4()),
-        "side": "bid",
+        "side": "bid" if action == "buy" else "ask",
         "count": fixed_contract_count(legacy_payload["count"]),
         "price": fixed_dollar_price_from_cents(yes_price),
         "time_in_force": tif,
         "self_trade_prevention_type": "taker_at_cross",
         "post_only": False,
         "cancel_order_on_pause": False,
-        "reduce_only": False,
+        "reduce_only": action == "sell",
     }
 
 
@@ -817,14 +839,21 @@ def signed_json_request(
     method: str,
     path: str,
     body: dict | None = None,
+    params: dict[str, Any] | None = None,
     timeout: float = 10.0,
 ) -> dict[str, Any]:
     """Raw signed Kalshi REST request. Never logs secret values."""
     if not getattr(args, "_auth_api_key_id", None) or not getattr(args, "_auth_private_key_file", None):
         raise RuntimeError("Resolved auth settings are required before signed REST requests")
 
+    # Kalshi signs the path without query params; append params to the URL only.
     signed_path = str(path).split("?", 1)[0]
     url = str(args.api_host).rstrip("/") + signed_path.removeprefix("/trade-api/v2")
+    query = urllib.parse.urlencode(
+        {str(k): v for k, v in (params or {}).items() if v not in (None, "")}
+    )
+    if query:
+        url += "?" + query
     timestamp = str(int(time.time() * 1000))
     private_key = getattr(args, "_raw_rest_private_key", None)
     if private_key is None:
@@ -931,6 +960,15 @@ def buy_yes_for_market(
     )
 
     if not args.live:
+        SESSION_BETS.record_buy(
+            ticker=row.ticker,
+            title=row.title or row.yes_sub_title or "",
+            count=count,
+            limit_cents=limit_cents,
+            live=False,
+            dry_run=True,
+            note=summary,
+        )
         return True, summary + " (not submitted; memory-log)"
 
     try:
@@ -975,9 +1013,343 @@ def buy_yes_for_market(
         ok=ok,
         http_status=http_status if isinstance(http_status, int) else None,
     )
+    if ok:
+        SESSION_BETS.record_buy(
+            ticker=row.ticker,
+            title=row.title or row.yes_sub_title or "",
+            count=count,
+            limit_cents=limit_cents,
+            live=True,
+            dry_run=False,
+            note=msg,
+        )
     return ok, msg
 
 
+@dataclass
+class SessionBet:
+    """One session-tracked BUY YES that went through (live or dry-run)."""
+
+    ticker: str
+    title: str
+    count: int
+    limit_cents: int | None
+    ts: float
+    live: bool
+    dry_run: bool
+    note: str = ""
+    sold_count: int = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, int(self.count) - int(self.sold_count))
+
+
+class SessionBetBook:
+    """In-memory bets opened this browser session (plus optional exchange positions)."""
+
+    def __init__(self) -> None:
+        self.bets: list[SessionBet] = []
+        self.exchange_positions: dict[str, int] = {}  # ticker -> net YES contracts
+        self.positions_error: str = ""
+        self.positions_ts: float = 0.0
+
+    def record_buy(
+        self,
+        *,
+        ticker: str,
+        title: str,
+        count: int,
+        limit_cents: int | None,
+        live: bool,
+        dry_run: bool,
+        note: str = "",
+    ) -> SessionBet:
+        bet = SessionBet(
+            ticker=ticker,
+            title=title or "",
+            count=int(count),
+            limit_cents=limit_cents,
+            ts=time.time(),
+            live=bool(live),
+            dry_run=bool(dry_run),
+            note=note or "",
+        )
+        self.bets.append(bet)
+        return bet
+
+    def mark_sold(self, ticker: str, count: int) -> None:
+        left = int(count)
+        if left <= 0:
+            return
+        for bet in reversed(self.bets):
+            if bet.ticker != ticker or bet.remaining <= 0:
+                continue
+            take = min(bet.remaining, left)
+            bet.sold_count += take
+            left -= take
+            if left <= 0:
+                break
+
+    def open_session_rows(self) -> list[tuple[str, str, int, bool]]:
+        """Aggregate open session exposure: (ticker, title, remaining, any_live)."""
+        agg: dict[str, list[Any]] = {}
+        for bet in self.bets:
+            rem = bet.remaining
+            if rem <= 0:
+                continue
+            cur = agg.get(bet.ticker)
+            if cur is None:
+                agg[bet.ticker] = [bet.title, rem, bet.live and not bet.dry_run]
+            else:
+                cur[1] += rem
+                cur[2] = cur[2] or (bet.live and not bet.dry_run)
+                if bet.title and not cur[0]:
+                    cur[0] = bet.title
+        return [(t, v[0], int(v[1]), bool(v[2])) for t, v in sorted(agg.items())]
+
+    def set_exchange_positions(self, positions: dict[str, int]) -> None:
+        self.exchange_positions = {
+            str(k).upper(): int(v) for k, v in positions.items() if int(v) != 0
+        }
+        self.positions_ts = time.time()
+        self.positions_error = ""
+
+
+SESSION_BETS = SessionBetBook()
+
+
+def _parse_position_contracts(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(round(float(str(value))))
+    except Exception:
+        return None
+
+
+def fetch_yes_positions(
+    args: argparse.Namespace,
+    *,
+    tickers: Iterable[str] | None = None,
+    timeout: float | None = None,
+) -> dict[str, int]:
+    """Fetch net YES positions (positive = long YES). Filter to tickers when given."""
+    resolve_auth_settings(args, required=True)
+    known = {str(t).upper() for t in (tickers or []) if t}
+    params: dict[str, Any] = {"limit": 200, "count_filter": "position"}
+    info = signed_json_request(
+        args,
+        method="GET",
+        path="/trade-api/v2/portfolio/positions",
+        params=params,
+        timeout=float(timeout if timeout is not None else getattr(args, "order_submit_timeout", 10.0)),
+    )
+    response = info.get("response") if isinstance(info, dict) else None
+    rows = response.get("market_positions") if isinstance(response, dict) else None
+    if not isinstance(rows, list):
+        raise RuntimeError(f"Unexpected /portfolio/positions response: {response!r}")
+
+    out: dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ticker = str(row.get("ticker") or "").upper()
+        if not ticker:
+            continue
+        if known and ticker not in known:
+            continue
+        pos = _parse_position_contracts(row.get("position_fp"))
+        if pos is None:
+            pos = _parse_position_contracts(row.get("position"))
+        if pos is None or pos == 0:
+            continue
+        out[ticker] = pos
+    return out
+
+
+def refresh_exchange_positions(state: "BrowserState") -> str:
+    """Pull exchange positions for known game tickers (+ session bets)."""
+    try:
+        resolve_auth_settings(state.args, required=True)
+    except Exception as exc:  # noqa: BLE001
+        SESSION_BETS.positions_error = str(exc)
+        return f"positions auth error: {exc}"
+    known = {r.ticker.upper() for r in state.rows}
+    known.update(b.ticker.upper() for b in SESSION_BETS.bets)
+    try:
+        # Fetch all non-zero positions, then keep those related to this game/session.
+        all_pos = fetch_yes_positions(state.args, tickers=None)
+        filtered = {
+            t: n
+            for t, n in all_pos.items()
+            if t in known or any(t.endswith(state.game_code.upper()) for _ in [0])
+        }
+        # Prefer game-code suffix match so we catch props even if series list incomplete.
+        game = state.game_code.upper()
+        filtered = {t: n for t, n in all_pos.items() if game in t or t in known}
+        SESSION_BETS.set_exchange_positions(filtered)
+        return f"positions refreshed: {len(filtered)} open (YES net)"
+    except Exception as exc:  # noqa: BLE001
+        SESSION_BETS.positions_error = str(exc)
+        return f"positions refresh failed: {exc}"
+
+
+def orders_page_items(state: "BrowserState") -> list[dict[str, Any]]:
+    """Rows for the ORDERS page: exchange positions + session dry-run exposure."""
+    title_by = {r.ticker.upper(): (r.title or r.yes_sub_title or "") for r in state.rows}
+    for bet in SESSION_BETS.bets:
+        title_by.setdefault(bet.ticker.upper(), bet.title)
+
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    # Live exchange positions first (authoritative when --live).
+    for ticker, net in sorted(SESSION_BETS.exchange_positions.items()):
+        if net == 0:
+            continue
+        side = "YES" if net > 0 else "NO"
+        qty = abs(int(net))
+        items.append(
+            {
+                "ticker": ticker,
+                "title": title_by.get(ticker, ""),
+                "qty": qty,
+                "side": side,
+                "source": "exchange",
+                "sellable": net > 0,  # sports UI sells YES longs for now
+                "net": int(net),
+            }
+        )
+        seen.add(ticker)
+
+    # Session dry-run / pending exposure not yet on exchange.
+    for ticker, title, rem, any_live in SESSION_BETS.open_session_rows():
+        t = ticker.upper()
+        if t in seen:
+            # still show session remainder as note via qty bump only if dry-run only
+            continue
+        items.append(
+            {
+                "ticker": t,
+                "title": title or title_by.get(t, ""),
+                "qty": int(rem),
+                "side": "YES",
+                "source": "session-live" if any_live else "session-dry",
+                "sellable": True,
+                "net": int(rem),
+            }
+        )
+    return items
+
+
+def sell_yes_for_position(
+    *,
+    args: argparse.Namespace,
+    ticker: str,
+    title: str,
+    count: int,
+    quote: "QuoteSnap | None",
+) -> tuple[bool, str]:
+    """SELL YES to exit a long YES position. Default count = full position (sell all).
+
+    Limit = YES bid - slippage (cross the bid). reduce_only on V2. Dry-run unless --live.
+    """
+    count = int(count)
+    if count <= 0:
+        return False, "SELL ERROR: count must be positive"
+
+    try:
+        resolve_auth_settings(args, required=True)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"SELL ERROR auth: {exc}"
+
+    bid = quote.yes_bid if quote is not None else None
+    if bid is None:
+        return False, (
+            f"SELL BLOCKED {ticker}: no YES bid yet "
+            "(wait for book / ensure market is subscribed)"
+        )
+
+    slip = int(getattr(args, "slippage_cents", 1) or 0)
+    limit_cents = clamp_price_cents(int(bid) - slip)
+    legacy = make_sell_yes_limit_payload(
+        ticker=ticker,
+        count=count,
+        yes_limit_cents=limit_cents,
+        time_in_force=str(getattr(args, "time_in_force", "immediate_or_cancel")),
+    )
+    try:
+        v2 = make_event_order_v2_payload(legacy)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"SELL ERROR payload: {exc}"
+
+    mode = "LIVE" if args.live else "DRY-RUN"
+    # Explicit action text so the operator never confuses buy vs sell.
+    summary = (
+        f"{mode} SELL YES (EXIT ALL x{count}) {ticker} "
+        f"bid={fmt_cents(bid)} limit={fmt_cents(limit_cents)} "
+        f"slip=-{slip}c reduce_only tif={legacy['time_in_force']}"
+    )
+    detail = f"payload_v2={json.dumps(v2, sort_keys=True)} title={title!r}"
+    ORDER_LOG.record(
+        summary,
+        kind="sell_built",
+        detail=detail,
+        ticker=ticker,
+        mode=mode,
+        live=bool(args.live),
+        ok=None if args.live else True,
+    )
+
+    if not args.live:
+        SESSION_BETS.mark_sold(ticker, count)
+        return True, summary + " (not submitted; memory-log)"
+
+    try:
+        info = signed_json_request(
+            args,
+            method="POST",
+            path="/trade-api/v2/portfolio/events/orders",
+            body=v2,
+            timeout=float(getattr(args, "order_submit_timeout", 10.0)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        fail = f"SELL FAIL {ticker}: {exc}"
+        ORDER_LOG.record(
+            fail,
+            kind="sell_error",
+            detail=str(exc),
+            ticker=ticker,
+            mode=mode,
+            live=True,
+            ok=False,
+        )
+        return False, fail
+
+    http_status = info.get("http_status")
+    resp = info.get("response")
+    resp_s = json.dumps(resp, default=str)[:800]
+    ok = http_status is None or (isinstance(http_status, int) and 200 <= http_status < 300)
+    if ok:
+        msg = (
+            f"LIVE OK SELL YES (EXIT x{count}) {ticker} "
+            f"limit={fmt_cents(limit_cents)} http={http_status}"
+        )
+        SESSION_BETS.mark_sold(ticker, count)
+    else:
+        msg = f"LIVE REJECT SELL YES {ticker} http={http_status}"
+    ORDER_LOG.record(
+        msg,
+        kind="sell_response",
+        detail=f"http={http_status} body={resp_s}",
+        ticker=ticker,
+        mode=mode,
+        live=True,
+        ok=ok,
+        http_status=http_status if isinstance(http_status, int) else None,
+    )
+    return ok, msg
 
 
 
@@ -1723,6 +2095,7 @@ NORMAL navigation
   Home / End / g/G   first / last row
   Enter              categories: open · markets/detail: BUY YES (--count-yes)
   d / Space           open market detail (no order)
+  o                  ORDERS page — session bets + exchange positions
   Esc / Backspace    clear filter if set, else go back
   1-5                jump to category (on category screen)
   a                  show All markets category
@@ -1730,9 +2103,12 @@ NORMAL navigation
   Ctrl-H             this help
   q                  ask to quit · Enter confirms · Esc/other cancels
 
-Orders
+Orders / exits
   Enter on a market  BUY YES for --count-yes contracts (default 1)
-  Price              YES ask + --slippage-cents (default 1), IOC limit
+  Price (buy)        YES ask + --slippage-cents (default 1), IOC limit
+  o then Enter       SELL YES EXIT ALL contracts on selected position
+  Price (sell)       YES bid - slippage, reduce_only IOC (explicit SELL)
+  r (on orders)      refresh exchange positions from API
   Dry-run default    memory-logs payload only; add --live to submit
   Order log          in-memory; dumps to file when idle / on exit
   Prefer --demo      for first live tests
@@ -1763,7 +2139,7 @@ class BrowserState:
     rows: list[MarketRow]
     tracker: BackgroundBookTracker
     args: argparse.Namespace
-    mode: str = "categories"  # categories | markets | detail | help
+    mode: str = "categories"  # categories | markets | detail | help | orders
     input_mode: str = "normal"  # normal | filter
     category: str = "game_lines"
     filter_text: str = ""
@@ -1776,6 +2152,10 @@ class BrowserState:
     order_busy: bool = False
     last_order_ts: float = 0.0
     quit_confirm: bool = False
+    sell_confirm: bool = False
+    sell_confirm_ticker: str = ""
+    sell_confirm_qty: int = 0
+    return_mode: str = "categories"  # mode to restore when leaving orders
 
     def category_counts(self) -> dict[str, int]:
         counts = {k: 0 for k in CATEGORY_ORDER}
@@ -1932,7 +2312,7 @@ def render_browser(state: BrowserState) -> None:
         if state.input_mode == "filter":
             lines.append("FILTER mode · type letters/digits/space · Esc/Enter normal · Ctrl-U clear · q is a letter")
         else:
-            lines.append("NORMAL · Enter open · 1-5/A jump · f filter · j/k move · q quit? · Ctrl-H help")
+            lines.append("NORMAL · Enter open · 1-5/A jump · o orders · f filter · j/k move · q quit? · Ctrl-H help")
     elif state.mode == "markets":
         rows = market_rows if market_rows is not None else state.filtered_rows()
         label = CATEGORY_LABELS.get(state.category, "All markets" if state.category == "all" else state.category)
@@ -1965,7 +2345,7 @@ def render_browser(state: BrowserState) -> None:
             count_yes = effective_count_yes(state.args)
             mode = "LIVE" if state.args.live else "DRY-RUN"
             lines.append(
-                f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · d detail · Esc back · f filter · q quit?"
+                f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · d detail · o orders · Esc back · f filter · q quit?"
             )
     elif state.mode == "detail":
         row = next((r for r in state.rows if r.ticker == state.selected_ticker), None)
@@ -2001,7 +2381,51 @@ def render_browser(state: BrowserState) -> None:
             count_yes = effective_count_yes(state.args)
             mode = "LIVE" if state.args.live else "DRY-RUN"
             lines.append(
-                f"Enter BUY YES x{count_yes} ({mode}) · Esc back · f filter · q quit?"
+                f"Enter BUY YES x{count_yes} ({mode}) · o orders · Esc back · f filter · q quit?"
+            )
+    elif state.mode == "orders":
+        items = orders_page_items(state)
+        mode = "LIVE" if state.args.live else "DRY-RUN"
+        age = ""
+        if SESSION_BETS.positions_ts:
+            age = f"  exch_age={max(0.0, time.time() - SESSION_BETS.positions_ts):.0f}s"
+        err = f"  err={SESSION_BETS.positions_error}" if SESSION_BETS.positions_error else ""
+        lines.append(f"ORDERS / POSITIONS  ({mode}){age}{err}")
+        lines.append(
+            "  Enter = SELL YES EXIT ALL qty on row  ·  r refresh exchange  ·  Esc back"
+        )
+        lines.append("")
+        clamp_cursor(state, len(items))
+        if not items:
+            lines.append("  (no session bets or exchange positions yet)")
+            lines.append("  Buy with Enter on a market, or press r to pull exchange positions.")
+        else:
+            lines.append(
+                f" {'':1} {'SIDE':<4} {'QTY':>5}  {'SRC':<12}  {'YES bid x ask':^11}  TICKER"
+            )
+            end = min(len(items), state.offset + state.page_size)
+            visible_tickers = [items[i]["ticker"] for i in range(state.offset, end)]
+            state.tracker.ensure_quotes(visible_tickers)
+            for idx in range(state.offset, end):
+                it = items[idx]
+                mark = ">" if idx == state.cursor else " "
+                q = state.tracker.quote(it["ticker"])
+                sell_tag = "SELL-ALL" if it.get("sellable") else "no-sell"
+                lines.append(
+                    f" {mark} {it['side']:<4} {it['qty']:>5}  {it['source']:<12}  "
+                    f"{format_quote_cell(q)}  {it['ticker']}"
+                )
+                title = short_label(it.get("title") or "", 52)
+                lines.append(f"      [{sell_tag}] {title}")
+        lines.append("")
+        if state.sell_confirm:
+            lines.append(
+                f"CONFIRM SELL YES EXIT ALL x{state.sell_confirm_qty} "
+                f"{state.sell_confirm_ticker} — Enter submits · Esc/other cancels"
+            )
+        else:
+            lines.append(
+                f"NORMAL · highlight row · Enter arms SELL-ALL exit ({mode}) · r refresh · Esc back · q quit?"
             )
 
     lines.append("")
@@ -2084,6 +2508,89 @@ def request_quit_confirm(state: BrowserState) -> None:
     state.message = "Quit? Press Enter to confirm (Esc/other cancels)"
 
 
+def cancel_sell_confirm(state: BrowserState, *, message: str = "sell cancelled") -> None:
+    if state.sell_confirm:
+        state.sell_confirm = False
+        state.sell_confirm_ticker = ""
+        state.sell_confirm_qty = 0
+        state.message = message
+
+
+def open_orders_page(state: BrowserState) -> None:
+    state.return_mode = state.mode if state.mode != "orders" else state.return_mode
+    state.prev_mode = state.mode if state.mode != "help" else state.prev_mode
+    state.mode = "orders"
+    state.input_mode = "normal"
+    state.cursor = 0
+    state.offset = 0
+    state.sell_confirm = False
+    state.sell_confirm_ticker = ""
+    state.sell_confirm_qty = 0
+    # Best-effort refresh so exchange positions show up without an extra key.
+    state.message = refresh_exchange_positions(state)
+
+
+def handle_sell_all(state: BrowserState) -> None:
+    """Orders page Enter: arm or execute SELL YES EXIT ALL for selected row."""
+    if state.order_busy:
+        state.message = "order already in flight"
+        return
+    now = time.time()
+    if now - state.last_order_ts < 0.35:
+        state.message = "order debounced — wait a moment"
+        return
+
+    items = orders_page_items(state)
+    if not items:
+        state.message = "no positions to sell"
+        return
+    clamp_cursor(state, len(items))
+    it = items[state.cursor]
+    ticker = str(it["ticker"])
+    qty = int(it["qty"])
+    if not it.get("sellable"):
+        state.message = f"cannot sell {it.get('side')} position here (YES longs only for now)"
+        return
+    if qty <= 0:
+        state.message = "qty is zero"
+        return
+
+    if not state.sell_confirm or state.sell_confirm_ticker != ticker:
+        state.sell_confirm = True
+        state.sell_confirm_ticker = ticker
+        state.sell_confirm_qty = qty
+        mode = "LIVE" if state.args.live else "DRY-RUN"
+        state.message = (
+            f"SELL YES EXIT ALL x{qty} on {ticker}? Enter confirms ({mode}), Esc cancels"
+        )
+        return
+
+    # Confirmed: submit sell-all.
+    state.tracker.ensure_quotes([ticker], force=True)
+    quote = state.tracker.quote(ticker)
+    title = str(it.get("title") or "")
+    state.order_busy = True
+    try:
+        ok, status = sell_yes_for_position(
+            args=state.args,
+            ticker=ticker,
+            title=title,
+            count=qty,
+            quote=quote,
+        )
+    finally:
+        state.order_busy = False
+        state.last_order_ts = time.time()
+        state.sell_confirm = False
+        state.sell_confirm_ticker = ""
+        state.sell_confirm_qty = 0
+    state.message = status
+    # Refresh exchange snapshot after live sells.
+    if state.args.live and ok:
+        extra = refresh_exchange_positions(state)
+        state.message = f"{status} · {extra}"
+
+
 def handle_enter(state: BrowserState) -> None:
     if state.quit_confirm:
         # Enter confirms quit; caller checks quit_confirm after this.
@@ -2100,17 +2607,29 @@ def handle_enter(state: BrowserState) -> None:
         open_category(state, key)
     elif state.mode in {"markets", "detail"}:
         handle_buy_yes(state)
+    elif state.mode == "orders":
+        handle_sell_all(state)
     elif state.mode == "help":
         state.mode = state.prev_mode
 
 
 def handle_back(state: BrowserState) -> bool:
     """Return True if caller should quit."""
+    if state.sell_confirm:
+        cancel_sell_confirm(state)
+        return False
     if state.input_mode == "filter":
         leave_filter_mode(state)
         return False
     if state.mode == "help":
         state.mode = state.prev_mode
+        return False
+    if state.mode == "orders":
+        state.mode = state.return_mode or "categories"
+        state.input_mode = "normal"
+        state.cursor = 0
+        state.offset = 0
+        state.message = "left orders"
         return False
     if state.mode == "detail":
         state.mode = "markets"
@@ -2199,7 +2718,7 @@ def run_browser(
         tracker=tracker,
         args=args,
         message=(
-            f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · d detail · L log · f filter · Ctrl-H help"
+            f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · o orders · d detail · L log · f filter · Ctrl-H help"
         ),
     )
 
@@ -2248,6 +2767,14 @@ def run_browser(
                     break
                 cancel_quit_confirm(state)
                 # Swallow the cancel key so it does not also act.
+                continue
+
+            # Sell confirm on orders page: Enter submits; anything else cancels.
+            if state.sell_confirm and state.mode == "orders":
+                if kind == "enter":
+                    handle_sell_all(state)
+                    continue
+                cancel_sell_confirm(state)
                 continue
 
             if kind == "ctrl" and value == "h":
@@ -2342,6 +2869,8 @@ def run_browser(
                 if state.mode == "categories"
                 else len(state.filtered_rows())
                 if state.mode == "markets"
+                else len(orders_page_items(state))
+                if state.mode == "orders"
                 else 0
             )
 
@@ -2384,6 +2913,14 @@ def run_browser(
                     dumped = ORDER_LOG.maybe_dump_idle(force=True)
                     if dumped:
                         state.message += f" · dumped {short_label(dumped, 36)}"
+                continue
+
+            if kind == "char" and value in {"o", "O"} and state.mode != "help":
+                open_orders_page(state)
+                continue
+
+            if state.mode == "orders" and kind == "char" and value in {"r", "R"}:
+                state.message = refresh_exchange_positions(state)
                 continue
 
             if state.mode == "markets" and kind == "char" and value in {"d", "D", " "}:
