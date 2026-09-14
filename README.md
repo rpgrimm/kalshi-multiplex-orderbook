@@ -23,12 +23,17 @@ source venv/bin/activate
 pip install -e .
 pip install kalshi_python_sync   # discovery / trader REST client
 
-# Auth (prod example — never commit real values)
-export KALSHI_PROD_API_KEY_ID='your-prod-key-id'
-export KALSHI_PROD_PRIVATE_KEY_FILE="$HOME/path/to/prod_private_key.pem"
-# Demo:
-# export KALSHI_DEMO_API_KEY_ID='...'
-# export KALSHI_DEMO_PRIVATE_KEY_FILE="$HOME/path/to/demo_private_key.pem"
+# Auth — preferred: config files (both traders + library)
+mkdir -p ~/.config/kalshi-multiplex-orderbook
+chmod 700 ~/.config/kalshi-multiplex-orderbook
+cp examples/config/prod.env.example ~/.config/kalshi-multiplex-orderbook/prod.env
+# put PEM at ~/.config/kalshi-multiplex-orderbook/prod.private-key.pem
+# edit prod.env: set KALSHI_PROD_API_KEY_ID=...
+chmod 600 ~/.config/kalshi-multiplex-orderbook/prod.env
+
+# Still supported: process env vars
+# export KALSHI_PROD_API_KEY_ID='your-prod-key-id'
+# export KALSHI_PROD_PRIVATE_KEY_FILE="$HOME/path/to/prod_private_key.pem"
 ```
 
 ### Watch a series (library)

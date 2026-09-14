@@ -30,10 +30,10 @@ Environment gates (same safety model as broadcast trader):
     Default is dry-run. --live is accepted for parity / future orders;
     this slice still does not place orders even with --live.
 
-Auth for --watch / --browse WS books:
-    demo:  KALSHI_DEMO_API_KEY_ID + KALSHI_DEMO_PRIVATE_KEY_FILE
-    prod:  KALSHI_PROD_API_KEY_ID + KALSHI_PROD_PRIVATE_KEY_FILE
-           (legacy fallback: KALSHI_API_KEY_ID + KALSHI_PRIVATE_KEY_FILE)
+Auth for --watch / --browse WS books (env vars or config files):
+    ~/.config/kalshi-multiplex-orderbook/prod.env
+    ~/.config/kalshi-multiplex-orderbook/demo.env
+    (or process env KALSHI_PROD_* / KALSHI_DEMO_*; legacy KALSHI_* for prod)
 """
 
 from __future__ import annotations
@@ -589,24 +589,18 @@ def fmt_cents(v: int | None) -> str:
 
 def auth_env_candidates(kalshi_env: str) -> list[tuple[str, str]]:
     """Return auth env-var pairs in preferred order for demo or prod."""
-    if kalshi_env == "demo":
-        return [(DEMO_API_KEY_ID_ENV, DEMO_PRIVATE_KEY_FILE_ENV)]
-    return [
-        (PROD_API_KEY_ID_ENV, PROD_PRIVATE_KEY_FILE_ENV),
-        (LEGACY_PROD_API_KEY_ID_ENV, LEGACY_PROD_PRIVATE_KEY_FILE_ENV),
-    ]
+    from kx_orderbooks.auth import auth_env_candidates as _cands
+    return _cands(kalshi_env)
 
 
 def default_auth_env_names(kalshi_env: str) -> tuple[str, str]:
-    return auth_env_candidates(kalshi_env)[0]
+    from kx_orderbooks.auth import default_auth_env_names as _names
+    return _names(kalshi_env)
 
 
 def key_id_hint(api_key_id: str) -> str:
-    """Non-secret key hint for logs."""
-    text = str(api_key_id or "")
-    if len(text) <= 12:
-        return "set"
-    return f"{text[:8]}...{text[-4:]}"
+    from kx_orderbooks.auth import key_id_hint as _hint
+    return _hint(api_key_id)
 
 
 def default_hosts_for_env(kalshi_env: str, *, demo_host_style: str = "external") -> tuple[str, str]:
@@ -624,7 +618,6 @@ def apply_env_endpoints(args: argparse.Namespace) -> None:
         args.kalshi_env,
         demo_host_style=str(getattr(args, "demo_host_style", "external") or "external"),
     )
-    # Prefer explicit --api-host, then --host, else env default.
     host_override = getattr(args, "host", None)
     api_host_override = getattr(args, "api_host", None)
     if api_host_override:
@@ -633,101 +626,73 @@ def apply_env_endpoints(args: argparse.Namespace) -> None:
         args.api_host = str(host_override).rstrip("/")
     else:
         args.api_host = rest_default.rstrip("/")
-    # Keep --host in sync for discovery call sites that still read args.host.
     args.host = args.api_host
 
     ws_override = getattr(args, "ws_url", None)
     args.ws_url = str(ws_override) if ws_override else ws_default
 
 
-def choose_auth_env_pair(args: argparse.Namespace) -> tuple[str, str]:
-    preferred_api_env, preferred_private_env = default_auth_env_names(args.kalshi_env)
-    api_key_id_env = getattr(args, "api_key_id_env", None)
-    private_key_file_env = getattr(args, "private_key_file_env", None)
-    if api_key_id_env or private_key_file_env:
-        return (
-            api_key_id_env or preferred_api_env,
-            private_key_file_env or preferred_private_env,
-        )
-    for api_env, private_env in auth_env_candidates(args.kalshi_env):
-        if os.environ.get(api_env) or os.environ.get(private_env):
-            return api_env, private_env
-    return preferred_api_env, preferred_private_env
-
-
 def resolve_auth_settings(args: argparse.Namespace, *, required: bool) -> bool:
-    """Resolve auth onto args. Return True if auth is available.
+    """Resolve auth onto args via shared config-dir/env loader.
 
     When required=True, raise RuntimeError on missing credentials.
     Never prints secret values.
     """
-    api_key_env, private_key_file_env = choose_auth_env_pair(args)
-    api_key_id = os.environ.get(api_key_env)
-    private_key_file = getattr(args, "private_key_file", None) or os.environ.get(private_key_file_env)
+    try:
+        from kx_orderbooks.auth import resolve_kalshi_auth
+    except ImportError as exc:
+        if required:
+            raise RuntimeError(
+                "kx_orderbooks is required for auth resolution. Run: pip install -e ."
+            ) from exc
+        return False
 
-    # Prod-only legacy fallback used by broadcast trader.
-    if (
-        not private_key_file
-        and args.kalshi_env == "prod"
-        and Path(DEFAULT_PRIVATE_KEY_FILE).expanduser().exists()
-    ):
-        private_key_file = DEFAULT_PRIVATE_KEY_FILE
-        private_key_file_env = "(fallback: ./grimm.txt)"
-
-    if not api_key_id or not private_key_file:
-        if not required:
-            return False
-        candidates_k = ", ".join(a for a, _ in auth_env_candidates(args.kalshi_env))
-        candidates_p = ", ".join(p for _, p in auth_env_candidates(args.kalshi_env))
-        missing = []
-        if not api_key_id:
-            missing.append(f"API key env ({api_key_env}; candidates: {candidates_k})")
-        if not private_key_file:
-            missing.append(
-                f"private key file ({private_key_file_env}; candidates: {candidates_p} "
-                f"or --private-key-file)"
-            )
-        raise RuntimeError(
-            f"Missing auth for {args.kalshi_env}: " + "; ".join(missing)
+    try:
+        auth = resolve_kalshi_auth(
+            args.kalshi_env,
+            private_key_file=getattr(args, "private_key_file", None),
+            api_key_id_env=getattr(args, "api_key_id_env", None),
+            private_key_file_env=getattr(args, "private_key_file_env", None),
+            required=required,
         )
+    except Exception:
+        if required:
+            raise
+        return False
 
-    private_key_path = str(Path(private_key_file).expanduser())
-    if not Path(private_key_path).exists():
-        if not required:
-            return False
-        raise RuntimeError(f"Private key file not found: {private_key_path}")
+    if auth is None:
+        return False
 
-    args._auth_api_key_id = api_key_id
-    args._auth_api_key_hint = key_id_hint(api_key_id)
-    args._auth_api_key_env = api_key_env
-    args._auth_private_key_file = private_key_path
-    args._auth_private_key_file_env = private_key_file_env
+    args._auth_api_key_id = auth.api_key_id
+    args._auth_api_key_hint = auth.api_key_hint
+    args._auth_api_key_env = auth.api_key_source
+    args._auth_private_key_file = auth.private_key_path
+    args._auth_private_key_file_env = auth.private_key_source
+    args._auth_config_dir = auth.config_dir
     return True
 
 
 def resolve_ws_auth(args: argparse.Namespace | None = None) -> tuple[str, Any, str]:
     """Return (api_key_id, private_key, source_label) for WebSocket workers."""
     try:
-        from kx_orderbooks.auth import load_private_key
+        from kx_orderbooks.auth import load_private_key, resolve_kalshi_auth
     except ImportError as exc:
         raise RuntimeError(
             "kx_orderbooks is required for --watch/--browse WS. Run: pip install -e ."
         ) from exc
 
     if args is None:
-        # Legacy path: probe env without --demo/--prod context (should be rare).
-        pairs = [
-            (PROD_API_KEY_ID_ENV, PROD_PRIVATE_KEY_FILE_ENV, "KALSHI_PROD_*"),
-            (LEGACY_PROD_API_KEY_ID_ENV, LEGACY_PROD_PRIVATE_KEY_FILE_ENV, "KALSHI_*"),
-            (DEMO_API_KEY_ID_ENV, DEMO_PRIVATE_KEY_FILE_ENV, "KALSHI_DEMO_*"),
-        ]
-        for key_env, pem_env, label in pairs:
-            key = os.environ.get(key_env)
-            pem = os.environ.get(pem_env)
-            if key and pem:
-                return key, load_private_key(pem), label
+        for probe in ("prod", "demo"):
+            auth = resolve_kalshi_auth(probe, required=False)
+            if auth is not None:
+                return (
+                    auth.api_key_id,
+                    auth.load_private_key(),
+                    f"{auth.kalshi_env}:{auth.api_key_source}",
+                )
         raise RuntimeError(
-            "Set KALSHI_PROD_* or KALSHI_DEMO_* (or legacy KALSHI_*) auth env vars."
+            "Set auth in ~/.config/kalshi-multiplex-orderbook/prod.env "
+            "(or demo.env), or export KALSHI_PROD_* / KALSHI_DEMO_*."
         )
 
     if not resolve_auth_settings(args, required=True):
@@ -772,8 +737,9 @@ def run_watch(
         eprint(f"error: WebSocket auth not configured: {exc}")
         pref_k, pref_p = default_auth_env_names(args.kalshi_env)
         eprint(
-            f"For --{args.kalshi_env}, set {pref_k} + {pref_p} "
-            f"(prod also accepts legacy KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_FILE)."
+            f"For --{args.kalshi_env}, set {pref_k}+{pref_p} in the environment or in "
+            f"~/.config/kalshi-multiplex-orderbook/{args.kalshi_env}.env "
+            f"(and place the PEM as {args.kalshi_env}.private-key.pem)."
         )
         return 2
 
@@ -1270,7 +1236,7 @@ FILTER matching
 Quotes
   Background WebSocket keeps books silently (no spam).
   YES bid/ask appears when a book snapshot has arrived.
-  Browse works without API keys; quotes need KALSHI_* auth.
+  Browse works without API keys; quotes need config/env auth.
 
 Screens
   Categories → Markets → Market detail
