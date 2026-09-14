@@ -705,7 +705,11 @@ def resolve_ws_auth(args: argparse.Namespace | None = None) -> tuple[str, Any, s
 
 
 def select_watch_rows(rows: list[MarketRow], *, watch_limit: int) -> list[MarketRow]:
-    """Prefer active/open markets for the websocket subscription."""
+    """Prefer active/open markets for the *initial* websocket subscription.
+
+    Browse mode later expands this set to whatever is on-screen (viewport),
+    because a fixed first-N seed misses later series like player props.
+    """
     preferred_status = {"active", "open"}
     live = [r for r in rows if r.status.lower() in preferred_status]
     chosen = live if live else list(rows)
@@ -984,7 +988,11 @@ class QuoteSnap:
 
 
 class BackgroundBookTracker:
-    """Silently maintain live books over one multiplex WebSocket."""
+    """Silently maintain live books over one multiplex WebSocket.
+
+    Starts with a seed subscription (watch_limit), then expands to whatever
+    tickers the UI is currently showing via ensure_quotes().
+    """
 
     def __init__(
         self,
@@ -1009,6 +1017,15 @@ class BackgroundBookTracker:
         self.subscribed_n = 0
         self._quotes: dict[str, QuoteSnap] = {}
         self._lock_err = ""
+        self._seed_tickers: set[str] = set()
+        self._subscribed: set[str] = set()
+        self._keep_tickers: set[str] = set()
+        self._last_ensure_ts = 0.0
+        # Soft cap on concurrent WS markets. 0 watch_limit => larger ceiling.
+        if watch_limit <= 0:
+            self._max_subscribed = 400
+        else:
+            self._max_subscribed = max(watch_limit, 160)
 
     def start(self) -> None:
         try:
@@ -1032,7 +1049,10 @@ class BackgroundBookTracker:
             self.error = "no markets to subscribe"
             return
 
-        tickers = [r.ticker for r in chosen]
+        tickers = [r.ticker.upper() for r in chosen]
+        self._seed_tickers = set(tickers)
+        self._subscribed = set(tickers)
+        self._keep_tickers = set(tickers)
         self.subscribed_n = len(tickers)
         self.auth_label = auth_label
         self.store = OrderbookStore()
@@ -1098,6 +1118,71 @@ class BackgroundBookTracker:
             self.status = "connected"
         else:
             self.status = "connecting"
+        # Keep count in sync with worker's view of the world.
+        try:
+            self.subscribed_n = len(getattr(self.worker, "market_tickers", []) or self._subscribed)
+            self._subscribed = {t.upper() for t in (self.worker.market_tickers or [])}
+        except Exception:  # noqa: BLE001
+            self.subscribed_n = len(self._subscribed)
+
+    def ensure_quotes(self, tickers: Iterable[str], *, force: bool = False) -> None:
+        """Subscribe any missing tickers the UI currently cares about.
+
+        Kalshi books only arrive for subscribed markets. Browse starts with a
+        seed (default first N), then calls this for the visible viewport so
+        player props / filtered rows get books too.
+        """
+        if not self.enabled or self.worker is None:
+            return
+        if not self.worker.subscribed and not force:
+            # Wait until the initial subscribe sid exists; add_markets needs it.
+            return
+
+        wanted = sorted({str(t).upper() for t in tickers if t})
+        if not wanted:
+            return
+
+        now = time.time()
+        # Light throttle so rapid redraws don't spam add/delete.
+        if not force and now - self._last_ensure_ts < 0.15:
+            self._keep_tickers |= set(wanted)
+            return
+        self._last_ensure_ts = now
+        self._keep_tickers |= set(wanted)
+
+        missing = [t for t in wanted if t not in self._subscribed]
+        if missing:
+            # Batch adds; worker.add_markets updates its market_tickers set.
+            ok = self.worker.add_markets(missing)
+            if ok:
+                self._subscribed |= set(missing)
+                self.subscribed_n = len(self._subscribed)
+
+        # Soft prune far-away markets if over budget.
+        if len(self._subscribed) > self._max_subscribed:
+            protect = set(self._seed_tickers) | set(self._keep_tickers) | set(wanted)
+            # Also protect anything with a fresh quote recently viewed.
+            excess = [t for t in sorted(self._subscribed) if t not in protect]
+            drop_n = len(self._subscribed) - self._max_subscribed
+            if drop_n > 0 and excess:
+                to_drop = excess[:drop_n]
+                if self.worker.delete_markets(to_drop):
+                    self._subscribed -= set(to_drop)
+                    self.subscribed_n = len(self._subscribed)
+                    for t in to_drop:
+                        self._quotes.pop(t, None)
+
+        # If already subscribed but still blank after a bit, nudge a snapshot.
+        stale_need: list[str] = []
+        for t in wanted:
+            q = self._quotes.get(t)
+            if q is None or not q.ready:
+                # Only request once the ticker is known-subscribed.
+                if t in self._subscribed:
+                    stale_need.append(t)
+        if stale_need and self.worker.subscribed:
+            # Cheap: request snapshots for visible blanks only.
+            self.worker.request_snapshots(stale_need)
 
     def quote(self, ticker: str) -> QuoteSnap | None:
         t = ticker.upper()
@@ -1237,6 +1322,8 @@ Quotes
   Background WebSocket keeps books silently (no spam).
   YES bid/ask appears when a book snapshot has arrived.
   Browse works without API keys; quotes need config/env auth.
+  Books refresh live for subscribed markets; viewport auto-subscribes
+  more as you scroll/filter (seed starts at --watch-limit).
 
 Screens
   Categories → Markets → Market detail
@@ -1427,6 +1514,10 @@ def render_browser(state: BrowserState) -> None:
         else:
             lines.append(f" {'':1} {'YES bid x ask':^11}  {'STATUS':<8}  {'SERIES':<16}  TICKER / TITLE")
             end = min(len(rows), state.offset + state.page_size)
+            # Prefetch a small lookahead beyond the page so scrolling feels live.
+            prefetch_end = min(len(rows), end + max(4, state.page_size // 2))
+            visible = rows[state.offset:prefetch_end]
+            state.tracker.ensure_quotes(r.ticker for r in visible)
             for idx in range(state.offset, end):
                 row = rows[idx]
                 mark = ">" if idx == state.cursor else " "
@@ -1447,6 +1538,7 @@ def render_browser(state: BrowserState) -> None:
         if row is None:
             lines.append("Market not found.")
         else:
+            state.tracker.ensure_quotes([row.ticker], force=True)
             q = state.tracker.quote(row.ticker)
             lines.append("MARKET DETAIL")
             lines.append(f"  ticker : {row.ticker}")
@@ -1588,7 +1680,9 @@ def run_browser(
         game_code=game_code,
         rows=rows,
         tracker=tracker,
-        message="NORMAL mode · f filter · Ctrl-H help · books update in background",
+        message=(
+            "NORMAL · f filter · Ctrl-H help · books refresh for visible markets"
+        ),
     )
 
     fd = sys.stdin.fileno()
@@ -1929,7 +2023,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--watch-limit",
         type=int,
         default=80,
-        help="Max markets to subscribe on --watch (default 80; 0 = all discovered).",
+        help=(
+            "Initial market seed size for WebSocket books (default 80). "
+            "--watch uses this as a hard subscribe cap (0 = all discovered). "
+            "--browse starts with this seed then auto-subscribes the visible "
+            "viewport so later series (e.g. player props) still get quotes."
+        ),
     )
     p.add_argument(
         "--ws-url",
