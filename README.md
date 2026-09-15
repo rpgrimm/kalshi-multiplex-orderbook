@@ -23,12 +23,17 @@ source venv/bin/activate
 pip install -e .
 pip install kalshi_python_sync   # discovery / trader REST client
 
-# Auth (prod example — never commit real values)
-export KALSHI_PROD_API_KEY_ID='your-prod-key-id'
-export KALSHI_PROD_PRIVATE_KEY_FILE="$HOME/path/to/prod_private_key.pem"
-# Demo:
-# export KALSHI_DEMO_API_KEY_ID='...'
-# export KALSHI_DEMO_PRIVATE_KEY_FILE="$HOME/path/to/demo_private_key.pem"
+# Auth — preferred: config files (both traders + library)
+mkdir -p ~/.config/kalshi-multiplex-orderbook
+chmod 700 ~/.config/kalshi-multiplex-orderbook
+cp examples/config/prod.env.example ~/.config/kalshi-multiplex-orderbook/prod.env
+# put PEM at ~/.config/kalshi-multiplex-orderbook/prod.private-key.pem
+# edit prod.env: set KALSHI_PROD_API_KEY_ID=...
+chmod 600 ~/.config/kalshi-multiplex-orderbook/prod.env
+
+# Still supported: process env vars
+# export KALSHI_PROD_API_KEY_ID='your-prod-key-id'
+# export KALSHI_PROD_PRIVATE_KEY_FILE="$HOME/path/to/prod_private_key.pem"
 ```
 
 ### Watch a series (library)
@@ -37,15 +42,21 @@ export KALSHI_PROD_PRIVATE_KEY_FILE="$HOME/path/to/prod_private_key.pem"
 python3 examples/watch_series_orderbooks.py KXTRUMPMENTIONB
 ```
 
-### Sports trader (list markets for a game)
+### Sports trader (list / browse / watch markets for a game)
 
-Public REST only for now — no API keys required for listing.
+Same env gates as the broadcast trader: **`--demo` or `--prod` required**. Default is dry-run; `--live` is accepted for parity but this slice still does not place orders.
+
+Catalog discovery uses public REST (no keys). Live books via `--browse` / `--watch` need env-matching API keys (`KALSHI_PROD_*` or `KALSHI_DEMO_*`).
 
 ```bash
-./kalshi_sports_trader.py kxnflgame-26sep13atlpit
-./kalshi_sports_trader.py KXNFLGAME-26SEP13ATLPIT --status all
+./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit
+./kalshi_sports_trader.py --prod KXNFLGAME-26SEP13ATLPIT --status all
+./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit --browse
+./kalshi_sports_trader.py --demo kxnflgame-26sep14denkc --browse --count-yes 5
+./kalshi_sports_trader.py --demo kxnflgame-26sep14denkc --browse --count-yes 5 --live
+./kalshi_sports_trader.py --demo kxnflgame-26sep13atlpit --watch --watch-limit 40
 # optional: limit which series are probed
-./kalshi_sports_trader.py kxnflgame-26sep13atlpit --series KXNFLGAME --series KXNFLSPREAD --series KXNFLTOTAL
+./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit --series KXNFLGAME --series KXNFLSPREAD --series KXNFLTOTAL
 ```
 
 Kalshi splits one game across many series that share the same game code

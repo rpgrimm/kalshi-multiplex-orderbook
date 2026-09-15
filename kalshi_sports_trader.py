@@ -20,35 +20,70 @@ Keep REST budget for discovery + later orders/account snapshots. Do not poll
 REST orderbooks continuously.
 
 Examples:
-    ./kalshi_sports_trader.py kxnflgame-26sep13atlpit
-    ./kalshi_sports_trader.py kxnflgame-26sep13atlpit --watch
-    ./kalshi_sports_trader.py kxnflgame-26sep13atlpit --watch --watch-limit 40
+    ./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit
+    ./kalshi_sports_trader.py --demo kxnflgame-26sep14denkc --browse --count-yes 5
+    ./kalshi_sports_trader.py --demo kxnflgame-26sep14denkc --browse --count-yes 5 --live
+    ./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit --browse
+    ./kalshi_sports_trader.py --demo kxnflgame-26sep13atlpit --watch
+    ./kalshi_sports_trader.py --prod kxnflgame-26sep13atlpit --watch --watch-limit 40
 
-Auth for --watch (same as kx_orderbooks / broadcast trader):
-    export KALSHI_API_KEY_ID=...
-    export KALSHI_PRIVATE_KEY_FILE=/path/to/key.pem
-  or KALSHI_PROD_* / KALSHI_DEMO_* variants.
+Environment gates (same safety model as broadcast trader):
+    --demo or --prod is required (no implicit host).
+    Default is dry-run. Real BUY/SELL only with --live.
+    Browser Enter on a market buys YES for --count-yes contracts.
+    o opens ORDERS/positions; Enter there SELL YES EXIT ALL (confirm).
+    Order events stay in memory during submit and dump to disk when idle/exit.
+
+Auth for --watch / --browse WS books (env vars or config files):
+    ~/.config/kalshi-multiplex-orderbook/prod.env
+    ~/.config/kalshi-multiplex-orderbook/demo.env
+    (or process env KALSHI_PROD_* / KALSHI_DEMO_*; legacy KALSHI_* for prod)
 """
 
 from __future__ import annotations
 
 import argparse
+import uuid
 import json
 import os
 import random
 import re
+import select
 import signal
 import sys
+import termios
 import time
+import tty
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable
 
-DEFAULT_REST_HOST = "https://api.elections.kalshi.com/trade-api/v2"
-DEFAULT_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
-USER_AGENT = "kalshi-sports-trader/0.2"
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
+PROD_REST_HOST = "https://api.elections.kalshi.com/trade-api/v2"
+PROD_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
+DEMO_REST_HOST = "https://external-api.demo.kalshi.co/trade-api/v2"
+DEMO_REST_HOST_ALT = "https://demo-api.kalshi.co/trade-api/v2"
+DEMO_WS_URL = "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2"
+DEMO_WS_URL_ALT = "wss://demo-api.kalshi.co/trade-api/ws/v2"
+
+# Preferred environment-specific auth variables (match broadcast trader).
+PROD_API_KEY_ID_ENV = "KALSHI_PROD_API_KEY_ID"
+PROD_PRIVATE_KEY_FILE_ENV = "KALSHI_PROD_PRIVATE_KEY_FILE"
+DEMO_API_KEY_ID_ENV = "KALSHI_DEMO_API_KEY_ID"
+DEMO_PRIVATE_KEY_FILE_ENV = "KALSHI_DEMO_PRIVATE_KEY_FILE"
+LEGACY_PROD_API_KEY_ID_ENV = "KALSHI_API_KEY_ID"
+LEGACY_PROD_PRIVATE_KEY_FILE_ENV = "KALSHI_PRIVATE_KEY_FILE"
+DEFAULT_PRIVATE_KEY_FILE = "grimm.txt"
+
+# Backward-compatible aliases used by older sports-trader call sites/docs.
+DEFAULT_REST_HOST = PROD_REST_HOST
+DEFAULT_WS_URL = PROD_WS_URL
+USER_AGENT = "kalshi-sports-trader/0.4"
 
 SEASON_LONG_HINTS = (
     "WINS",
@@ -145,6 +180,127 @@ class MarketRow:
 
 def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
+
+
+@dataclass
+class OrderLogEvent:
+    """One in-memory order event (no secrets)."""
+
+    ts: float
+    kind: str
+    summary: str
+    detail: str = ""
+    ticker: str = ""
+    mode: str = ""
+    live: bool = False
+    ok: bool | None = None
+    http_status: int | None = None
+
+    def render(self) -> str:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.ts))
+        lines = [f"[{stamp}] {self.summary}"]
+        if self.detail:
+            lines.append(self.detail)
+        return "\n".join(lines)
+
+
+class OrderMemoryLog:
+    """Ring buffer of order events. No disk writes during submit; dump on idle/exit."""
+
+    def __init__(self, *, capacity: int = 500):
+        self.capacity = max(50, int(capacity))
+        self.events: list[OrderLogEvent] = []
+        self._dirty = False
+        self._last_event_ts = 0.0
+        self._last_dump_ts = 0.0
+        self.path: str | None = None
+        self.idle_dump_s = 2.0
+        self.enabled = True
+
+    def configure(
+        self,
+        *,
+        path: str | None,
+        idle_dump_s: float = 2.0,
+        capacity: int = 500,
+        enabled: bool = True,
+    ) -> None:
+        self.path = str(Path(path).expanduser()) if path else None
+        self.idle_dump_s = max(0.25, float(idle_dump_s))
+        self.capacity = max(50, int(capacity))
+        self.enabled = bool(enabled)
+
+    def record(
+        self,
+        summary: str,
+        *,
+        kind: str = "order",
+        detail: str = "",
+        ticker: str = "",
+        mode: str = "",
+        live: bool = False,
+        ok: bool | None = None,
+        http_status: int | None = None,
+    ) -> OrderLogEvent:
+        ev = OrderLogEvent(
+            ts=time.time(),
+            kind=kind,
+            summary=summary,
+            detail=detail or "",
+            ticker=ticker or "",
+            mode=mode or "",
+            live=bool(live),
+            ok=ok,
+            http_status=http_status,
+        )
+        if not self.enabled:
+            return ev
+        self.events.append(ev)
+        if len(self.events) > self.capacity:
+            self.events = self.events[-self.capacity :]
+        self._dirty = True
+        self._last_event_ts = ev.ts
+        return ev
+
+    def recent(self, n: int = 8) -> list[OrderLogEvent]:
+        if n <= 0:
+            return []
+        return self.events[-n:]
+
+    def maybe_dump_idle(self, *, force: bool = False) -> str | None:
+        """If dirty and idle long enough (or force), write memory log to path."""
+        if not self.enabled or not self.path or not self._dirty:
+            return None
+        now = time.time()
+        if not force and (now - self._last_event_ts) < self.idle_dump_s:
+            return None
+        return self.dump(reason="idle" if not force else "force")
+
+    def dump(self, *, reason: str = "manual") -> str | None:
+        if not self.enabled or not self.path:
+            return None
+        if not self.events and not self._dirty:
+            return None
+        out = Path(self.path).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        header = (
+            f"# kalshi_sports_trader order memory log\n"
+            f"# dumped_at={time.strftime('%Y-%m-%d %H:%M:%S')} reason={reason}\n"
+            f"# events={len(self.events)} (no secrets)\n\n"
+        )
+        body = "\n\n".join(ev.render() for ev in self.events) + "\n"
+        out.write_text(header + body, encoding="utf-8")
+        try:
+            os.chmod(out, 0o600)
+        except OSError:
+            pass
+        self._dirty = False
+        self._last_dump_ts = time.time()
+        return str(out)
+
+
+# Process-wide memory log used by order path + browser idle flusher.
+ORDER_LOG = OrderMemoryLog()
 
 
 def normalize_status_filter(status: str | None) -> set[str]:
@@ -560,33 +716,789 @@ def fmt_cents(v: int | None) -> str:
     return "--" if v is None else f"{v:02d}c"
 
 
-def resolve_ws_auth() -> tuple[str, Any, str]:
-    """Return (api_key_id, private_key, source_label)."""
+def cents_to_dollars(cents: int | None) -> str:
+    if cents is None:
+        return "--"
+    return f"${cents / 100:.2f}"
+
+
+def clamp_price_cents(cents: int) -> int:
+    return max(1, min(99, int(cents)))
+
+
+def fixed_contract_count(count: int | float | str) -> str:
+    return f"{float(count):.2f}"
+
+
+def fixed_dollar_price_from_cents(cents: int | float | str) -> str:
+    return f"{(float(cents) / 100.0):.4f}"
+
+
+def load_pem_private_key(private_key_file: str) -> Any:
+    with Path(private_key_file).expanduser().open("rb") as f:
+        return serialization.load_pem_private_key(f.read(), password=None)
+
+
+def sign_private_key_text(private_key: Any, text: str) -> str:
+    import base64
+
+    signature = private_key.sign(
+        text.encode("utf-8"),
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.DIGEST_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+    return base64.b64encode(signature).decode("utf-8")
+
+
+def headers_to_dict(headers: Any) -> Any:
+    if headers is None:
+        return None
+    if isinstance(headers, dict):
+        return {str(k): str(v) for k, v in headers.items()}
     try:
-        from kx_orderbooks.auth import load_auth_from_env, load_private_key
-    except ImportError as exc:
+        return {str(k): str(v) for k, v in dict(headers).items()}
+    except Exception:
+        return str(headers)
+
+
+def make_buy_yes_limit_payload(
+    *,
+    ticker: str,
+    count: int,
+    yes_limit_cents: int,
+    time_in_force: str = "immediate_or_cancel",
+) -> dict[str, Any]:
+    """Legacy-shaped BUY YES limit payload (pre-V2 conversion)."""
+    return {
+        "ticker": ticker,
+        "action": "buy",
+        "side": "yes",
+        "count": int(count),
+        "type": "limit",
+        "client_order_id": str(uuid.uuid4()),
+        "yes_price": clamp_price_cents(yes_limit_cents),
+        "time_in_force": time_in_force,
+    }
+
+
+def make_sell_yes_limit_payload(
+    *,
+    ticker: str,
+    count: int,
+    yes_limit_cents: int,
+    time_in_force: str = "immediate_or_cancel",
+) -> dict[str, Any]:
+    """Legacy-shaped SELL YES (exit long YES) limit payload."""
+    return {
+        "ticker": ticker,
+        "action": "sell",
+        "side": "yes",
+        "count": int(count),
+        "type": "limit",
+        "client_order_id": str(uuid.uuid4()),
+        "yes_price": clamp_price_cents(yes_limit_cents),
+        "time_in_force": time_in_force,
+    }
+
+
+def make_event_order_v2_payload(legacy_payload: dict[str, Any]) -> dict[str, Any]:
+    """Convert legacy BUY/SELL YES payload to Kalshi V2 event-order shape."""
+    if str(legacy_payload.get("type") or "") != "limit":
+        raise ValueError("sports trader currently supports limit orders only")
+    action = str(legacy_payload.get("action") or "").lower()
+    side = str(legacy_payload.get("side") or "").lower()
+    if side != "yes" or action not in {"buy", "sell"}:
+        raise ValueError(f"unsupported order shape action={action!r} side={side!r}")
+    yes_price = legacy_payload.get("yes_price")
+    if yes_price is None:
+        raise ValueError(f"{action.upper()} YES limit order missing yes_price")
+    tif = legacy_payload.get("time_in_force") or "immediate_or_cancel"
+    if tif == "GTT":
+        tif = "good_till_canceled"
+    # V2 YES book: BUY YES = bid, SELL YES = ask (reduce_only).
+    return {
+        "ticker": legacy_payload["ticker"],
+        "client_order_id": legacy_payload.get("client_order_id") or str(uuid.uuid4()),
+        "side": "bid" if action == "buy" else "ask",
+        "count": fixed_contract_count(legacy_payload["count"]),
+        "price": fixed_dollar_price_from_cents(yes_price),
+        "time_in_force": tif,
+        "self_trade_prevention_type": "taker_at_cross",
+        "post_only": False,
+        "cancel_order_on_pause": False,
+        "reduce_only": action == "sell",
+    }
+
+
+def signed_json_request(
+    args: argparse.Namespace,
+    *,
+    method: str,
+    path: str,
+    body: dict | None = None,
+    params: dict[str, Any] | None = None,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Raw signed Kalshi REST request. Never logs secret values."""
+    if not getattr(args, "_auth_api_key_id", None) or not getattr(args, "_auth_private_key_file", None):
+        raise RuntimeError("Resolved auth settings are required before signed REST requests")
+
+    # Kalshi signs the path without query params; append params to the URL only.
+    signed_path = str(path).split("?", 1)[0]
+    url = str(args.api_host).rstrip("/") + signed_path.removeprefix("/trade-api/v2")
+    query = urllib.parse.urlencode(
+        {str(k): v for k, v in (params or {}).items() if v not in (None, "")}
+    )
+    if query:
+        url += "?" + query
+    timestamp = str(int(time.time() * 1000))
+    private_key = getattr(args, "_raw_rest_private_key", None)
+    if private_key is None:
+        private_key = load_pem_private_key(args._auth_private_key_file)
+        args._raw_rest_private_key = private_key
+    signature = sign_private_key_text(private_key, timestamp + method.upper() + signed_path)
+    data = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
+    headers = {
+        "KALSHI-ACCESS-KEY": args._auth_api_key_id,
+        "KALSHI-ACCESS-TIMESTAMP": timestamp,
+        "KALSHI-ACCESS-SIGNATURE": signature,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                response_body = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                response_body = {"raw": raw}
+            return {
+                "method": f"raw.{method.upper()} {path}",
+                "http_status": getattr(resp, "status", None) or getattr(resp, "code", None),
+                "headers": headers_to_dict(getattr(resp, "headers", None)),
+                "response": response_body,
+            }
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(4096).decode("utf-8", errors="replace")
+        try:
+            body_obj = json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            body_obj = raw
         raise RuntimeError(
-            "kx_orderbooks is required for --watch. Run: pip install -e ."
+            f"HTTP {exc.code} {method.upper()} {path}: {body_obj}"
         ) from exc
 
-    pairs = [
-        ("KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_FILE", "KALSHI_*"),
-        ("KALSHI_PROD_API_KEY_ID", "KALSHI_PROD_PRIVATE_KEY_FILE", "KALSHI_PROD_*"),
-        ("KALSHI_DEMO_API_KEY_ID", "KALSHI_DEMO_PRIVATE_KEY_FILE", "KALSHI_DEMO_*"),
-    ]
-    for key_env, pem_env, label in pairs:
-        key = os.environ.get(key_env)
-        pem = os.environ.get(pem_env)
-        if key and pem:
-            return key, load_private_key(pem), label
 
-    # Fall back to default env names used by kx_orderbooks.
-    key, private_key = load_auth_from_env()
-    return key, private_key, "KALSHI_*"
+def effective_count_yes(args: argparse.Namespace) -> int:
+    if getattr(args, "count_yes", None) is not None:
+        return int(args.count_yes)
+    return int(getattr(args, "count", 1) or 1)
+
+
+def buy_yes_for_market(
+    *,
+    args: argparse.Namespace,
+    row: "MarketRow",
+    quote: "QuoteSnap | None",
+) -> tuple[bool, str]:
+    """BUY YES for --count-yes contracts. Dry-run unless --live.
+
+    Prices from live YES ask + slippage (default 1c), IOC limit via V2 events API.
+    """
+    count = effective_count_yes(args)
+    if count <= 0:
+        return False, "ORDER ERROR: --count-yes must be positive"
+
+    # Ensure auth is resolved for both dry-run metadata and live submit.
+    try:
+        resolve_auth_settings(args, required=True)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"ORDER ERROR auth: {exc}"
+
+    ask = quote.yes_ask if quote is not None else None
+    if ask is None:
+        return False, (
+            f"ORDER BLOCKED {row.ticker}: no YES ask yet "
+            "(wait for book / ensure market is on-screen)"
+        )
+
+    slip = int(getattr(args, "slippage_cents", 1) or 0)
+    limit_cents = clamp_price_cents(int(ask) + slip)
+    legacy = make_buy_yes_limit_payload(
+        ticker=row.ticker,
+        count=count,
+        yes_limit_cents=limit_cents,
+        time_in_force=str(getattr(args, "time_in_force", "immediate_or_cancel")),
+    )
+    try:
+        v2 = make_event_order_v2_payload(legacy)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"ORDER ERROR payload: {exc}"
+
+    mode = "LIVE" if args.live else "DRY-RUN"
+    summary = (
+        f"{mode} BUY YES {row.ticker} count={count} "
+        f"ask={fmt_cents(ask)} limit={fmt_cents(limit_cents)} "
+        f"slip=+{slip}c tif={legacy['time_in_force']}"
+    )
+
+    # Memory-only during submit (no disk I/O, no stderr spam that breaks TUI).
+    detail = f"payload_v2={json.dumps(v2, sort_keys=True)}"
+    ORDER_LOG.record(
+        summary,
+        kind="order_built",
+        detail=detail,
+        ticker=row.ticker,
+        mode=mode,
+        live=bool(args.live),
+        ok=None if args.live else True,
+    )
+
+    if not args.live:
+        SESSION_BETS.record_buy(
+            ticker=row.ticker,
+            title=row.title or row.yes_sub_title or "",
+            count=count,
+            limit_cents=limit_cents,
+            live=False,
+            dry_run=True,
+            note=summary,
+        )
+        return True, summary + " (not submitted; memory-log)"
+
+    try:
+        info = signed_json_request(
+            args,
+            method="POST",
+            path="/trade-api/v2/portfolio/events/orders",
+            body=v2,
+            timeout=float(getattr(args, "order_submit_timeout", 10.0)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        fail = f"ORDER FAIL {row.ticker}: {exc}"
+        ORDER_LOG.record(
+            fail,
+            kind="order_error",
+            detail=str(exc),
+            ticker=row.ticker,
+            mode=mode,
+            live=True,
+            ok=False,
+        )
+        return False, fail
+
+    http_status = info.get("http_status")
+    resp = info.get("response")
+    resp_s = json.dumps(resp, default=str)[:800]
+    ok = http_status is None or (isinstance(http_status, int) and 200 <= http_status < 300)
+    if ok:
+        msg = (
+            f"LIVE OK BUY YES {row.ticker} count={count} "
+            f"limit={fmt_cents(limit_cents)} http={http_status}"
+        )
+    else:
+        msg = f"LIVE REJECT BUY YES {row.ticker} http={http_status}"
+    ORDER_LOG.record(
+        msg,
+        kind="order_response",
+        detail=f"http={http_status} body={resp_s}",
+        ticker=row.ticker,
+        mode=mode,
+        live=True,
+        ok=ok,
+        http_status=http_status if isinstance(http_status, int) else None,
+    )
+    if ok:
+        SESSION_BETS.record_buy(
+            ticker=row.ticker,
+            title=row.title or row.yes_sub_title or "",
+            count=count,
+            limit_cents=limit_cents,
+            live=True,
+            dry_run=False,
+            note=msg,
+        )
+    return ok, msg
+
+
+@dataclass
+class SessionBet:
+    """One session-tracked BUY YES that went through (live or dry-run)."""
+
+    ticker: str
+    title: str
+    count: int
+    limit_cents: int | None
+    ts: float
+    live: bool
+    dry_run: bool
+    note: str = ""
+    sold_count: int = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, int(self.count) - int(self.sold_count))
+
+
+class SessionBetBook:
+    """In-memory bets opened this browser session (plus optional exchange positions)."""
+
+    def __init__(self) -> None:
+        self.bets: list[SessionBet] = []
+        self.exchange_positions: dict[str, int] = {}  # ticker -> net YES contracts
+        self.positions_error: str = ""
+        self.positions_ts: float = 0.0
+
+    def record_buy(
+        self,
+        *,
+        ticker: str,
+        title: str,
+        count: int,
+        limit_cents: int | None,
+        live: bool,
+        dry_run: bool,
+        note: str = "",
+    ) -> SessionBet:
+        bet = SessionBet(
+            ticker=ticker,
+            title=title or "",
+            count=int(count),
+            limit_cents=limit_cents,
+            ts=time.time(),
+            live=bool(live),
+            dry_run=bool(dry_run),
+            note=note or "",
+        )
+        self.bets.append(bet)
+        return bet
+
+    def mark_sold(self, ticker: str, count: int) -> None:
+        left = int(count)
+        if left <= 0:
+            return
+        for bet in reversed(self.bets):
+            if bet.ticker != ticker or bet.remaining <= 0:
+                continue
+            take = min(bet.remaining, left)
+            bet.sold_count += take
+            left -= take
+            if left <= 0:
+                break
+
+    def open_session_rows(self) -> list[tuple[str, str, int, bool]]:
+        """Aggregate open session exposure: (ticker, title, remaining, any_live)."""
+        agg: dict[str, list[Any]] = {}
+        for bet in self.bets:
+            rem = bet.remaining
+            if rem <= 0:
+                continue
+            cur = agg.get(bet.ticker)
+            if cur is None:
+                agg[bet.ticker] = [bet.title, rem, bet.live and not bet.dry_run]
+            else:
+                cur[1] += rem
+                cur[2] = cur[2] or (bet.live and not bet.dry_run)
+                if bet.title and not cur[0]:
+                    cur[0] = bet.title
+        return [(t, v[0], int(v[1]), bool(v[2])) for t, v in sorted(agg.items())]
+
+    def set_exchange_positions(self, positions: dict[str, int]) -> None:
+        self.exchange_positions = {
+            str(k).upper(): int(v) for k, v in positions.items() if int(v) != 0
+        }
+        self.positions_ts = time.time()
+        self.positions_error = ""
+
+
+SESSION_BETS = SessionBetBook()
+
+
+def _parse_position_contracts(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(round(float(str(value))))
+    except Exception:
+        return None
+
+
+def fetch_yes_positions(
+    args: argparse.Namespace,
+    *,
+    tickers: Iterable[str] | None = None,
+    timeout: float | None = None,
+) -> dict[str, int]:
+    """Fetch net YES positions (positive = long YES). Filter to tickers when given."""
+    resolve_auth_settings(args, required=True)
+    known = {str(t).upper() for t in (tickers or []) if t}
+    params: dict[str, Any] = {"limit": 200, "count_filter": "position"}
+    info = signed_json_request(
+        args,
+        method="GET",
+        path="/trade-api/v2/portfolio/positions",
+        params=params,
+        timeout=float(timeout if timeout is not None else getattr(args, "order_submit_timeout", 10.0)),
+    )
+    response = info.get("response") if isinstance(info, dict) else None
+    rows = response.get("market_positions") if isinstance(response, dict) else None
+    if not isinstance(rows, list):
+        raise RuntimeError(f"Unexpected /portfolio/positions response: {response!r}")
+
+    out: dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ticker = str(row.get("ticker") or "").upper()
+        if not ticker:
+            continue
+        if known and ticker not in known:
+            continue
+        pos = _parse_position_contracts(row.get("position_fp"))
+        if pos is None:
+            pos = _parse_position_contracts(row.get("position"))
+        if pos is None or pos == 0:
+            continue
+        out[ticker] = pos
+    return out
+
+
+def refresh_exchange_positions(state: "BrowserState") -> str:
+    """Pull exchange positions for known game tickers (+ session bets)."""
+    try:
+        resolve_auth_settings(state.args, required=True)
+    except Exception as exc:  # noqa: BLE001
+        SESSION_BETS.positions_error = str(exc)
+        return f"positions auth error: {exc}"
+    known = {r.ticker.upper() for r in state.rows}
+    known.update(b.ticker.upper() for b in SESSION_BETS.bets)
+    try:
+        # Fetch all non-zero positions, then keep those related to this game/session.
+        all_pos = fetch_yes_positions(state.args, tickers=None)
+        filtered = {
+            t: n
+            for t, n in all_pos.items()
+            if t in known or any(t.endswith(state.game_code.upper()) for _ in [0])
+        }
+        # Prefer game-code suffix match so we catch props even if series list incomplete.
+        game = state.game_code.upper()
+        filtered = {t: n for t, n in all_pos.items() if game in t or t in known}
+        SESSION_BETS.set_exchange_positions(filtered)
+        return f"positions refreshed: {len(filtered)} open (YES net)"
+    except Exception as exc:  # noqa: BLE001
+        SESSION_BETS.positions_error = str(exc)
+        return f"positions refresh failed: {exc}"
+
+
+def orders_page_items(state: "BrowserState") -> list[dict[str, Any]]:
+    """Rows for the ORDERS page: exchange positions + session dry-run exposure."""
+    title_by = {r.ticker.upper(): (r.title or r.yes_sub_title or "") for r in state.rows}
+    for bet in SESSION_BETS.bets:
+        title_by.setdefault(bet.ticker.upper(), bet.title)
+
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    # Live exchange positions first (authoritative when --live).
+    for ticker, net in sorted(SESSION_BETS.exchange_positions.items()):
+        if net == 0:
+            continue
+        side = "YES" if net > 0 else "NO"
+        qty = abs(int(net))
+        items.append(
+            {
+                "ticker": ticker,
+                "title": title_by.get(ticker, ""),
+                "qty": qty,
+                "side": side,
+                "source": "exchange",
+                "sellable": net > 0,  # sports UI sells YES longs for now
+                "net": int(net),
+            }
+        )
+        seen.add(ticker)
+
+    # Session dry-run / pending exposure not yet on exchange.
+    for ticker, title, rem, any_live in SESSION_BETS.open_session_rows():
+        t = ticker.upper()
+        if t in seen:
+            # still show session remainder as note via qty bump only if dry-run only
+            continue
+        items.append(
+            {
+                "ticker": t,
+                "title": title or title_by.get(t, ""),
+                "qty": int(rem),
+                "side": "YES",
+                "source": "session-live" if any_live else "session-dry",
+                "sellable": True,
+                "net": int(rem),
+            }
+        )
+    return items
+
+
+def sell_yes_for_position(
+    *,
+    args: argparse.Namespace,
+    ticker: str,
+    title: str,
+    count: int,
+    quote: "QuoteSnap | None",
+) -> tuple[bool, str]:
+    """SELL YES to exit a long YES position. Default count = full position (sell all).
+
+    Limit = YES bid - slippage (cross the bid). reduce_only on V2. Dry-run unless --live.
+    """
+    count = int(count)
+    if count <= 0:
+        return False, "SELL ERROR: count must be positive"
+
+    try:
+        resolve_auth_settings(args, required=True)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"SELL ERROR auth: {exc}"
+
+    bid = quote.yes_bid if quote is not None else None
+    if bid is None:
+        return False, (
+            f"SELL BLOCKED {ticker}: no YES bid yet "
+            "(wait for book / ensure market is subscribed)"
+        )
+
+    slip = int(getattr(args, "slippage_cents", 1) or 0)
+    limit_cents = clamp_price_cents(int(bid) - slip)
+    legacy = make_sell_yes_limit_payload(
+        ticker=ticker,
+        count=count,
+        yes_limit_cents=limit_cents,
+        time_in_force=str(getattr(args, "time_in_force", "immediate_or_cancel")),
+    )
+    try:
+        v2 = make_event_order_v2_payload(legacy)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"SELL ERROR payload: {exc}"
+
+    mode = "LIVE" if args.live else "DRY-RUN"
+    # Explicit action text so the operator never confuses buy vs sell.
+    summary = (
+        f"{mode} SELL YES (EXIT ALL x{count}) {ticker} "
+        f"bid={fmt_cents(bid)} limit={fmt_cents(limit_cents)} "
+        f"slip=-{slip}c reduce_only tif={legacy['time_in_force']}"
+    )
+    detail = f"payload_v2={json.dumps(v2, sort_keys=True)} title={title!r}"
+    ORDER_LOG.record(
+        summary,
+        kind="sell_built",
+        detail=detail,
+        ticker=ticker,
+        mode=mode,
+        live=bool(args.live),
+        ok=None if args.live else True,
+    )
+
+    if not args.live:
+        SESSION_BETS.mark_sold(ticker, count)
+        return True, summary + " (not submitted; memory-log)"
+
+    try:
+        info = signed_json_request(
+            args,
+            method="POST",
+            path="/trade-api/v2/portfolio/events/orders",
+            body=v2,
+            timeout=float(getattr(args, "order_submit_timeout", 10.0)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        fail = f"SELL FAIL {ticker}: {exc}"
+        ORDER_LOG.record(
+            fail,
+            kind="sell_error",
+            detail=str(exc),
+            ticker=ticker,
+            mode=mode,
+            live=True,
+            ok=False,
+        )
+        return False, fail
+
+    http_status = info.get("http_status")
+    resp = info.get("response")
+    resp_s = json.dumps(resp, default=str)[:800]
+    ok = http_status is None or (isinstance(http_status, int) and 200 <= http_status < 300)
+    if ok:
+        msg = (
+            f"LIVE OK SELL YES (EXIT x{count}) {ticker} "
+            f"limit={fmt_cents(limit_cents)} http={http_status}"
+        )
+        SESSION_BETS.mark_sold(ticker, count)
+    else:
+        msg = f"LIVE REJECT SELL YES {ticker} http={http_status}"
+    ORDER_LOG.record(
+        msg,
+        kind="sell_response",
+        detail=f"http={http_status} body={resp_s}",
+        ticker=ticker,
+        mode=mode,
+        live=True,
+        ok=ok,
+        http_status=http_status if isinstance(http_status, int) else None,
+    )
+    return ok, msg
+
+
+
+def _import_kx_auth():
+    """Import kx_orderbooks.auth without requiring full package extras."""
+    try:
+        from kx_orderbooks import auth as auth_mod
+        return auth_mod
+    except Exception:
+        pass
+    import importlib.util
+    import sys
+    auth_path = Path(__file__).resolve().parent / "kx_orderbooks" / "auth.py"
+    if not auth_path.is_file():
+        raise ImportError(f"kx_orderbooks.auth not found at {auth_path}")
+    if "kx_orderbooks" not in sys.modules:
+        pkg = importlib.util.module_from_spec(
+            importlib.util.spec_from_loader("kx_orderbooks", loader=None)
+        )
+        pkg.__path__ = [str(auth_path.parent)]
+        sys.modules["kx_orderbooks"] = pkg
+    spec = importlib.util.spec_from_file_location("kx_orderbooks.auth", auth_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["kx_orderbooks.auth"] = mod
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def auth_env_candidates(kalshi_env: str) -> list[tuple[str, str]]:
+    """Return auth env-var pairs in preferred order for demo or prod."""
+    return _import_kx_auth().auth_env_candidates(kalshi_env)
+
+
+def default_auth_env_names(kalshi_env: str) -> tuple[str, str]:
+    return _import_kx_auth().default_auth_env_names(kalshi_env)
+
+
+def key_id_hint(api_key_id: str) -> str:
+    return _import_kx_auth().key_id_hint(api_key_id)
+
+
+def default_hosts_for_env(kalshi_env: str, *, demo_host_style: str = "external") -> tuple[str, str]:
+    """Return (rest_host, ws_url) for --demo/--prod."""
+    if kalshi_env == "demo":
+        if demo_host_style == "direct":
+            return DEMO_REST_HOST_ALT, DEMO_WS_URL_ALT
+        return DEMO_REST_HOST, DEMO_WS_URL
+    return PROD_REST_HOST, PROD_WS_URL
+
+
+def apply_env_endpoints(args: argparse.Namespace) -> None:
+    """Fill api_host / ws_url from --demo/--prod unless explicitly overridden."""
+    rest_default, ws_default = default_hosts_for_env(
+        args.kalshi_env,
+        demo_host_style=str(getattr(args, "demo_host_style", "external") or "external"),
+    )
+    host_override = getattr(args, "host", None)
+    api_host_override = getattr(args, "api_host", None)
+    if api_host_override:
+        args.api_host = str(api_host_override).rstrip("/")
+    elif host_override:
+        args.api_host = str(host_override).rstrip("/")
+    else:
+        args.api_host = rest_default.rstrip("/")
+    args.host = args.api_host
+
+    ws_override = getattr(args, "ws_url", None)
+    args.ws_url = str(ws_override) if ws_override else ws_default
+
+
+def resolve_auth_settings(args: argparse.Namespace, *, required: bool) -> bool:
+    """Resolve auth onto args via shared config-dir/env loader.
+
+    When required=True, raise RuntimeError on missing credentials.
+    Never prints secret values.
+    """
+    try:
+        auth_mod = _import_kx_auth()
+    except Exception as exc:
+        if required:
+            raise RuntimeError(
+                "kx_orderbooks.auth is required for auth resolution. Run: pip install -e ."
+            ) from exc
+        return False
+
+    try:
+        auth = auth_mod.resolve_kalshi_auth(
+            args.kalshi_env,
+            private_key_file=getattr(args, "private_key_file", None),
+            api_key_id_env=getattr(args, "api_key_id_env", None),
+            private_key_file_env=getattr(args, "private_key_file_env", None),
+            required=required,
+        )
+    except Exception:
+        if required:
+            raise
+        return False
+
+    if auth is None:
+        return False
+
+    args._auth_api_key_id = auth.api_key_id
+    args._auth_api_key_hint = auth.api_key_hint
+    args._auth_api_key_env = auth.api_key_source
+    args._auth_private_key_file = auth.private_key_path
+    args._auth_private_key_file_env = auth.private_key_source
+    args._auth_config_dir = auth.config_dir
+    return True
+
+
+def resolve_ws_auth(args: argparse.Namespace | None = None) -> tuple[str, Any, str]:
+    """Return (api_key_id, private_key, source_label) for WebSocket workers."""
+    try:
+        auth_mod = _import_kx_auth()
+    except Exception as exc:
+        raise RuntimeError(
+            "kx_orderbooks.auth is required for --watch/--browse WS. Run: pip install -e ."
+        ) from exc
+
+    if args is None:
+        for probe in ("prod", "demo"):
+            auth = auth_mod.resolve_kalshi_auth(probe, required=False)
+            if auth is not None:
+                return (
+                    auth.api_key_id,
+                    auth.load_private_key(),
+                    f"{auth.kalshi_env}:{auth.api_key_source}",
+                )
+        raise RuntimeError(
+            "Set auth in ~/.config/kalshi-multiplex-orderbook/prod.env "
+            "(or demo.env), or export KALSHI_PROD_* / KALSHI_DEMO_*."
+        )
+
+    if not resolve_auth_settings(args, required=True):
+        raise RuntimeError("auth resolution failed")
+    return (
+        args._auth_api_key_id,
+        auth_mod.load_private_key(args._auth_private_key_file),
+        f"{args.kalshi_env}:{args._auth_api_key_env}",
+    )
 
 
 def select_watch_rows(rows: list[MarketRow], *, watch_limit: int) -> list[MarketRow]:
-    """Prefer active/open markets for the websocket subscription."""
+    """Prefer active/open markets for the *initial* websocket subscription.
+
+    Browse mode later expands this set to whatever is on-screen (viewport),
+    because a fixed first-N seed misses later series like player props.
+    """
     preferred_status = {"active", "open"}
     live = [r for r in rows if r.status.lower() in preferred_status]
     chosen = live if live else list(rows)
@@ -598,6 +1510,7 @@ def select_watch_rows(rows: list[MarketRow], *, watch_limit: int) -> list[Market
 def run_watch(
     rows: list[MarketRow],
     *,
+    args: argparse.Namespace,
     ws_url: str,
     watch_limit: int,
     print_every: float,
@@ -612,12 +1525,14 @@ def run_watch(
         return 2
 
     try:
-        api_key_id, private_key, auth_label = resolve_ws_auth()
+        api_key_id, private_key, auth_label = resolve_ws_auth(args)
     except Exception as exc:  # noqa: BLE001
         eprint(f"error: WebSocket auth not configured: {exc}")
+        pref_k, pref_p = default_auth_env_names(args.kalshi_env)
         eprint(
-            "Set KALSHI_API_KEY_ID + KALSHI_PRIVATE_KEY_FILE "
-            "(or KALSHI_PROD_* / KALSHI_DEMO_*)."
+            f"For --{args.kalshi_env}, set {pref_k}+{pref_p} in the environment or in "
+            f"~/.config/kalshi-multiplex-orderbook/{args.kalshi_env}.env "
+            f"(and place the PEM as {args.kalshi_env}.private-key.pem)."
         )
         return 2
 
@@ -745,21 +1660,1431 @@ def print_discovery_text(
             print(f"  ... {len(errors) - 30} more")
 
 
+
+CATEGORY_ORDER = (
+    "game_lines",
+    "player_props",
+    "team_props",
+    "game_props",
+    "other",
+)
+
+CATEGORY_LABELS = {
+    "game_lines": "Game lines",
+    "player_props": "Player props",
+    "team_props": "Team props",
+    "game_props": "Game props",
+    "other": "Other",
+}
+
+
+def classify_market(row: MarketRow) -> str:
+    """Bucket a market into the sports browser categories."""
+    series = (row.series_ticker or "").upper()
+    title = f"{row.title} {row.yes_sub_title} {row.no_sub_title}".lower()
+
+    if any(tok in series for tok in ("TEAMTOTAL", "TEAMTD", "TEAMYDS", "TEAMSACK", "FIRSTTDTEAM")):
+        return "team_props"
+    if series.endswith("TEAM") and "GAME" not in series:
+        return "team_props"
+
+    player_series = (
+        "PASSYDS", "PASSTDS", "PASSATT", "PASSCOMP", "PASSINT",
+        "RSHYDS", "RSHATT", "REC", "RECYDS", "RRYDS",
+        "ANYTD", "FIRSTTD", "FFPTS", "LONGREC", "LONGRSH",
+        "MOSTREC", "MOSTRSH", "TOTALTD",
+    )
+    if any(tok in series for tok in player_series):
+        # FIRSTTDTEAM already handled; bare FIRSTTD is player props
+        if "TEAM" in series and "FIRSTTDTEAM" not in series and series.endswith("TEAM"):
+            return "team_props"
+        return "player_props"
+    if "player" in title or re.search(r"\b(qb|rb|wr|te)\b", title):
+        return "player_props"
+
+    game_line_series = (
+        "GAME", "SPREAD", "TOTAL", "WINMARGIN", "MONEYLINE", "ML",
+        "1H", "2H", "1Q", "2Q", "3Q", "4Q",
+    )
+    # TEAMTOTAL already returned; plain TOTAL/SPREAD/GAME are lines
+    if any(tok in series for tok in game_line_series) and "TEAM" not in series:
+        # quarters/halves totals/spreads are still game lines
+        if not any(tok in series for tok in ("PASS", "RSH", "REC", "TD", "FG", "SACK", "FFPTS")):
+            return "game_lines"
+        # e.g. unexpected mix
+    if series in {"KXNFLGAME", "KXNFLSPREAD", "KXNFLTOTAL", "KXNFLWINMARGIN"} or re.fullmatch(r"KXNFL[1234]Q(SPREAD|TOTAL)?", series) or re.fullmatch(r"KXNFL[12]H(SPREAD|TOTAL|FT)?", series):
+        return "game_lines"
+
+    game_prop_series = (
+        "BOTH", "GAMESPECIALS", "GAMETD", "GAMEFG", "GAMESACK", "FG", "SACK", "TD",
+    )
+    if any(tok in series for tok in game_prop_series):
+        return "game_props"
+
+    return "other"
+
+
+def market_haystack(row: MarketRow) -> str:
+    return " ".join(
+        [
+            row.ticker,
+            row.title,
+            row.yes_sub_title,
+            row.no_sub_title,
+            row.series_ticker,
+            row.event_ticker,
+            row.status,
+            CATEGORY_LABELS.get(classify_market(row), ""),
+        ]
+    ).lower()
+
+
+def filter_tokens(text: str) -> list[str]:
+    """Whitespace-split query tokens (order-independent matching)."""
+    return [tok for tok in str(text or "").lower().split() if tok]
+
+
+def row_matches_filter(row: MarketRow, filter_text: str) -> bool:
+    """Loose multi-word match: every token must appear somewhere in haystack.
+
+    Example: "patrick mahomes td" matches a market whose title/ticker contains
+    those words in any order (and with other text in between).
+    """
+    tokens = filter_tokens(filter_text)
+    if not tokens:
+        return True
+    hay = market_haystack(row)
+    return all(tok in hay for tok in tokens)
+
+
+def short_label(text: str, max_len: int = 56) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max(1, max_len - 1)] + "…"
+
+
+@dataclass
+class QuoteSnap:
+    yes_bid: int | None = None
+    yes_ask: int | None = None
+    no_bid: int | None = None
+    no_ask: int | None = None
+    spread: int | None = None
+    ready: bool = False
+    seq: int | None = None
+    updated_ts: float = 0.0
+
+
+class BackgroundBookTracker:
+    """Silently maintain live books over one multiplex WebSocket.
+
+    Starts with a seed subscription (watch_limit), then expands to whatever
+    tickers the UI is currently showing via ensure_quotes().
+    """
+
+    def __init__(
+        self,
+        rows: list[MarketRow],
+        *,
+        ws_url: str,
+        watch_limit: int,
+        log_raw: bool = False,
+        args: argparse.Namespace | None = None,
+    ):
+        self.rows = rows
+        self.ws_url = ws_url
+        self.watch_limit = watch_limit
+        self.log_raw = log_raw
+        self.args = args
+        self.store = None
+        self.worker = None
+        self.enabled = False
+        self.status = "off"
+        self.auth_label = ""
+        self.error: str | None = None
+        self.subscribed_n = 0
+        self._quotes: dict[str, QuoteSnap] = {}
+        self._lock_err = ""
+        self._seed_tickers: set[str] = set()
+        self._subscribed: set[str] = set()
+        self._keep_tickers: set[str] = set()
+        self._last_ensure_ts = 0.0
+        # Soft cap on concurrent WS markets. 0 watch_limit => larger ceiling.
+        if watch_limit <= 0:
+            self._max_subscribed = 400
+        else:
+            self._max_subscribed = max(watch_limit, 160)
+
+    def start(self) -> None:
+        try:
+            from kx_orderbooks.store import OrderbookStore
+            from kx_orderbooks.ws_multiplex import MultiplexOrderbookWorker
+        except ImportError as exc:
+            self.status = "no-deps"
+            self.error = f"kx_orderbooks import failed: {exc}"
+            return
+
+        try:
+            api_key_id, private_key, auth_label = resolve_ws_auth(self.args)
+        except Exception as exc:  # noqa: BLE001
+            self.status = "no-auth"
+            self.error = str(exc)
+            return
+
+        chosen = select_watch_rows(self.rows, watch_limit=self.watch_limit)
+        if not chosen:
+            self.status = "no-markets"
+            self.error = "no markets to subscribe"
+            return
+
+        tickers = [r.ticker.upper() for r in chosen]
+        self._seed_tickers = set(tickers)
+        self._subscribed = set(tickers)
+        self._keep_tickers = set(tickers)
+        self.subscribed_n = len(tickers)
+        self.auth_label = auth_label
+        self.store = OrderbookStore()
+        self.worker = MultiplexOrderbookWorker(
+            market_tickers=tickers,
+            store=self.store,
+            ws_url=self.ws_url,
+            api_key_id=api_key_id,
+            private_key=private_key,
+            use_yes_price=True,
+            reconnect=True,
+            log_raw=self.log_raw,
+        )
+
+        def _on_update(update) -> None:  # noqa: ANN001
+            # Silent tracking only — UI pulls snapshots on redraw.
+            try:
+                b = update.view.best
+                self._quotes[update.market_ticker.upper()] = QuoteSnap(
+                    yes_bid=b.yes_bid_cents,
+                    yes_ask=b.yes_ask_cents,
+                    no_bid=b.no_bid_cents,
+                    no_ask=b.no_ask_cents,
+                    spread=b.spread_cents,
+                    ready=bool(update.view.ready),
+                    seq=update.seq if isinstance(update.seq, int) else None,
+                    updated_ts=time.time(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._lock_err = str(exc)
+
+        self.store.register_callback(_on_update)
+        self.worker.start()
+        self.enabled = True
+        self.status = "starting"
+
+        # Brief non-blocking wait so first UI frame can show connect state.
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if self.worker.subscribed:
+                self.status = "live"
+                break
+            if self.worker.last_error is not None and not self.worker.connected:
+                self.status = "error"
+                self.error = repr(self.worker.last_error)
+                break
+            time.sleep(0.05)
+        else:
+            if self.worker.connected:
+                self.status = "connected"
+            else:
+                self.status = "connecting"
+
+    def poll_status(self) -> None:
+        if not self.enabled or self.worker is None:
+            return
+        if self.worker.last_error is not None and not self.worker.connected:
+            self.status = "error"
+            self.error = repr(self.worker.last_error)
+        elif self.worker.subscribed:
+            self.status = "live"
+        elif self.worker.connected:
+            self.status = "connected"
+        else:
+            self.status = "connecting"
+        # Keep count in sync with worker's view of the world.
+        try:
+            self.subscribed_n = len(getattr(self.worker, "market_tickers", []) or self._subscribed)
+            self._subscribed = {t.upper() for t in (self.worker.market_tickers or [])}
+        except Exception:  # noqa: BLE001
+            self.subscribed_n = len(self._subscribed)
+
+    def ensure_quotes(self, tickers: Iterable[str], *, force: bool = False) -> None:
+        """Subscribe any missing tickers the UI currently cares about.
+
+        Kalshi books only arrive for subscribed markets. Browse starts with a
+        seed (default first N), then calls this for the visible viewport so
+        player props / filtered rows get books too.
+        """
+        if not self.enabled or self.worker is None:
+            return
+        if not self.worker.subscribed and not force:
+            # Wait until the initial subscribe sid exists; add_markets needs it.
+            return
+
+        wanted = sorted({str(t).upper() for t in tickers if t})
+        if not wanted:
+            return
+
+        now = time.time()
+        # Light throttle so rapid redraws don't spam add/delete.
+        if not force and now - self._last_ensure_ts < 0.15:
+            self._keep_tickers |= set(wanted)
+            return
+        self._last_ensure_ts = now
+        self._keep_tickers |= set(wanted)
+
+        missing = [t for t in wanted if t not in self._subscribed]
+        if missing:
+            # Batch adds; worker.add_markets updates its market_tickers set.
+            ok = self.worker.add_markets(missing)
+            if ok:
+                self._subscribed |= set(missing)
+                self.subscribed_n = len(self._subscribed)
+
+        # Soft prune far-away markets if over budget.
+        if len(self._subscribed) > self._max_subscribed:
+            protect = set(self._seed_tickers) | set(self._keep_tickers) | set(wanted)
+            # Also protect anything with a fresh quote recently viewed.
+            excess = [t for t in sorted(self._subscribed) if t not in protect]
+            drop_n = len(self._subscribed) - self._max_subscribed
+            if drop_n > 0 and excess:
+                to_drop = excess[:drop_n]
+                if self.worker.delete_markets(to_drop):
+                    self._subscribed -= set(to_drop)
+                    self.subscribed_n = len(self._subscribed)
+                    for t in to_drop:
+                        self._quotes.pop(t, None)
+
+        # If already subscribed but still blank after a bit, nudge a snapshot.
+        stale_need: list[str] = []
+        for t in wanted:
+            q = self._quotes.get(t)
+            if q is None or not q.ready:
+                # Only request once the ticker is known-subscribed.
+                if t in self._subscribed:
+                    stale_need.append(t)
+        if stale_need and self.worker.subscribed:
+            # Cheap: request snapshots for visible blanks only.
+            self.worker.request_snapshots(stale_need)
+
+    def quote(self, ticker: str) -> QuoteSnap | None:
+        t = ticker.upper()
+        q = self._quotes.get(t)
+        if q is not None:
+            return q
+        if self.store is None:
+            return None
+        view = self.store.get_view(t)
+        if view is None:
+            return None
+        b = view.best
+        q = QuoteSnap(
+            yes_bid=b.yes_bid_cents,
+            yes_ask=b.yes_ask_cents,
+            no_bid=b.no_bid_cents,
+            no_ask=b.no_ask_cents,
+            spread=b.spread_cents,
+            ready=bool(view.ready),
+            seq=view.seq if isinstance(view.seq, int) else None,
+            updated_ts=view.last_local_ts or time.time(),
+        )
+        self._quotes[t] = q
+        return q
+
+    def ready_count(self) -> int:
+        if self.store is None:
+            return len([q for q in self._quotes.values() if q.ready])
+        return sum(1 for v in self.store.views() if v.ready)
+
+    def stop(self) -> None:
+        if self.worker is not None:
+            try:
+                self.worker.stop()
+                self.worker.join(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+        self.status = "stopped"
+
+
+def read_terminal_key(fd: int) -> tuple[str, str]:
+    """Read one keypress from raw terminal fd. Returns (kind, value)."""
+    ch = os.read(fd, 1)
+    if not ch:
+        return "empty", ""
+    if ch == b"\x1b":
+        seq = bytearray(ch)
+        deadline = time.time() + 0.03
+        while len(seq) < 8 and time.time() < deadline:
+            readable, _, _ = select.select([fd], [], [], 0.005)
+            if not readable:
+                break
+            try:
+                b = os.read(fd, 1)
+            except OSError:
+                break
+            if not b:
+                break
+            seq.extend(b)
+        mapping = {
+            b"\x1b[A": "up",
+            b"\x1b[B": "down",
+            b"\x1b[C": "right",
+            b"\x1b[D": "left",
+            b"\x1b[5~": "pageup",
+            b"\x1b[6~": "pagedown",
+            b"\x1b[H": "home",
+            b"\x1b[F": "end",
+        }
+        key = mapping.get(bytes(seq))
+        if key:
+            return key, bytes(seq).decode("ascii", errors="ignore")
+        if bytes(seq) == b"\x1b":
+            return "escape", "esc"
+        return "escape", bytes(seq).decode("ascii", errors="ignore")
+    if ch == b"\x08":
+        return "ctrl", "h"  # Ctrl-H help (not backspace)
+    if ch == b"\x7f":
+        return "backspace", "del"
+    if ch in (b"\r", b"\n"):
+        return "enter", "enter"
+    if ch == b"\x03":
+        return "ctrl", "c"
+    if ch == b"\x0c":
+        return "ctrl", "l"
+    if ch == b"\x12":
+        return "ctrl", "r"
+    if ch == b"\x04":
+        return "ctrl", "d"
+    if ch == b"\x15":
+        return "ctrl", "u"
+    try:
+        s = ch.decode("utf-8")
+    except UnicodeDecodeError:
+        return "unknown", ""
+    if s.isprintable() or s == "\t":
+        return "char", s
+    if 0 < ch[0] < 32:
+        return "ctrl", chr(ch[0] + 96)
+    return "unknown", s
+def clear_screen() -> None:
+    sys.stdout.write("\033[H\033[J")
+    sys.stdout.flush()
+
+
+def help_text() -> str:
+    return """
+SPORTS TRADER — KEYBOARD HELP (Ctrl-H)
+======================================
+Modes (vim-style)
+  NORMAL             navigate; letters are commands (default)
+  FILTER             type query; all letters/digits/space go to filter>
+  f or /             enter FILTER mode
+  Esc / Enter        leave FILTER → NORMAL (keeps query)
+  Ctrl-U             clear filter text
+
+NORMAL navigation
+  ↑ / k / Ctrl-P     move up
+  ↓ / j / Ctrl-N     move down
+  PgUp / PgDn        page up/down
+  Home / End / g/G   first / last row
+  Enter              categories: open · markets/detail: BUY YES (--count-yes)
+  d / Space           open market detail (no order)
+  o                  ORDERS page — session bets + exchange positions
+  Esc / Backspace    clear filter if set, else go back
+  1-5                jump to category (on category screen)
+  a                  show All markets category
+  Ctrl-L / Ctrl-R    redraw
+  Ctrl-H             this help
+  q                  ask to quit · Enter confirms · Esc/other cancels
+
+Orders / exits
+  Enter on a market  BUY YES for --count-yes contracts (default 1)
+  Price (buy)        YES ask + --slippage-cents (default 1), IOC limit
+  o then Enter       SELL YES EXIT ALL contracts on selected position
+  Price (sell)       YES bid - slippage, reduce_only IOC (explicit SELL)
+  r (on orders)      refresh exchange positions from API
+  Dry-run default    memory-logs payload only; add --live to submit
+  Order log          in-memory; dumps to file when idle / on exit
+  Prefer --demo      for first live tests
+  L                  show recent memory log + force dump
+
+FILTER matching
+  Multi-word, order-independent: "patrick mahomes td"
+  matches markets containing all of those tokens anywhere
+  in ticker/title/series (any order).
+  q / k / j / numbers all type into the filter in FILTER mode.
+
+Quotes
+  Background WebSocket keeps books silently (no spam).
+  YES bid/ask appears when a book snapshot has arrived.
+  Browse works without API keys; quotes need config/env auth.
+  Books refresh live for subscribed markets; viewport auto-subscribes
+  more as you scroll/filter (seed starts at --watch-limit).
+
+Screens
+  Categories → Markets → Market detail
+""".strip()
+
+
+@dataclass
+class BrowserState:
+    seed_series: str
+    game_code: str
+    rows: list[MarketRow]
+    tracker: BackgroundBookTracker
+    args: argparse.Namespace
+    mode: str = "categories"  # categories | markets | detail | help | orders
+    input_mode: str = "normal"  # normal | filter
+    category: str = "game_lines"
+    filter_text: str = ""
+    cursor: int = 0
+    offset: int = 0
+    page_size: int = 18
+    selected_ticker: str = ""
+    message: str = ""
+    prev_mode: str = "categories"
+    order_busy: bool = False
+    last_order_ts: float = 0.0
+    quit_confirm: bool = False
+    sell_confirm: bool = False
+    sell_confirm_ticker: str = ""
+    sell_confirm_qty: int = 0
+    return_mode: str = "categories"  # mode to restore when leaving orders
+
+    def category_counts(self) -> dict[str, int]:
+        counts = {k: 0 for k in CATEGORY_ORDER}
+        for row in self.rows:
+            counts[classify_market(row)] = counts.get(classify_market(row), 0) + 1
+        return counts
+
+    def filtered_rows(self) -> list[MarketRow]:
+        out: list[MarketRow] = []
+        for row in self.rows:
+            if self.category != "all" and classify_market(row) != self.category:
+                continue
+            if not row_matches_filter(row, self.filter_text):
+                continue
+            out.append(row)
+        out.sort(key=lambda r: (r.series_ticker, r.ticker))
+        return out
+
+    def category_items(self) -> list[tuple[str, str, int]]:
+        counts = self.category_counts()
+        items = [(key, CATEGORY_LABELS[key], counts.get(key, 0)) for key in CATEGORY_ORDER]
+        items.append(("all", "All markets", len(self.rows)))
+        return items
+
+
+def clamp_cursor(state: BrowserState, n_items: int) -> None:
+    if n_items <= 0:
+        state.cursor = 0
+        state.offset = 0
+        return
+    state.cursor = max(0, min(state.cursor, n_items - 1))
+    if state.cursor < state.offset:
+        state.offset = state.cursor
+    if state.cursor >= state.offset + state.page_size:
+        state.offset = state.cursor - state.page_size + 1
+
+
+def move_cursor(state: BrowserState, delta: int, n_items: int) -> None:
+    if n_items <= 0:
+        return
+    state.cursor = max(0, min(n_items - 1, state.cursor + delta))
+    clamp_cursor(state, n_items)
+
+
+def format_quote_cell(q: QuoteSnap | None) -> str:
+    if q is None or not q.ready:
+        return "  -- x -- "
+    return f"{fmt_cents(q.yes_bid):>4} x {fmt_cents(q.yes_ask):<4}"
+
+
+def format_filter_line(state: BrowserState, match_count: int | None = None) -> str:
+    """Visible filter bar. Live caret only while input_mode == filter."""
+    if state.mode == "help":
+        return "filter> (paused on help)"
+    needle = state.filter_text
+    filtering = state.input_mode == "filter"
+    if match_count is None:
+        count_bit = ""
+    else:
+        unit = "match" if match_count == 1 else "matches"
+        count_bit = f"  · {match_count} {unit}"
+    if filtering:
+        # Block caret so typed chars are obvious; real tty cursor parks here too.
+        return f"FILTER> {needle}█{count_bit}  · Esc/Enter normal · Ctrl-U clear"
+    if needle:
+        return f"filter: {needle}{count_bit}  · f filter · Ctrl-U clear · NORMAL"
+    return f"filter: (empty){count_bit}  · f filter · NORMAL"
+
+
+def enter_filter_mode(state: BrowserState, *, jump_all: bool = False) -> None:
+    """Enter FILTER input mode; optionally open All markets."""
+    if state.mode == "detail":
+        state.mode = "markets"
+    if jump_all and state.mode == "categories":
+        open_category(state, "all")
+    if state.mode not in {"categories", "markets"}:
+        return
+    state.input_mode = "filter"
+    state.message = ""
+    state.cursor = 0
+    state.offset = 0
+
+
+def leave_filter_mode(state: BrowserState) -> None:
+    state.input_mode = "normal"
+    state.message = ""
+
+
+def clear_filter(state: BrowserState) -> None:
+    state.filter_text = ""
+    state.cursor = 0
+    state.offset = 0
+    state.message = ""
+
+
+def append_filter_char(state: BrowserState, ch: str) -> None:
+    """Append one character to the live filter query."""
+    state.filter_text += ch
+    state.cursor = 0
+    state.offset = 0
+    state.message = ""
+    # Typing from categories with an active filter jumps into All markets.
+    if state.mode == "categories":
+        open_category(state, "all")
+
+
+def render_browser(state: BrowserState) -> None:
+    state.tracker.poll_status()
+    ready = state.tracker.ready_count()
+    sub_n = state.tracker.subscribed_n
+    ws = state.tracker.status
+    if state.tracker.error and ws in {"error", "no-auth", "no-deps"}:
+        ws_line = f"WS {ws}: {short_label(state.tracker.error, 40)}"
+    else:
+        ws_line = f"WS {ws}  books {ready}/{sub_n}" if sub_n else f"WS {ws}"
+
+    # Precompute market matches when filtering so the bar can show live counts.
+    market_rows: list[MarketRow] | None = None
+    match_count: int | None = None
+    if state.mode == "markets":
+        market_rows = state.filtered_rows()
+        match_count = len(market_rows)
+    elif state.filter_text.strip():
+        match_count = sum(1 for row in state.rows if row_matches_filter(row, state.filter_text))
+
+    lines: list[str] = []
+    mode_tag = "FILTER" if state.input_mode == "filter" else "NORMAL"
+    lines.append(
+        f"{state.seed_series}-{state.game_code}   markets={len(state.rows)}   "
+        f"{mode_tag}   {ws_line}"
+    )
+    filter_line_idx = len(lines)  # 0-based index in lines; terminal row = idx + 1
+    filter_line = format_filter_line(state, match_count)
+    lines.append(filter_line)
+    if state.message:
+        lines.append(state.message)
+    lines.append("")
+
+    if state.mode == "help":
+        lines.extend(help_text().splitlines())
+        lines.append("")
+        lines.append("Press Esc / Backspace / q to return.")
+    elif state.mode == "categories":
+        lines.append("CATEGORIES")
+        items = state.category_items()
+        clamp_cursor(state, len(items))
+        for idx, (key, label, count) in enumerate(items):
+            if idx < state.offset or idx >= state.offset + state.page_size:
+                continue
+            mark = ">" if idx == state.cursor else " "
+            num = "A" if key == "all" else str(CATEGORY_ORDER.index(key) + 1 if key in CATEGORY_ORDER else " ")
+            lines.append(f" {mark} {num}  {label:<14}  ({count})")
+        lines.append("")
+        if state.input_mode == "filter":
+            lines.append("FILTER mode · type letters/digits/space · Esc/Enter normal · Ctrl-U clear · q is a letter")
+        else:
+            lines.append("NORMAL · Enter open · 1-5/A jump · o orders · f filter · j/k move · q quit? · Ctrl-H help")
+    elif state.mode == "markets":
+        rows = market_rows if market_rows is not None else state.filtered_rows()
+        label = CATEGORY_LABELS.get(state.category, "All markets" if state.category == "all" else state.category)
+        filt = f" filter={state.filter_text!r}" if state.filter_text else ""
+        lines.append(f"MARKETS — {label}  showing {len(rows)}{filt}")
+        clamp_cursor(state, len(rows))
+        if not rows:
+            lines.append("  (no markets match)")
+        else:
+            lines.append(f" {'':1} {'YES bid x ask':^11}  {'STATUS':<8}  {'SERIES':<16}  TICKER / TITLE")
+            end = min(len(rows), state.offset + state.page_size)
+            # Prefetch a small lookahead beyond the page so scrolling feels live.
+            prefetch_end = min(len(rows), end + max(4, state.page_size // 2))
+            visible = rows[state.offset:prefetch_end]
+            state.tracker.ensure_quotes(r.ticker for r in visible)
+            for idx in range(state.offset, end):
+                row = rows[idx]
+                mark = ">" if idx == state.cursor else " "
+                q = state.tracker.quote(row.ticker)
+                title = short_label(row.title or row.yes_sub_title or "", 42)
+                lines.append(
+                    f" {mark} {format_quote_cell(q)}  {(row.status or '-'):<8}  "
+                    f"{row.series_ticker:<16}  {row.ticker}"
+                )
+                lines.append(f"      {title}")
+        lines.append("")
+        if state.input_mode == "filter":
+            lines.append("FILTER mode · type freely (q/k/j ok) · Esc/Enter normal · Ctrl-U clear")
+        else:
+            count_yes = effective_count_yes(state.args)
+            mode = "LIVE" if state.args.live else "DRY-RUN"
+            lines.append(
+                f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · d detail · o orders · Esc back · f filter · q quit?"
+            )
+    elif state.mode == "detail":
+        row = next((r for r in state.rows if r.ticker == state.selected_ticker), None)
+        if row is None:
+            lines.append("Market not found.")
+        else:
+            state.tracker.ensure_quotes([row.ticker], force=True)
+            q = state.tracker.quote(row.ticker)
+            lines.append("MARKET DETAIL")
+            lines.append(f"  ticker : {row.ticker}")
+            lines.append(f"  series : {row.series_ticker}")
+            lines.append(f"  event  : {row.event_ticker}")
+            lines.append(f"  status : {row.status}")
+            lines.append(f"  cat    : {CATEGORY_LABELS.get(classify_market(row), classify_market(row))}")
+            lines.append(f"  title  : {row.title}")
+            if row.yes_sub_title:
+                lines.append(f"  yes    : {row.yes_sub_title}")
+            if row.no_sub_title:
+                lines.append(f"  no     : {row.no_sub_title}")
+            lines.append("")
+            if q and q.ready:
+                lines.append(
+                    f"  YES {fmt_cents(q.yes_bid)} x {fmt_cents(q.yes_ask)}"
+                    f"   NO {fmt_cents(q.no_bid)} x {fmt_cents(q.no_ask)}"
+                    f"   spr {fmt_cents(q.spread)}"
+                )
+                if q.updated_ts:
+                    age = max(0.0, time.time() - q.updated_ts)
+                    lines.append(f"  book age: {age:.1f}s   seq={q.seq}")
+            else:
+                lines.append("  book: (waiting for websocket snapshot)")
+            lines.append("")
+            count_yes = effective_count_yes(state.args)
+            mode = "LIVE" if state.args.live else "DRY-RUN"
+            lines.append(
+                f"Enter BUY YES x{count_yes} ({mode}) · o orders · Esc back · f filter · q quit?"
+            )
+    elif state.mode == "orders":
+        items = orders_page_items(state)
+        mode = "LIVE" if state.args.live else "DRY-RUN"
+        age = ""
+        if SESSION_BETS.positions_ts:
+            age = f"  exch_age={max(0.0, time.time() - SESSION_BETS.positions_ts):.0f}s"
+        err = f"  err={SESSION_BETS.positions_error}" if SESSION_BETS.positions_error else ""
+        lines.append(f"ORDERS / POSITIONS  ({mode}){age}{err}")
+        lines.append(
+            "  Enter = SELL YES EXIT ALL qty on row  ·  r refresh exchange  ·  Esc back"
+        )
+        lines.append("")
+        clamp_cursor(state, len(items))
+        if not items:
+            lines.append("  (no session bets or exchange positions yet)")
+            lines.append("  Buy with Enter on a market, or press r to pull exchange positions.")
+        else:
+            lines.append(
+                f" {'':1} {'SIDE':<4} {'QTY':>5}  {'SRC':<12}  {'YES bid x ask':^11}  TICKER"
+            )
+            end = min(len(items), state.offset + state.page_size)
+            visible_tickers = [items[i]["ticker"] for i in range(state.offset, end)]
+            state.tracker.ensure_quotes(visible_tickers)
+            for idx in range(state.offset, end):
+                it = items[idx]
+                mark = ">" if idx == state.cursor else " "
+                q = state.tracker.quote(it["ticker"])
+                sell_tag = "SELL-ALL" if it.get("sellable") else "no-sell"
+                lines.append(
+                    f" {mark} {it['side']:<4} {it['qty']:>5}  {it['source']:<12}  "
+                    f"{format_quote_cell(q)}  {it['ticker']}"
+                )
+                title = short_label(it.get("title") or "", 52)
+                lines.append(f"      [{sell_tag}] {title}")
+        lines.append("")
+        if state.sell_confirm:
+            lines.append(
+                f"CONFIRM SELL YES EXIT ALL x{state.sell_confirm_qty} "
+                f"{state.sell_confirm_ticker} — Enter submits · Esc/other cancels"
+            )
+        else:
+            lines.append(
+                f"NORMAL · highlight row · Enter arms SELL-ALL exit ({mode}) · r refresh · Esc back · q quit?"
+            )
+
+    lines.append("")
+    clear_screen()
+    sys.stdout.write("\n".join(lines) + "\n")
+    # Park the real terminal cursor on the filter caret only in FILTER mode.
+    if state.input_mode == "filter" and state.mode in {"categories", "markets"}:
+        # "FILTER> " prefix is 8 chars; caret sits on the █ after needle.
+        caret_col = 8 + len(state.filter_text) + 1  # 1-based columns
+        caret_row = filter_line_idx + 1  # 1-based rows after clear+home
+        sys.stdout.write(f"\033[{caret_row};{caret_col}H")
+    sys.stdout.flush()
+
+
+def open_category(state: BrowserState, key: str) -> None:
+    state.category = key
+    state.mode = "markets"
+    state.cursor = 0
+    state.offset = 0
+    state.message = ""
+
+
+def open_market_detail(state: BrowserState, ticker: str) -> None:
+    state.selected_ticker = ticker
+    state.mode = "detail"
+    state.input_mode = "normal"
+    state.message = ""
+
+
+def selected_market_row(state: BrowserState) -> MarketRow | None:
+    if state.mode == "markets":
+        rows = state.filtered_rows()
+        if not rows:
+            return None
+        clamp_cursor(state, len(rows))
+        return rows[state.cursor]
+    if state.mode == "detail" and state.selected_ticker:
+        return next((r for r in state.rows if r.ticker == state.selected_ticker), None)
+    return None
+
+
+def handle_buy_yes(state: BrowserState) -> None:
+    """Enter on market/detail: BUY YES for --count-yes."""
+    if state.order_busy:
+        state.message = "order already in flight"
+        return
+    # simple debounce against double Enter
+    now = time.time()
+    if now - state.last_order_ts < 0.35:
+        state.message = "order debounced — wait a moment"
+        return
+
+    row = selected_market_row(state)
+    if row is None:
+        state.message = "no market selected"
+        return
+
+    state.tracker.ensure_quotes([row.ticker], force=True)
+    quote = state.tracker.quote(row.ticker)
+    state.order_busy = True
+    try:
+        ok, status = buy_yes_for_market(args=state.args, row=row, quote=quote)
+    finally:
+        state.order_busy = False
+        state.last_order_ts = time.time()
+    state.message = status if ok else status
+    # Keep selection on the market; jump to detail so the status is readable.
+    if state.mode == "markets":
+        open_market_detail(state, row.ticker)
+
+
+def cancel_quit_confirm(state: BrowserState, *, message: str = "quit cancelled") -> None:
+    if state.quit_confirm:
+        state.quit_confirm = False
+        state.message = message
+
+
+def request_quit_confirm(state: BrowserState) -> None:
+    state.quit_confirm = True
+    state.message = "Quit? Press Enter to confirm (Esc/other cancels)"
+
+
+def cancel_sell_confirm(state: BrowserState, *, message: str = "sell cancelled") -> None:
+    if state.sell_confirm:
+        state.sell_confirm = False
+        state.sell_confirm_ticker = ""
+        state.sell_confirm_qty = 0
+        state.message = message
+
+
+def open_orders_page(state: BrowserState) -> None:
+    state.return_mode = state.mode if state.mode != "orders" else state.return_mode
+    state.prev_mode = state.mode if state.mode != "help" else state.prev_mode
+    state.mode = "orders"
+    state.input_mode = "normal"
+    state.cursor = 0
+    state.offset = 0
+    state.sell_confirm = False
+    state.sell_confirm_ticker = ""
+    state.sell_confirm_qty = 0
+    # Best-effort refresh so exchange positions show up without an extra key.
+    state.message = refresh_exchange_positions(state)
+
+
+def handle_sell_all(state: BrowserState) -> None:
+    """Orders page Enter: arm or execute SELL YES EXIT ALL for selected row."""
+    if state.order_busy:
+        state.message = "order already in flight"
+        return
+    now = time.time()
+    if now - state.last_order_ts < 0.35:
+        state.message = "order debounced — wait a moment"
+        return
+
+    items = orders_page_items(state)
+    if not items:
+        state.message = "no positions to sell"
+        return
+    clamp_cursor(state, len(items))
+    it = items[state.cursor]
+    ticker = str(it["ticker"])
+    qty = int(it["qty"])
+    if not it.get("sellable"):
+        state.message = f"cannot sell {it.get('side')} position here (YES longs only for now)"
+        return
+    if qty <= 0:
+        state.message = "qty is zero"
+        return
+
+    if not state.sell_confirm or state.sell_confirm_ticker != ticker:
+        state.sell_confirm = True
+        state.sell_confirm_ticker = ticker
+        state.sell_confirm_qty = qty
+        mode = "LIVE" if state.args.live else "DRY-RUN"
+        state.message = (
+            f"SELL YES EXIT ALL x{qty} on {ticker}? Enter confirms ({mode}), Esc cancels"
+        )
+        return
+
+    # Confirmed: submit sell-all.
+    state.tracker.ensure_quotes([ticker], force=True)
+    quote = state.tracker.quote(ticker)
+    title = str(it.get("title") or "")
+    state.order_busy = True
+    try:
+        ok, status = sell_yes_for_position(
+            args=state.args,
+            ticker=ticker,
+            title=title,
+            count=qty,
+            quote=quote,
+        )
+    finally:
+        state.order_busy = False
+        state.last_order_ts = time.time()
+        state.sell_confirm = False
+        state.sell_confirm_ticker = ""
+        state.sell_confirm_qty = 0
+    state.message = status
+    # Refresh exchange snapshot after live sells.
+    if state.args.live and ok:
+        extra = refresh_exchange_positions(state)
+        state.message = f"{status} · {extra}"
+
+
+def handle_enter(state: BrowserState) -> None:
+    if state.quit_confirm:
+        # Enter confirms quit; caller checks quit_confirm after this.
+        return
+    if state.input_mode == "filter":
+        leave_filter_mode(state)
+        return
+    if state.mode == "categories":
+        items = state.category_items()
+        if not items:
+            return
+        clamp_cursor(state, len(items))
+        key = items[state.cursor][0]
+        open_category(state, key)
+    elif state.mode in {"markets", "detail"}:
+        handle_buy_yes(state)
+    elif state.mode == "orders":
+        handle_sell_all(state)
+    elif state.mode == "help":
+        state.mode = state.prev_mode
+
+
+def handle_back(state: BrowserState) -> bool:
+    """Return True if caller should quit."""
+    if state.sell_confirm:
+        cancel_sell_confirm(state)
+        return False
+    if state.input_mode == "filter":
+        leave_filter_mode(state)
+        return False
+    if state.mode == "help":
+        state.mode = state.prev_mode
+        return False
+    if state.mode == "orders":
+        state.mode = state.return_mode or "categories"
+        state.input_mode = "normal"
+        state.cursor = 0
+        state.offset = 0
+        state.message = "left orders"
+        return False
+    if state.mode == "detail":
+        state.mode = "markets"
+        state.input_mode = "normal"
+        return False
+    if state.mode == "markets":
+        # Prefer clearing an active filter before leaving the market list.
+        if state.filter_text:
+            clear_filter(state)
+            return False
+        state.mode = "categories"
+        state.input_mode = "normal"
+        state.cursor = 0
+        state.offset = 0
+        return False
+    if state.mode == "categories" and state.filter_text:
+        clear_filter(state)
+        return False
+    return False
+
+
+def run_browser(
+    *,
+    seed_series: str,
+    game_code: str,
+    rows: list[MarketRow],
+    args: argparse.Namespace,
+    ws_url: str,
+    watch_limit: int,
+    log_raw: bool,
+    no_ws: bool,
+) -> int:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        eprint("error: --browse requires an interactive TTY")
+        return 2
+
+    tracker = BackgroundBookTracker(
+        rows,
+        ws_url=ws_url,
+        watch_limit=0 if watch_limit < 0 else watch_limit,
+        log_raw=log_raw,
+        args=args,
+    )
+    if no_ws:
+        tracker.status = "disabled"
+    else:
+        # Start WS silently in background; UI does not dump ticks.
+        eprint("starting background websocket book tracker (silent)...")
+        tracker.start()
+        if tracker.error and tracker.status in {"no-auth", "no-deps"}:
+            eprint(f"browser continues without live quotes: {tracker.error}")
+        elif tracker.enabled:
+            eprint(
+                f"ws tracker: status={tracker.status} subscribed={tracker.subscribed_n} "
+                f"auth={tracker.auth_label or '-'}"
+            )
+
+    # Order log stays in memory during submit; dump only when idle / exit.
+    default_log = str(
+        Path.home()
+        / ".local"
+        / "share"
+        / "kalshi-multiplex-orderbook"
+        / "sports-order-memory.log"
+    )
+    log_path = getattr(args, "order_log_file", None)
+    if getattr(args, "no_order_log_file", False) or log_path == "":
+        ORDER_LOG.configure(path=None, enabled=True)  # memory only; no disk
+        log_path_disp = "(memory-only; no disk dump)"
+    else:
+        ORDER_LOG.configure(
+            path=str(log_path) if log_path else default_log,
+            idle_dump_s=float(getattr(args, "order_log_idle_s", 2.0) or 2.0),
+            capacity=int(getattr(args, "order_log_capacity", 500) or 500),
+            enabled=True,
+        )
+        log_path_disp = ORDER_LOG.path or default_log
+    eprint(f"order memory log: {log_path_disp} (no write during submit)")
+
+    count_yes = effective_count_yes(args)
+    mode = "LIVE" if args.live else "DRY-RUN"
+    state = BrowserState(
+        seed_series=seed_series,
+        game_code=game_code,
+        rows=rows,
+        tracker=tracker,
+        args=args,
+        message=(
+            f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · o orders · d detail · L log · f filter · Ctrl-H help"
+        ),
+    )
+
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    stop = False
+
+    def _sig(_signum, _frame):  # noqa: ANN001
+        nonlocal stop
+        stop = True
+
+    prev_int = signal.signal(signal.SIGINT, _sig)
+    prev_term = signal.signal(signal.SIGTERM, _sig)
+
+    try:
+        tty.setcbreak(fd)
+        # Disable OS XON/XOFF so Ctrl-S etc. are available later; leave ISIG for Ctrl-C path via handler if needed
+        attrs = termios.tcgetattr(fd)
+        attrs[0] &= ~termios.IXON
+        termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+
+        last_draw = 0.0
+        while not stop:
+            now = time.time()
+            # periodic redraw so quotes fill in without keypresses
+            render_browser(state)
+            last_draw = now
+            dumped = ORDER_LOG.maybe_dump_idle()
+            if dumped and not state.message:
+                state.message = f"order log dumped → {short_label(dumped, 48)}"
+
+            readable, _, _ = select.select([fd], [], [], 0.5)
+            if not readable:
+                ORDER_LOG.maybe_dump_idle()
+                continue
+            kind, value = read_terminal_key(fd)
+
+            if kind == "ctrl" and value == "c":
+                stop = True
+                break
+
+            # Quit confirm: q arms it; Enter confirms; anything else cancels.
+            if state.quit_confirm:
+                if kind == "enter":
+                    stop = True
+                    break
+                cancel_quit_confirm(state)
+                # Swallow the cancel key so it does not also act.
+                continue
+
+            # Sell confirm on orders page: Enter submits; anything else cancels.
+            if state.sell_confirm and state.mode == "orders":
+                if kind == "enter":
+                    handle_sell_all(state)
+                    continue
+                cancel_sell_confirm(state)
+                continue
+
+            if kind == "ctrl" and value == "h":
+                # Help is always available; leave filter input first.
+                if state.input_mode == "filter":
+                    leave_filter_mode(state)
+                state.prev_mode = state.mode if state.mode != "help" else state.prev_mode
+                state.mode = "help"
+                continue
+            if kind == "ctrl" and value in {"l", "r"}:
+                state.message = "redraw"
+                continue
+
+            # ---- HELP screen ----
+            if state.mode == "help":
+                if kind in {"escape", "backspace"} or (kind == "char" and value in {"q", "Q"}):
+                    state.mode = state.prev_mode
+                    state.input_mode = "normal"
+                continue
+
+            # ---- global clear filter ----
+            if kind == "ctrl" and value == "u":
+                clear_filter(state)
+                continue
+
+            # ---- FILTER input mode: all printable chars type into the query ----
+            if state.input_mode == "filter":
+                if kind == "escape":
+                    leave_filter_mode(state)
+                    continue
+                if kind == "enter":
+                    leave_filter_mode(state)
+                    continue
+                if kind == "backspace":
+                    if state.filter_text:
+                        state.filter_text = state.filter_text[:-1]
+                        state.cursor = 0
+                        state.offset = 0
+                        state.message = ""
+                    else:
+                        leave_filter_mode(state)
+                    continue
+                # Arrows still navigate the filtered list while typing.
+                n_items = (
+                    len(state.category_items())
+                    if state.mode == "categories"
+                    else len(state.filtered_rows())
+                    if state.mode == "markets"
+                    else 0
+                )
+                if kind == "up" or (kind == "ctrl" and value == "p"):
+                    move_cursor(state, -1, n_items)
+                    continue
+                if kind == "down" or (kind == "ctrl" and value == "n"):
+                    move_cursor(state, 1, n_items)
+                    continue
+                if kind == "pageup":
+                    move_cursor(state, -state.page_size, n_items)
+                    continue
+                if kind == "pagedown":
+                    move_cursor(state, state.page_size, n_items)
+                    continue
+                if kind == "home":
+                    state.cursor = 0
+                    clamp_cursor(state, n_items)
+                    continue
+                if kind == "end":
+                    state.cursor = max(0, n_items - 1)
+                    clamp_cursor(state, n_items)
+                    continue
+                if kind == "char" and value.isprintable():
+                    # Accept letters, digits, space, punctuation — including q/k/j.
+                    append_filter_char(state, value)
+                    continue
+                continue
+
+            # ---- NORMAL mode from here ----
+            if kind == "backspace":
+                if handle_back(state):
+                    stop = True
+                continue
+            if kind == "escape":
+                if handle_back(state):
+                    stop = True
+                continue
+            if kind == "enter":
+                handle_enter(state)
+                continue
+
+            n_items = (
+                len(state.category_items())
+                if state.mode == "categories"
+                else len(state.filtered_rows())
+                if state.mode == "markets"
+                else len(orders_page_items(state))
+                if state.mode == "orders"
+                else 0
+            )
+
+            if kind == "up" or (kind == "char" and value in {"k", "K"}) or (kind == "ctrl" and value == "p"):
+                move_cursor(state, -1, n_items)
+                continue
+            if kind == "down" or (kind == "char" and value in {"j", "J"}) or (kind == "ctrl" and value == "n"):
+                move_cursor(state, 1, n_items)
+                continue
+            if kind == "pageup":
+                move_cursor(state, -state.page_size, n_items)
+                continue
+            if kind == "pagedown":
+                move_cursor(state, state.page_size, n_items)
+                continue
+            if kind == "home" or (kind == "char" and value == "g" and state.mode != "categories"):
+                state.cursor = 0
+                clamp_cursor(state, n_items)
+                continue
+            if kind == "end" or (kind == "char" and value == "G"):
+                state.cursor = max(0, n_items - 1)
+                clamp_cursor(state, n_items)
+                continue
+
+            if kind == "char" and value in {"q", "Q"}:
+                request_quit_confirm(state)
+                continue
+
+            if kind == "char" and value in {"f", "F", "/"}:
+                # f or / enters FILTER mode. From categories, open All so the query applies.
+                enter_filter_mode(state, jump_all=(state.mode == "categories"))
+                continue
+
+            if kind == "char" and value in {"l", "L"} and state.mode != "help":
+                recent = ORDER_LOG.recent(3)
+                if not recent:
+                    state.message = "order memory log empty"
+                else:
+                    state.message = " | ".join(short_label(ev.summary, 42) for ev in recent)
+                    dumped = ORDER_LOG.maybe_dump_idle(force=True)
+                    if dumped:
+                        state.message += f" · dumped {short_label(dumped, 36)}"
+                continue
+
+            if kind == "char" and value in {"o", "O"} and state.mode != "help":
+                open_orders_page(state)
+                continue
+
+            if state.mode == "orders" and kind == "char" and value in {"r", "R"}:
+                state.message = refresh_exchange_positions(state)
+                continue
+
+            if state.mode == "markets" and kind == "char" and value in {"d", "D", " "}:
+                rows = state.filtered_rows()
+                if rows:
+                    clamp_cursor(state, len(rows))
+                    open_market_detail(state, rows[state.cursor].ticker)
+                continue
+
+            if state.mode == "categories" and kind == "char":
+                if value in {"1", "2", "3", "4", "5"}:
+                    idx = int(value) - 1
+                    if 0 <= idx < len(CATEGORY_ORDER):
+                        open_category(state, CATEGORY_ORDER[idx])
+                        state.input_mode = "normal"
+                    continue
+                if value in {"a", "A"}:
+                    open_category(state, "all")
+                    state.input_mode = "normal"
+                    continue
+                continue
+
+            if state.mode == "detail" and kind == "char" and value == "g":
+                state.mode = "categories"
+                state.input_mode = "normal"
+                state.cursor = 0
+                state.offset = 0
+                continue
+
+    finally:
+        signal.signal(signal.SIGINT, prev_int)
+        signal.signal(signal.SIGTERM, prev_term)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        tracker.stop()
+        dumped = ORDER_LOG.maybe_dump_idle(force=True)
+        # leave a clean line after raw mode
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        if dumped:
+            eprint(f"order memory log dumped: {dumped}")
+
+    eprint("browser exit")
+    return 0
+
+
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Discover Kalshi sports markets for a game id; optional WebSocket "
-            "orderbook watch (no REST book polling)."
+            "Discover Kalshi sports markets for a game id; keyboard browser "
+            "and/or WebSocket orderbook tracking (no REST book polling). "
+            "Requires --demo or --prod. Default is dry-run; --live submits real "
+            "BUY YES orders from the browser (Enter on a market)."
         )
     )
+
+    env = p.add_mutually_exclusive_group(required=True)
+    env.add_argument(
+        "--demo",
+        dest="kalshi_env",
+        action="store_const",
+        const="demo",
+        help="Use Kalshi demo REST/WS endpoints. Required choice: --demo or --prod.",
+    )
+    env.add_argument(
+        "--prod",
+        dest="kalshi_env",
+        action="store_const",
+        const="prod",
+        help="Use Kalshi production REST/WS endpoints. Required choice: --demo or --prod.",
+    )
+
+    p.add_argument(
+        "--demo-host-style",
+        choices=["external", "direct"],
+        default="external",
+        help=(
+            "Demo endpoint pair. external = external-api.demo / external-api-ws.demo; "
+            "direct = demo-api REST + demo-api WS. Default: external"
+        ),
+    )
+    p.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Submit real orders. Default is dry-run (logs BUY YES payload only). "
+            "Prefer --demo --live for first tests."
+        ),
+    )
+    p.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        help="Fallback contracts per BUY YES when --count-yes is omitted. Default: 1",
+    )
+    p.add_argument(
+        "--count-yes",
+        type=int,
+        default=None,
+        help=(
+            "Contracts to BUY YES when pressing Enter on a market/detail. "
+            "Default: --count (1)."
+        ),
+    )
+    p.add_argument(
+        "--slippage-cents",
+        "--slippage",
+        type=int,
+        default=1,
+        help="BUY YES limit = YES ask + this many cents (clamped 1..99). Default: 1",
+    )
+    p.add_argument(
+        "--time-in-force",
+        default="immediate_or_cancel",
+        choices=["immediate_or_cancel", "good_till_canceled", "fill_or_kill"],
+        help="Limit order time-in-force for Enter BUY YES. Default: immediate_or_cancel",
+    )
+    p.add_argument(
+        "--order-submit-timeout",
+        type=float,
+        default=10.0,
+        help="HTTP timeout seconds for live order submit. Default: 10",
+    )
+    p.add_argument(
+        "--order-log-file",
+        default=None,
+        help=(
+            "Where to dump the in-memory order log when idle/exit. "
+            "Default: ~/.local/share/kalshi-multiplex-orderbook/sports-order-memory.log. "
+            "Use --no-order-log-file for memory-only."
+        ),
+    )
+    p.add_argument(
+        "--order-log-idle-s",
+        type=float,
+        default=2.0,
+        help="Seconds after last order event before dumping memory log to disk. Default: 2",
+    )
+    p.add_argument(
+        "--order-log-capacity",
+        type=int,
+        default=500,
+        help="Max in-memory order events retained. Default: 500",
+    )
+    p.add_argument(
+        "--no-order-log-file",
+        action="store_true",
+        help="Keep order log in memory only; never dump to disk.",
+    )
+
     p.add_argument(
         "game",
         help="Game/event id or URL tail, e.g. kxnflgame-26sep13atlpit",
     )
     p.add_argument(
         "--host",
-        default=DEFAULT_REST_HOST,
-        help=f"REST host for catalog discovery (default {DEFAULT_REST_HOST})",
+        default=None,
+        help="Override REST catalog host selected by --demo/--prod.",
+    )
+    p.add_argument(
+        "--api-host",
+        default=None,
+        help="Alias for --host (broadcast-trader naming). Overrides --demo/--prod REST host.",
     )
     p.add_argument(
         "--status",
@@ -818,23 +3143,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Suppress stderr progress.",
     )
     p.add_argument(
+        "--browse",
+        action="store_true",
+        help=(
+            "After discovery, open keyboard market browser. Starts a silent "
+            "background WebSocket book tracker when auth is available. Ctrl-H help."
+        ),
+    )
+    p.add_argument(
+        "--no-ws",
+        action="store_true",
+        help="With --browse, do not start the background WebSocket tracker.",
+    )
+    p.add_argument(
+        "--list-only",
+        action="store_true",
+        help="Print discovery table only (default when not using --browse/--watch).",
+    )
+    p.add_argument(
         "--watch",
         action="store_true",
         help=(
             "After discovery, stream orderbooks over one authenticated Kalshi "
-            "WebSocket (kx_orderbooks multiplex). Requires API key env."
+            "WebSocket (kx_orderbooks multiplex). Requires env-matching API keys. "
+            "Prints ticks (use --browse for silent tracking + UI)."
         ),
     )
     p.add_argument(
         "--watch-limit",
         type=int,
         default=80,
-        help="Max markets to subscribe on --watch (default 80; 0 = all discovered).",
+        help=(
+            "Initial market seed size for WebSocket books (default 80). "
+            "--watch uses this as a hard subscribe cap (0 = all discovered). "
+            "--browse starts with this seed then auto-subscribes the visible "
+            "viewport so later series (e.g. player props) still get quotes."
+        ),
     )
     p.add_argument(
         "--ws-url",
-        default=DEFAULT_WS_URL,
-        help=f"WebSocket URL (default {DEFAULT_WS_URL})",
+        default=None,
+        help="Override the WebSocket URL selected by --demo/--prod.",
     )
     p.add_argument(
         "--print-every",
@@ -847,17 +3196,64 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="With --watch, log raw websocket messages.",
     )
+    p.add_argument(
+        "--api-key-id-env",
+        default=None,
+        help=(
+            "Env var holding API key id. Defaults: "
+            f"demo={DEMO_API_KEY_ID_ENV}, prod={PROD_API_KEY_ID_ENV} "
+            f"(legacy prod {LEGACY_PROD_API_KEY_ID_ENV})."
+        ),
+    )
+    p.add_argument(
+        "--private-key-file-env",
+        default=None,
+        help=(
+            "Env var holding private-key PEM path. Defaults: "
+            f"demo={DEMO_PRIVATE_KEY_FILE_ENV}, prod={PROD_PRIVATE_KEY_FILE_ENV} "
+            f"(legacy prod {LEGACY_PROD_PRIVATE_KEY_FILE_ENV})."
+        ),
+    )
+    p.add_argument(
+        "--private-key-file",
+        default=None,
+        help="Private key PEM path (overrides env-var file path).",
+    )
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    apply_env_endpoints(args)
+    if getattr(args, "no_order_log_file", False):
+        args.order_log_file = ""
 
     if args.quiet:
         def _quiet_eprint(*_a: Any, **_k: Any) -> None:
             return None
 
         globals()["eprint"] = _quiet_eprint
+
+    mode = "LIVE" if args.live else "DRY-RUN"
+    if args.count is not None and args.count <= 0:
+        eprint("error: --count must be positive")
+        return 2
+    if args.count_yes is not None and args.count_yes <= 0:
+        eprint("error: --count-yes must be positive")
+        return 2
+    if args.slippage_cents < 0:
+        eprint("error: --slippage-cents must be >= 0")
+        return 2
+    if args.live:
+        eprint(
+            f"LIVE mode: Enter on a market will BUY YES x{effective_count_yes(args)} "
+            f"(ask+{args.slippage_cents}c IOC). Prefer --demo for first tests."
+        )
+    else:
+        eprint(
+            f"DRY-RUN mode: Enter logs BUY YES x{effective_count_yes(args)} payload only "
+            "(add --live to submit)."
+        )
 
     try:
         seed_series, game_code = parse_game_input(args.game)
@@ -869,6 +3265,9 @@ def main(argv: list[str] | None = None) -> int:
     league = league_prefix_from_series(seed_series)
 
     t0 = time.time()
+    eprint(
+        f"env={args.kalshi_env} mode={mode} rest={args.api_host} ws={args.ws_url}"
+    )
     eprint(f"game_code={game_code} seed_series={seed_series} league_prefix={league}")
     eprint(f"status_filter={'all' if not statuses else ','.join(sorted(statuses))}")
     eprint(f"discovery={args.discovery} scan_all_series={bool(args.scan_all_series)}")
@@ -895,11 +3294,61 @@ def main(argv: list[str] | None = None) -> int:
     )
     elapsed = time.time() - t0
 
+    if not rows:
+        eprint("no markets found")
+        # still print empty discovery for list mode
+        if args.json and not args.browse and not args.watch:
+            print(json.dumps({
+                "seed_series": seed_series,
+                "game_code": game_code,
+                "league_prefix": league,
+                "kalshi_env": args.kalshi_env,
+                "mode": mode.lower().replace("-", "_"),
+                "api_host": args.api_host,
+                "ws_url": args.ws_url,
+                "market_count": 0,
+                "series_hits": hits,
+                "errors": errors,
+                "elapsed_seconds": round(elapsed, 3),
+                "markets": [],
+            }, indent=2, sort_keys=True))
+        elif not args.browse:
+            print_discovery_text(
+                seed_series=seed_series,
+                game_code=game_code,
+                rows=rows,
+                hits=hits,
+                errors=errors,
+                elapsed=elapsed,
+            )
+        return 1
+
+    if args.browse:
+        # Compact discovery summary on stderr; UI owns the screen.
+        eprint(
+            f"discovered {len(rows)} markets across {len(hits)} series "
+            f"in {elapsed:.1f}s; opening browser ({args.kalshi_env}/{mode})"
+        )
+        return run_browser(
+            seed_series=seed_series,
+            game_code=game_code,
+            rows=rows,
+            args=args,
+            ws_url=str(args.ws_url),
+            watch_limit=int(args.watch_limit),
+            log_raw=bool(args.log_raw),
+            no_ws=bool(args.no_ws),
+        )
+
     if args.json and not args.watch:
         payload = {
             "seed_series": seed_series,
             "game_code": game_code,
             "league_prefix": league,
+            "kalshi_env": args.kalshi_env,
+            "mode": mode.lower().replace("-", "_"),
+            "api_host": args.api_host,
+            "ws_url": args.ws_url,
             "market_count": len(rows),
             "series_hits": hits,
             "errors": errors,
@@ -929,13 +3378,10 @@ def main(argv: list[str] | None = None) -> int:
             elapsed=elapsed,
         )
 
-    if not rows:
-        eprint("no markets found")
-        return 1
-
     if args.watch:
         return run_watch(
             rows,
+            args=args,
             ws_url=str(args.ws_url),
             watch_limit=int(args.watch_limit),
             print_every=float(args.print_every),

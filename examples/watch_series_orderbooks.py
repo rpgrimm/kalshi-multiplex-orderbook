@@ -7,7 +7,9 @@ Examples:
     ./examples/watch_series_orderbooks.py KXTRUMPMENTIONB --print-top 20
     ./examples/watch_series_orderbooks.py KXTRUMPMENTIONB --discovery rest --status open
 
-Required env:
+Auth (env or config file):
+    ~/.config/kalshi-multiplex-orderbook/prod.env
+    # or:
     export KALSHI_API_KEY_ID='...'
     export KALSHI_PRIVATE_KEY_FILE="$HOME/path/to/private_key.pem"
 

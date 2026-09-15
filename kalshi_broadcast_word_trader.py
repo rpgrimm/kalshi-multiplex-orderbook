@@ -973,12 +973,16 @@ def model_to_dict(obj: Any) -> Any:
 
 def auth_env_candidates(kalshi_env: str) -> list[tuple[str, str]]:
     """Return auth env-var pairs in preferred order for demo or prod."""
-    if kalshi_env == "demo":
-        return [(DEMO_API_KEY_ID_ENV, DEMO_PRIVATE_KEY_FILE_ENV)]
-    return [
-        (PROD_API_KEY_ID_ENV, PROD_PRIVATE_KEY_FILE_ENV),
-        (LEGACY_PROD_API_KEY_ID_ENV, LEGACY_PROD_PRIVATE_KEY_FILE_ENV),
-    ]
+    try:
+        from kx_orderbooks.auth import auth_env_candidates as _cands
+        return _cands(kalshi_env)
+    except Exception:
+        if kalshi_env == "demo":
+            return [(DEMO_API_KEY_ID_ENV, DEMO_PRIVATE_KEY_FILE_ENV)]
+        return [
+            (PROD_API_KEY_ID_ENV, PROD_PRIVATE_KEY_FILE_ENV),
+            (LEGACY_PROD_API_KEY_ID_ENV, LEGACY_PROD_PRIVATE_KEY_FILE_ENV),
+        ]
 
 
 def default_auth_env_names(kalshi_env: str) -> tuple[str, str]:
@@ -988,99 +992,79 @@ def default_auth_env_names(kalshi_env: str) -> tuple[str, str]:
 
 def key_id_hint(api_key_id: str) -> str:
     """Return a non-secret hint for logs without printing the full key id."""
-    text = str(api_key_id or "")
-    if len(text) <= 12:
-        return "set"
-    return f"{text[:8]}...{text[-4:]}"
+    try:
+        from kx_orderbooks.auth import key_id_hint as _hint
+        return _hint(api_key_id)
+    except Exception:
+        text = str(api_key_id or "")
+        if len(text) <= 12:
+            return "set"
+        return f"{text[:8]}...{text[-4:]}"
 
 
 def choose_auth_env_pair(args) -> tuple[str, str]:
-    """
-    Pick env var names for the selected Kalshi environment.
-
-    Prod now prefers KALSHI_PROD_* so demo/prod credentials can never collide by
-    accident.  The older KALSHI_API_KEY_ID/KALSHI_PRIVATE_KEY_FILE pair remains
-    supported as a legacy prod fallback when no KALSHI_PROD_* vars are present.
-    """
+    """Pick preferred env var names (used for help text / overrides)."""
     preferred_api_env, preferred_private_env = default_auth_env_names(args.kalshi_env)
-
-    if args.api_key_id_env or args.private_key_file_env:
+    if getattr(args, "api_key_id_env", None) or getattr(args, "private_key_file_env", None):
         return (
             args.api_key_id_env or preferred_api_env,
             args.private_key_file_env or preferred_private_env,
         )
-
-    candidates = auth_env_candidates(args.kalshi_env)
-
-    for api_env, private_env in candidates:
-        api_present = bool(os.environ.get(api_env))
-        private_present = bool(os.environ.get(private_env))
-        if api_present or private_present:
-            return api_env, private_env
-
-    return candidates[0]
+    return preferred_api_env, preferred_private_env
 
 
 def resolve_auth_settings(args) -> None:
     """
     Resolve Kalshi auth once and store non-secret metadata on args.
 
-    Demo and prod intentionally use different default env var names so a demo key
-    is not accidentally used against prod, or vice versa.  Prod-specific vars are:
-      KALSHI_PROD_API_KEY_ID / KALSHI_PROD_PRIVATE_KEY_FILE
-    The older prod vars are still accepted as a fallback:
-      KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_FILE
+    Sources (first hit wins), shared with sports trader via kx_orderbooks.auth:
+      1) CLI --private-key-file / explicit env-var name overrides
+      2) process environment (KALSHI_PROD_* / KALSHI_DEMO_* / legacy KALSHI_*)
+      3) ~/.config/kalshi-multiplex-orderbook/{prod,demo}.env
+      4) split files: {prod,demo}.api-key-id + {prod,demo}.private-key.pem
+      5) legacy prod ./grimm.txt private-key fallback
+
     The API key value is never printed.
     """
-    api_key_env, private_key_file_env = choose_auth_env_pair(args)
-
-    api_key_id = os.environ.get(api_key_env)
-    if not api_key_id:
-        candidate_text = ", ".join(a for a, _ in auth_env_candidates(args.kalshi_env))
+    try:
+        from kx_orderbooks.auth import resolve_kalshi_auth
+    except Exception as exc:
         raise SystemExit(
-            f"Missing {api_key_env}. For {args.kalshi_env}, export it before using "
-            "REST/WebSocket auth. Candidate key env vars: "
-            f"{candidate_text}. Example:\n"
-            f"  export {api_key_env}=..."
+            "kx_orderbooks.auth is required for credential resolution. "
+            f"Install package deps (pip install -e .). Import error: {exc}"
+        ) from exc
+
+    try:
+        auth = resolve_kalshi_auth(
+            args.kalshi_env,
+            private_key_file=getattr(args, "private_key_file", None),
+            api_key_id_env=getattr(args, "api_key_id_env", None),
+            private_key_file_env=getattr(args, "private_key_file_env", None),
+            required=True,
         )
+    except Exception as exc:
+        raise SystemExit(str(exc)) from exc
 
-    private_key_file = args.private_key_file or os.environ.get(private_key_file_env)
-
-    # Backward compatibility for existing prod setups that relied on ./grimm.txt.
-    # Do not do this for demo; demo should use its own explicit key file.
-    if not private_key_file and args.kalshi_env == "prod" and Path(DEFAULT_PRIVATE_KEY_FILE).expanduser().exists():
-        private_key_file = DEFAULT_PRIVATE_KEY_FILE
-        private_key_file_env = "(fallback: ./grimm.txt)"
-
-    if not private_key_file:
-        candidate_text = ", ".join(p for _, p in auth_env_candidates(args.kalshi_env))
-        raise SystemExit(
-            f"Missing {private_key_file_env}. For {args.kalshi_env}, export the private-key PEM file path "
-            "or pass --private-key-file. Candidate private-key env vars: "
-            f"{candidate_text}. Example:\n"
-            f"  export {private_key_file_env}=~/kalshi-{args.kalshi_env}-private-key.pem"
-        )
-
-    private_key_path = str(Path(private_key_file).expanduser())
-    if not Path(private_key_path).exists():
-        raise SystemExit(f"Private key file not found: {private_key_path}")
-
-    args._auth_api_key_id = api_key_id
-    args._auth_api_key_hint = key_id_hint(api_key_id)
-    args._auth_api_key_env = api_key_env
-    args._auth_private_key_file = private_key_path
-    args._auth_private_key_file_env = private_key_file_env
+    assert auth is not None
+    args._auth_api_key_id = auth.api_key_id
+    args._auth_api_key_hint = auth.api_key_hint
+    args._auth_api_key_env = auth.api_key_source
+    args._auth_private_key_file = auth.private_key_path
+    args._auth_private_key_file_env = auth.private_key_source
+    args._auth_config_dir = auth.config_dir
 
 
 def print_auth_summary(args) -> None:
     """Print auth source names only; never print secret values."""
     if not getattr(args, "_auth_api_key_env", None):
         return
+    cfg = getattr(args, "_auth_config_dir", None)
+    cfg_bit = f" config_dir={cfg}" if cfg else ""
     safe_print(
-        f"Auth: env={args.kalshi_env} key_env={args._auth_api_key_env} "
+        f"Auth: env={args.kalshi_env} key_source={args._auth_api_key_env} "
         f"key_hint={getattr(args, '_auth_api_key_hint', 'set')} "
         f"private_key_file={args._auth_private_key_file} "
-        f"private_key_source={args._auth_private_key_file_env}"
+        f"private_key_source={args._auth_private_key_file_env}{cfg_bit}"
     )
 
 
