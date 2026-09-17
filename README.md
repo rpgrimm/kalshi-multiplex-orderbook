@@ -44,7 +44,7 @@ python3 examples/watch_series_orderbooks.py KXTRUMPMENTIONB
 
 ### Sports trader (list / browse / watch markets for a game)
 
-Same env gates as the broadcast trader: **`--demo` or `--prod` required**. Default is dry-run; `--live` is accepted for parity but this slice still does not place orders.
+Same env gates as the broadcast trader: **`--demo` or `--prod` required**. Default is dry-run; **`--live` places real BUY/SELL orders** from the browser.
 
 Catalog discovery uses public REST (no keys). Live books via `--browse` / `--watch` need env-matching API keys (`KALSHI_PROD_*` or `KALSHI_DEMO_*`).
 
@@ -62,6 +62,8 @@ Catalog discovery uses public REST (no keys). Live books via `--browse` / `--wat
 Kalshi splits one game across many series that share the same game code
 (`26SEP13ATLPIT` on `KXNFLSPREAD`, `KXNFLREC`, …). The sports lister probes those
 related series and prints ticker / status / series / title.
+
+**Bet packages:** with `--browse`, Enter on a **player First TD** market arms a stored cluster (that player, same-team QB 1+ passing TDs, over 6.5 1Q points) instead of a single BUY YES. Enter again sends every resolved leg; `1` while armed sends the trigger only; Esc cancels. D/ST and No Touchdown rows are not triggers. `--no-packages` keeps Enter as single BUY YES. Extra JSON can live in `--packages-dir` or `~/.config/kalshi-multiplex-orderbook/packages/` (first `id` wins; shipped example is `examples/packages/first_td_cluster.json`).
 
 ### Broadcast trader
 

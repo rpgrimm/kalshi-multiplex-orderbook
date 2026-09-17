@@ -31,8 +31,10 @@ Environment gates (same safety model as broadcast trader):
     --demo or --prod is required (no implicit host).
     Default is dry-run. Real BUY/SELL only with --live.
     Browser Enter on a market buys YES for --count-yes contracts.
+    Player First TD Enter arms a stored bet package (confirm to send).
     o opens ORDERS/positions; Enter there SELL YES EXIT ALL (confirm).
     Order events stay in memory during submit and dump to disk when idle/exit.
+    --no-packages keeps Enter as single BUY YES.
 
 Auth for --watch / --browse WS books (env vars or config files):
     ~/.config/kalshi-multiplex-orderbook/prod.env
@@ -60,6 +62,14 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+
+from kalshi_sports_packages import (
+    load_browse_packages,
+    package_for_trigger,
+    preview_status_line,
+    resolve_package,
+    send_summary_line,
+)
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -2093,7 +2103,7 @@ NORMAL navigation
   ↓ / j / Ctrl-N     move down
   PgUp / PgDn        page up/down
   Home / End / g/G   first / last row
-  Enter              categories: open · markets/detail: BUY YES (--count-yes)
+  Enter              categories: open · markets/detail: BUY YES or ARM package
   d / Space           open market detail (no order)
   o                  ORDERS page — session bets + exchange positions
   Esc / Backspace    clear filter if set, else go back
@@ -2113,6 +2123,14 @@ Orders / exits
   Order log          in-memory; dumps to file when idle / on exit
   Prefer --demo      for first live tests
   L                  show recent memory log + force dump
+
+Packages
+  Enter on player First TD  arm cluster (that player + same-team QB 1+ pass TD + over 6.5 1Q)
+  Enter again               send all resolved legs (session --count-yes)
+  1 while armed             send the trigger market only
+  Esc / other               cancel arm; no orders
+  D/ST and No Touchdown     not triggers (single BUY YES if you Enter there)
+  --no-packages             Enter stays single BUY YES
 
 FILTER matching
   Multi-word, order-independent: "patrick mahomes td"
@@ -2156,6 +2174,11 @@ class BrowserState:
     sell_confirm_ticker: str = ""
     sell_confirm_qty: int = 0
     return_mode: str = "categories"  # mode to restore when leaving orders
+    packages: list[Any] = field(default_factory=list)
+    package_confirm: bool = False
+    package_confirm_id: str = ""
+    package_confirm_ticker: str = ""
+    package_resolved: Any = None
 
     def category_counts(self) -> dict[str, int]:
         counts = {k: 0 for k in CATEGORY_ORDER}
@@ -2328,6 +2351,7 @@ def render_browser(state: BrowserState) -> None:
             prefetch_end = min(len(rows), end + max(4, state.page_size // 2))
             visible = rows[state.offset:prefetch_end]
             state.tracker.ensure_quotes(r.ticker for r in visible)
+            ensure_package_quotes(state)
             for idx in range(state.offset, end):
                 row = rows[idx]
                 mark = ">" if idx == state.cursor else " "
@@ -2341,11 +2365,16 @@ def render_browser(state: BrowserState) -> None:
         lines.append("")
         if state.input_mode == "filter":
             lines.append("FILTER mode · type freely (q/k/j ok) · Esc/Enter normal · Ctrl-U clear")
+        elif state.package_confirm:
+            lines.append(package_confirm_footer(state))
         else:
             count_yes = effective_count_yes(state.args)
             mode = "LIVE" if state.args.live else "DRY-RUN"
+            enter_bit = package_enter_hint(state, selected_from_list(rows, state)) or (
+                f"Enter BUY YES x{count_yes} ({mode})"
+            )
             lines.append(
-                f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · d detail · o orders · Esc back · f filter · q quit?"
+                f"NORMAL · {enter_bit} · d detail · o orders · Esc back · f filter · q quit?"
             )
     elif state.mode == "detail":
         row = next((r for r in state.rows if r.ticker == state.selected_ticker), None)
@@ -2378,11 +2407,18 @@ def render_browser(state: BrowserState) -> None:
             else:
                 lines.append("  book: (waiting for websocket snapshot)")
             lines.append("")
-            count_yes = effective_count_yes(state.args)
-            mode = "LIVE" if state.args.live else "DRY-RUN"
-            lines.append(
-                f"Enter BUY YES x{count_yes} ({mode}) · o orders · Esc back · f filter · q quit?"
-            )
+            ensure_package_quotes(state)
+            if state.package_confirm:
+                lines.append(package_confirm_footer(state))
+            else:
+                count_yes = effective_count_yes(state.args)
+                mode = "LIVE" if state.args.live else "DRY-RUN"
+                enter_bit = package_enter_hint(state, row) or (
+                    f"Enter BUY YES x{count_yes} ({mode})"
+                )
+                lines.append(
+                    f"{enter_bit} · o orders · Esc back · f filter · q quit?"
+                )
     elif state.mode == "orders":
         items = orders_page_items(state)
         mode = "LIVE" if state.args.live else "DRY-RUN"
@@ -2467,6 +2503,184 @@ def selected_market_row(state: BrowserState) -> MarketRow | None:
     return None
 
 
+def selected_from_list(rows: list[MarketRow], state: BrowserState) -> MarketRow | None:
+    if not rows:
+        return None
+    clamp_cursor(state, len(rows))
+    return rows[state.cursor]
+
+
+def ensure_package_quotes(state: BrowserState) -> None:
+    resolved = state.package_resolved
+    if resolved is None:
+        return
+    tickers = [
+        str(leg.row.ticker)
+        for leg in resolved.resolved_legs()
+        if getattr(leg, "row", None) is not None
+    ]
+    if tickers:
+        state.tracker.ensure_quotes(tickers)
+
+
+def package_enter_hint(state: BrowserState, row: MarketRow | None) -> str:
+    if row is None or not state.packages:
+        return ""
+    pkg = package_for_trigger(state.packages, row)
+    if pkg is None:
+        return ""
+    return f"Enter ARM PKG {pkg.id} (not single BUY)"
+
+
+def package_confirm_footer(state: BrowserState) -> str:
+    resolved = state.package_resolved
+    mode = "LIVE" if state.args.live else "DRY-RUN"
+    pkg_id = state.package_confirm_id or (
+        resolved.package.id if resolved is not None else "?"
+    )
+    return (
+        f"CONFIRM PKG {pkg_id} — Enter sends all resolved legs ({mode}) · "
+        f"1 trigger only · Esc/other cancels"
+    )
+
+
+def cancel_package_confirm(
+    state: BrowserState, *, message: str = "package cancelled"
+) -> None:
+    if state.package_confirm:
+        state.package_confirm = False
+        state.package_confirm_id = ""
+        state.package_confirm_ticker = ""
+        state.package_resolved = None
+        state.message = message
+
+
+def arm_package(state: BrowserState, package: Any, row: MarketRow) -> None:
+    resolved = resolve_package(package, row, state.rows)
+    state.package_confirm = True
+    state.package_confirm_id = package.id
+    state.package_confirm_ticker = row.ticker
+    state.package_resolved = resolved
+    count_yes = effective_count_yes(state.args)
+    mode = "LIVE" if state.args.live else "DRY-RUN"
+    state.message = preview_status_line(resolved, count_yes=count_yes, mode=mode)
+    tickers = [
+        str(leg.row.ticker)
+        for leg in resolved.resolved_legs()
+        if getattr(leg, "row", None) is not None
+    ]
+    if tickers:
+        state.tracker.ensure_quotes(tickers, force=True)
+
+
+def _quote_yes_ask(quote: QuoteSnap | None) -> int | None:
+    return quote.yes_ask if quote is not None else None
+
+
+def submit_package(state: BrowserState, *, trigger_only: bool) -> None:
+    """Second Enter (or 1) while a package is armed."""
+    if state.order_busy:
+        state.message = "order already in flight"
+        return
+    now = time.time()
+    if now - state.last_order_ts < 0.35:
+        state.message = "order debounced — wait a moment"
+        return
+    resolved = state.package_resolved
+    if resolved is None:
+        cancel_package_confirm(state, message="package cancelled")
+        return
+    if not trigger_only:
+        required_miss = resolved.required_unresolved()
+        if required_miss:
+            ids = ", ".join(leg.id for leg in required_miss)
+            state.message = (
+                f"PKG {resolved.package.id}: cannot send, required unresolved ({ids})"
+            )
+            return
+
+    trigger_row = resolved.trigger_row
+    send_legs = []
+    for leg in resolved.legs:
+        if trigger_only and (leg.role or "") != "trigger":
+            continue
+        send_legs.append(leg)
+
+    tickers = [
+        str(leg.row.ticker)
+        for leg in send_legs
+        if getattr(leg, "row", None) is not None
+    ]
+    if tickers:
+        state.tracker.ensure_quotes(tickers, force=True)
+
+    trigger_quote = state.tracker.quote(trigger_row.ticker)
+    if _quote_yes_ask(trigger_quote) is None:
+        state.message = (
+            f"PKG blocked: no YES ask on trigger {trigger_row.ticker} "
+            "(wait for book; package still armed)"
+        )
+        return
+
+    sent: list[str] = []
+    missed: list[str] = []
+    state.order_busy = True
+    try:
+        for leg in send_legs:
+            if leg.row is None:
+                missed.append(leg.id)
+                continue
+            quote = state.tracker.quote(leg.row.ticker)
+            is_trigger = (leg.role or "") == "trigger" or (
+                str(getattr(leg.row, "ticker", "")) == str(trigger_row.ticker)
+            )
+            if not is_trigger and _quote_yes_ask(quote) is None:
+                missed.append(leg.id)
+                ORDER_LOG.record(
+                    f"PKG skip {leg.id} {leg.row.ticker}: no YES ask",
+                    kind="order_skip",
+                    ticker=str(leg.row.ticker),
+                    mode="LIVE" if state.args.live else "DRY-RUN",
+                    live=bool(state.args.live),
+                    ok=False,
+                )
+                continue
+            ok, _status = buy_yes_for_market(
+                args=state.args, row=leg.row, quote=quote
+            )
+            if ok:
+                sent.append(leg.id)
+            else:
+                missed.append(leg.id)
+    finally:
+        state.order_busy = False
+        state.last_order_ts = time.time()
+
+    state.package_confirm = False
+    state.package_confirm_id = ""
+    state.package_confirm_ticker = ""
+    state.package_resolved = None
+    summary = send_summary_line(
+        resolved, sent_ids=sent, missed_ids=missed, trigger_only=trigger_only
+    )
+    if state.mode == "markets":
+        open_market_detail(state, trigger_row.ticker)
+    state.message = summary
+
+
+def handle_market_enter(state: BrowserState) -> None:
+    if state.package_confirm:
+        submit_package(state, trigger_only=False)
+        return
+    row = selected_market_row(state)
+    if row is not None and state.packages:
+        pkg = package_for_trigger(state.packages, row)
+        if pkg is not None:
+            arm_package(state, pkg, row)
+            return
+    handle_buy_yes(state)
+
+
 def handle_buy_yes(state: BrowserState) -> None:
     """Enter on market/detail: BUY YES for --count-yes."""
     if state.order_busy:
@@ -2526,6 +2740,10 @@ def open_orders_page(state: BrowserState) -> None:
     state.sell_confirm = False
     state.sell_confirm_ticker = ""
     state.sell_confirm_qty = 0
+    state.package_confirm = False
+    state.package_confirm_id = ""
+    state.package_confirm_ticker = ""
+    state.package_resolved = None
     # Best-effort refresh so exchange positions show up without an extra key.
     state.message = refresh_exchange_positions(state)
 
@@ -2606,7 +2824,7 @@ def handle_enter(state: BrowserState) -> None:
         key = items[state.cursor][0]
         open_category(state, key)
     elif state.mode in {"markets", "detail"}:
-        handle_buy_yes(state)
+        handle_market_enter(state)
     elif state.mode == "orders":
         handle_sell_all(state)
     elif state.mode == "help":
@@ -2617,6 +2835,9 @@ def handle_back(state: BrowserState) -> bool:
     """Return True if caller should quit."""
     if state.sell_confirm:
         cancel_sell_confirm(state)
+        return False
+    if state.package_confirm:
+        cancel_package_confirm(state)
         return False
     if state.input_mode == "filter":
         leave_filter_mode(state)
@@ -2709,6 +2930,13 @@ def run_browser(
         log_path_disp = ORDER_LOG.path or default_log
     eprint(f"order memory log: {log_path_disp} (no write during submit)")
 
+    packages, pkg_summary, _owner_n = load_browse_packages(
+        script_file=Path(__file__),
+        packages_dir=getattr(args, "packages_dir", None),
+        no_packages=bool(getattr(args, "no_packages", False)),
+    )
+    eprint(pkg_summary)
+
     count_yes = effective_count_yes(args)
     mode = "LIVE" if args.live else "DRY-RUN"
     state = BrowserState(
@@ -2717,6 +2945,7 @@ def run_browser(
         rows=rows,
         tracker=tracker,
         args=args,
+        packages=packages,
         message=(
             f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · o orders · d detail · L log · f filter · Ctrl-H help"
         ),
@@ -2775,6 +3004,17 @@ def run_browser(
                     handle_sell_all(state)
                     continue
                 cancel_sell_confirm(state)
+                continue
+
+            # Package confirm on markets/detail: Enter sends all; 1 sends trigger.
+            if state.package_confirm:
+                if kind == "enter":
+                    submit_package(state, trigger_only=False)
+                    continue
+                if kind == "char" and value == "1":
+                    submit_package(state, trigger_only=True)
+                    continue
+                cancel_package_confirm(state)
                 continue
 
             if kind == "ctrl" and value == "h":
@@ -3149,6 +3389,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "After discovery, open keyboard market browser. Starts a silent "
             "background WebSocket book tracker when auth is available. Ctrl-H help."
         ),
+    )
+    p.add_argument(
+        "--packages-dir",
+        default=None,
+        help=(
+            "Directory of extra/override bet-package JSON (first id wins). "
+            "Also loads ~/.config/kalshi-multiplex-orderbook/packages/ then "
+            "examples/packages/ next to this script."
+        ),
+    )
+    p.add_argument(
+        "--no-packages",
+        action="store_true",
+        help="Disable bet packages; Enter on a market stays single BUY YES.",
     )
     p.add_argument(
         "--no-ws",
