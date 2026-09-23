@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VERSION: 2026-08-03-v50.1-disqualify-side-to-buy
+# VERSION: 2026-09-23-v50.2-brute-force-yes
 """
 kalshi_broadcast_word_trader.py
 
@@ -12,7 +12,9 @@ New workflow:
   3. An input thread reads single keystrokes immediately; no Enter required.
   4. As soon as the typed character stream ends with a market word, the script
      queues a BUY YES order for that word and marks that market as "heard".
-     The order worker prices from the latest WebSocket ask + slippage.
+     The order worker prices from the latest WebSocket ask + slippage,
+     unless --brute-force is set: BUY YES then skips the book and IOC-submits
+     --count-yes at 97¢.
   5. Press Ctrl-E, then Enter to confirm, before the script queues BUY NO orders only for
      active markets that were not already heard, whose
      current YES price is still below the END safety threshold, and whose current
@@ -31,6 +33,9 @@ Examples:
 
   # Use a fixed hard bid price for all BUY orders
   ./kalshi_broadcast_word_trader.py --prod KXVANCEMENTION-26MAY15 --live --hard-bid 75
+
+  # Brute-force BUY YES: skip the orderbook, IOC at 97¢, size --count-yes
+  ./kalshi_broadcast_word_trader.py --prod KXVANCEMENTION-26MAY15 --live --brute-force --count-yes 100
 
   # Use a dumped get_markets.py output file for testing/dry run
   ./kalshi_broadcast_word_trader.py --prod --file markets.txt
@@ -81,6 +86,9 @@ Important safety behavior:
   - Duplicate detections for the same market are ignored.
   - --live is required for real orders; otherwise every order is logged as dry-run.
   - Limit prices are clamped to MAX_BID_CENTS, default 97.
+  - --brute-force: BUY YES does not read the orderbook. It submits one IOC
+    limit at 97¢ for --count-yes (or --count). BUY NO, SELL, and END still
+    use live books.
   - END has extra safety gates: by default it skips BUY NO when the current
     YES signal is >= 97c, marks markets as finished once YES is >= 99c, and
     only buys NO when the current NO ask is at least 4c (> 3c). END NO orders
@@ -2492,6 +2500,15 @@ def effective_count_for_side(args, side: str | None) -> int:
     return int(args.count)
 
 
+def is_brute_force_yes_buy(args, *, side: str | None, trade_action: str = "buy") -> bool:
+    """True when --brute-force should skip the book and fire a 97¢ IOC BUY YES."""
+    return (
+        bool(getattr(args, "brute_force", False))
+        and str(trade_action or "buy").lower() == "buy"
+        and str(side or "").lower() == "yes"
+    )
+
+
 def effective_slippage_for_side(args, side: str | None) -> int:
     """Return simple-mode slippage for this side, honoring side-specific overrides."""
     side_key = str(side or "").lower()
@@ -2504,6 +2521,13 @@ def effective_slippage_for_side(args, side: str | None) -> int:
 
 def slippage_summary_for_args(args) -> str:
     """Human-readable simple-mode slippage summary."""
+    if bool(getattr(args, "brute_force", False)):
+        hard = getattr(args, "hard_bid_cents", None)
+        no_bit = f"; NO hard-bid={int(hard)}c" if hard is not None else ""
+        return (
+            f"YES brute-force {MAX_BID_CENTS}c IOC (no book){no_bit}; "
+            "NO uses ask+slippage unless hard-bid"
+        )
     if getattr(args, "hard_bid_cents", None) is not None:
         return f"hard-bid={int(args.hard_bid_cents)}c (slippage ignored)"
     yes_slippage = effective_slippage_for_side(args, "yes")
@@ -3255,58 +3279,83 @@ def place_single_order_for_market(
     )
 
     try:
-        quote = latest_quote_for_order(args, market, side)
-        ask_cents = quote_side_ask_cents(quote, side)
-        bid_cents = quote_side_bid_cents(quote, side)
+        brute_yes = is_brute_force_yes_buy(args, side=side, trade_action=trade_action)
+        if brute_yes:
+            # Speed path: do not wait on WS/REST books. One IOC limit at 97¢.
+            quote = {
+                "price_source": "brute_force",
+                "ws_snapshot_refresh": "skipped_brute_force",
+                "ws_snapshot_refresh_wait_ms": 0,
+            }
+            ask_cents = None
+            bid_cents = None
+            price_base = "brute_force"
+            effective_slippage_cents = 0
+            limit_base_cents = MAX_BID_CENTS
+            order_time_in_force = "immediate_or_cancel"
+            payload = make_order_payload(
+                ticker=ticker,
+                side=side,
+                count=order_count,
+                order_type="limit",
+                slippage_cents=0,
+                ask_cents=None,
+                time_in_force=order_time_in_force,
+                limit_base_cents=limit_base_cents,
+            )
+        else:
+            quote = latest_quote_for_order(args, market, side)
+            ask_cents = quote_side_ask_cents(quote, side)
+            bid_cents = quote_side_bid_cents(quote, side)
 
-        if trade_action == "buy":
-            if args.hard_bid_cents is not None:
-                price_base = "hard_bid"
-                effective_slippage_cents = 0
-                limit_base_cents = args.hard_bid_cents
+            if trade_action == "buy":
+                if args.hard_bid_cents is not None:
+                    price_base = "hard_bid"
+                    effective_slippage_cents = 0
+                    limit_base_cents = args.hard_bid_cents
+                else:
+                    price_base = "ask"
+                    effective_slippage_cents = (
+                        effective_slippage_for_side(args, side)
+                        if slippage_override_cents is None
+                        else slippage_override_cents
+                    )
+                    limit_base_cents = ask_cents
+
+                payload = make_order_payload(
+                    ticker=ticker,
+                    side=side,
+                    count=order_count,
+                    order_type=args.order_type,
+                    slippage_cents=effective_slippage_cents,
+                    ask_cents=ask_cents,
+                    time_in_force=order_time_in_force,
+                    limit_base_cents=limit_base_cents,
+                )
             else:
-                price_base = "ask"
+                if args.hard_bid_cents is not None:
+                    raise ValueError("--hard-bid cannot be used with SELL-position trade controls")
+                price_base = "bid"
                 effective_slippage_cents = (
                     effective_slippage_for_side(args, side)
                     if slippage_override_cents is None
                     else slippage_override_cents
                 )
-                limit_base_cents = ask_cents
-
-            payload = make_order_payload(
-                ticker=ticker,
-                side=side,
-                count=order_count,
-                order_type=args.order_type,
-                slippage_cents=effective_slippage_cents,
-                ask_cents=ask_cents,
-                time_in_force=order_time_in_force,
-                limit_base_cents=limit_base_cents,
-            )
-        else:
-            if args.hard_bid_cents is not None:
-                raise ValueError("--hard-bid cannot be used with SELL-position trade controls")
-            price_base = "bid"
-            effective_slippage_cents = (
-                effective_slippage_for_side(args, side)
-                if slippage_override_cents is None
-                else slippage_override_cents
-            )
-            limit_base_cents = bid_cents
-            payload = make_sell_order_payload(
-                ticker=ticker,
-                side=side,
-                count=order_count,
-                order_type=args.order_type,
-                slippage_cents=effective_slippage_cents,
-                bid_cents=bid_cents,
-                time_in_force=order_time_in_force,
-            )
+                limit_base_cents = bid_cents
+                payload = make_sell_order_payload(
+                    ticker=ticker,
+                    side=side,
+                    count=order_count,
+                    order_type=args.order_type,
+                    slippage_cents=effective_slippage_cents,
+                    bid_cents=bid_cents,
+                    time_in_force=order_time_in_force,
+                )
 
         limit_price_cents = order_payload_limit_price(payload, side)
         v2_payload_preview = None
         try:
-            if args.order_submit_api == "v2" and args.order_type == "limit":
+            if args.order_submit_api == "v2" and payload.get("type") == "limit":
                 v2_payload_preview = make_event_order_v2_payload(payload)
         except Exception:
             v2_payload_preview = None
@@ -3322,12 +3371,13 @@ def place_single_order_for_market(
             "ticker": ticker,
             "side": side,
             "count": order_count,
-            "order_type": args.order_type,
-            "time_in_force": order_time_in_force if args.order_type == "limit" else None,
+            "order_type": payload.get("type") or args.order_type,
+            "time_in_force": order_time_in_force if (payload.get("type") or args.order_type) == "limit" else None,
             "price_base": price_base,
             "base_price_cents": limit_base_cents,
             "limit_price_cents": limit_price_cents,
             "hard_bid_cents": args.hard_bid_cents,
+            "brute_force": brute_yes,
             "slippage_cents": effective_slippage_cents,
             "price_source": quote.get("price_source"),
             "bid_cents": bid_cents,
@@ -3665,7 +3715,13 @@ def place_order_for_market(
     # their fill count can update the on-screen position immediately.  The
     # global execution mode still applies to automatic paths such as Ctrl-E.
     is_manual_trade_control = str(action).startswith("manual_")
-    mode = "simple" if is_manual_trade_control else getattr(args, "execution_mode", "simple")
+    brute_yes = is_brute_force_yes_buy(args, side=side, trade_action=trade_action)
+    # Brute YES is always one IOC; do not walk the ladder or wait on books.
+    mode = (
+        "simple"
+        if is_manual_trade_control or brute_yes
+        else getattr(args, "execution_mode", "simple")
+    )
     if mode == "simple":
         ok, status, details = place_single_order_for_market(
             client=client,
@@ -4287,6 +4343,13 @@ def print_key_help(state: SharedBroadcastState, args) -> None:
         "",
         "Trading:",
         "  Type to filter/highlight  Enter  confirm highlighted action",
+        *(
+            [
+                f"  --brute-force YES: Enter/heard skips the book, IOC {MAX_BID_CENTS}c",
+            ]
+            if getattr(args, "brute_force", False)
+            else []
+        ),
         "  Ctrl-E then Enter         BUY NO on remaining qualified markets",
         "  Typed END                 plain text (not a command)",
         "",
@@ -6422,6 +6485,15 @@ def order_submission_preview(args, market: dict, side: str, task: OrderTask) -> 
     side_text = side.upper()
     trade_action = str(getattr(task, "trade_action", "buy")).upper()
     mode = "LIVE" if args.live else "DRY RUN"
+    brute_yes = is_brute_force_yes_buy(
+        args, side=side, trade_action=str(getattr(task, "trade_action", "buy"))
+    )
+    if brute_yes:
+        count = effective_count_for_side(args, side)
+        return (
+            f"{mode}: {word} [{ticker}] BUY YES count={count} "
+            f"BRUTE {MAX_BID_CENTS}c IOC (no book) trigger={task.trigger}"
+        )
     try:
         quote = latest_quote_for_market(args, market)
         prob = quote_prob_summary(quote, include_spread=True, args=args)
@@ -6633,6 +6705,11 @@ def print_startup_summary(args, markets: list[dict], state: SharedBroadcastState
     elif args.ws_orderbook:
         safe_print("WS cache freshness: background snapshot repair disabled")
     safe_print(f"On detected word: BUY {args.mention_side.upper()}")
+    if getattr(args, "brute_force", False):
+        safe_print(
+            f"BRUTE FORCE YES: skip orderbook; IOC {MAX_BID_CENTS}c x"
+            f"{effective_count_for_side(args, 'yes')} (NO/SELL/END still use the book)"
+        )
     safe_print(f"Order submit API: {args.order_submit_api} ({'/portfolio/events/orders' if args.order_submit_api == 'v2' else '/portfolio/orders legacy'})")
     safe_print("Order sizes: " + count_summary_for_args(args))
     safe_print("Simple-mode slippage: " + slippage_summary_for_args(args))
@@ -7298,6 +7375,18 @@ def parse_args():
             "Fixed limit bid price in cents for every BUY order. "
             "When set, slippage is forced to 0 and ask+slippage pricing is ignored. "
             f"Allowed range: 1-{MAX_BID_CENTS}. Example: --hard-bid 75"
+        ),
+    )
+
+    p.add_argument(
+        "--brute-force",
+        action="store_true",
+        help=(
+            "Speed path for BUY YES only: do not read the orderbook. "
+            f"Submit one immediate-or-cancel limit at {MAX_BID_CENTS}c for --count-yes "
+            "(or --count). Heard-word, autocomplete Enter, and Ctrl-B YES all use this. "
+            "BUY NO, SELL, and Ctrl-E END still price from the live book. "
+            "Compatible with --trade-controls / cmd_adv."
         ),
     )
 
