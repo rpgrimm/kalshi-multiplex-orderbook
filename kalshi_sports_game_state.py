@@ -212,6 +212,21 @@ class GameState:
         self.sent_tickers.add(str(ticker).upper())
         self.armed = [b for b in self.armed if b.ticker.upper() != str(ticker).upper()]
 
+    def should_hide_market(self, row: Any) -> bool:
+        """Drop settled/queued markets from the browse list of possible bets."""
+        ticker = str(getattr(row, "ticker", "") or "").upper()
+        series = str(getattr(row, "series_ticker", "") or "").upper()
+        if not series:
+            series = ticker_parts(ticker)[0]
+        title = str(getattr(row, "title", "") or "")
+        if self.game_tds >= 1 and (
+            series == "KXNFLFIRSTTD" or "1st Touchdown" in title
+        ):
+            return True
+        if ticker and self.has_armed_or_sent(ticker):
+            return True
+        return False
+
 
 def parse_score_command(text: str, state: GameState) -> tuple[str, int] | None:
     """`atl 7` / `gb=14` — team must be this game's away/home."""

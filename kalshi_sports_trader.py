@@ -2263,6 +2263,7 @@ Game state / armed bets
   e then Enter              END quarter: BUY NO on thisQ overs that missed, then Q+1
   b                         ARMED BETS page (Enter send all, x drop row)
   Clear filter (Ctrl-U)     then retype the play to record the next TD
+  Hidden from list          sent/armed tickers, and all First TD after one is recorded
 
 Packages (market Enter still works)
   Detail on a trigger       lists every leg that would be sent (ticker + quote)
@@ -2324,15 +2325,23 @@ class BrowserState:
     game: GameState | None = None
     end_q_confirm: bool = False
 
+    def market_available(self, row: MarketRow) -> bool:
+        if self.game is not None and self.game.should_hide_market(row):
+            return False
+        return True
+
+    def available_rows(self) -> list[MarketRow]:
+        return [row for row in self.rows if self.market_available(row)]
+
     def category_counts(self) -> dict[str, int]:
         counts = {k: 0 for k in CATEGORY_ORDER}
-        for row in self.rows:
+        for row in self.available_rows():
             counts[classify_market(row)] = counts.get(classify_market(row), 0) + 1
         return counts
 
     def filtered_rows(self) -> list[MarketRow]:
         out: list[MarketRow] = []
-        for row in self.rows:
+        for row in self.available_rows():
             if self.category != "all" and classify_market(row) != self.category:
                 continue
             if not row_matches_filter(row, self.filter_text):
@@ -2344,7 +2353,7 @@ class BrowserState:
     def category_items(self) -> list[tuple[str, str, int]]:
         counts = self.category_counts()
         items = [(key, CATEGORY_LABELS[key], counts.get(key, 0)) for key in CATEGORY_ORDER]
-        items.append(("all", "All markets", len(self.rows)))
+        items.append(("all", "All markets", len(self.available_rows())))
         return items
 
 
@@ -2497,12 +2506,16 @@ def render_browser(state: BrowserState) -> None:
         market_rows = state.filtered_rows()
         match_count = len(market_rows)
     elif state.filter_text.strip():
-        match_count = sum(1 for row in state.rows if row_matches_filter(row, state.filter_text))
+        match_count = sum(
+            1
+            for row in state.available_rows()
+            if row_matches_filter(row, state.filter_text)
+        )
 
     lines: list[str] = []
     mode_tag = "FILTER" if state.input_mode == "filter" else "NORMAL"
     lines.append(
-        f"{state.seed_series}-{state.game_code}   markets={len(state.rows)}   "
+        f"{state.seed_series}-{state.game_code}   markets={len(state.available_rows())}   "
         f"{mode_tag}   {ws_line}"
     )
     if state.game is not None:
@@ -2756,6 +2769,8 @@ def ensure_package_quotes(state: BrowserState) -> None:
 def package_enter_hint(state: BrowserState, row: MarketRow | None) -> str:
     if row is None or not state.packages:
         return ""
+    if not state.market_available(row):
+        return ""
     pkg = package_for_trigger(state.packages, row)
     if pkg is None:
         return ""
@@ -2955,6 +2970,9 @@ def handle_market_enter(state: BrowserState) -> None:
         submit_package(state, trigger_only=False)
         return
     row = selected_market_row(state)
+    if row is not None and not state.market_available(row):
+        state.message = "already armed/sent or first TD is done — not a possible bet"
+        return
     if row is not None and state.packages:
         pkg = package_for_trigger(state.packages, row)
         if pkg is not None:

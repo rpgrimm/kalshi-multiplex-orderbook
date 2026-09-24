@@ -130,6 +130,25 @@ class TestGameState(unittest.TestCase):
         self.assertIn("Q1", line)
         self.assertIn("DET 7-14 BUF", line)
 
+    def test_recorded_first_td_and_armed_tickers_hide_from_possible_bets(self) -> None:
+        by_ticker = {r.ticker: r for r in self.rows}
+        first_shakir = by_ticker["KXNFLFIRSTTD-26SEP17DETBUF-BUFKSHAKIR10"]
+        first_goff = by_ticker["KXNFLFIRSTTD-26SEP17DETBUF-DETJGOFF16"]
+        shakir_1 = by_ticker["KXNFLTD-26SEP17DETBUF-BUFKSHAKIR10-1"]
+        shakir_2 = by_ticker["KXNFLTD-26SEP17DETBUF-BUFKSHAKIR10-2"]
+        goff_pass = by_ticker["KXNFLPASSTDS-26SEP17DETBUF-DETJGOFF16-1"]
+        self.assertFalse(self.state.should_hide_market(first_shakir))
+        resolve_play_bets(
+            state=self.state, rows=self.rows, player_tokens=["shakir"], intent="receiving"
+        )
+        self.assertTrue(self.state.should_hide_market(first_shakir))
+        self.assertTrue(self.state.should_hide_market(first_goff))
+        self.assertTrue(self.state.should_hide_market(shakir_1))
+        self.assertFalse(self.state.should_hide_market(shakir_2))
+        self.assertFalse(self.state.should_hide_market(goff_pass))
+        self.state.mark_sent(shakir_1.ticker)
+        self.assertTrue(self.state.should_hide_market(shakir_1))
+
 
 if __name__ == "__main__":
     unittest.main()
