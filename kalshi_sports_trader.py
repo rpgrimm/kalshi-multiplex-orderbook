@@ -192,6 +192,15 @@ def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
 
+def missing_kx_orderbooks_hint() -> str:
+    return (
+        "This usually means the venv is not active. From the repo root:\n"
+        "  source venv/bin/activate\n"
+        "  pip install -e .\n"
+        "Use --browse --no-ws only if you want the UI with no live books."
+    )
+
+
 @dataclass
 class OrderLogEvent:
     """One in-memory order event (no secrets)."""
@@ -1531,7 +1540,7 @@ def run_watch(
         from kx_orderbooks.ws_multiplex import MultiplexOrderbookWorker
     except ImportError as exc:
         eprint(f"error: kx_orderbooks import failed: {exc}")
-        eprint("Install package deps: pip install -e .")
+        eprint(missing_kx_orderbooks_hint())
         return 2
 
     try:
@@ -2900,7 +2909,11 @@ def run_browser(
         # Start WS silently in background; UI does not dump ticks.
         eprint("starting background websocket book tracker (silent)...")
         tracker.start()
-        if tracker.error and tracker.status in {"no-auth", "no-deps"}:
+        if tracker.status == "no-deps":
+            eprint(f"error: {tracker.error}")
+            eprint(missing_kx_orderbooks_hint())
+            return 2
+        if tracker.error and tracker.status == "no-auth":
             eprint(f"browser continues without live quotes: {tracker.error}")
         elif tracker.enabled:
             eprint(
