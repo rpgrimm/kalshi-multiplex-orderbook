@@ -100,6 +100,45 @@ class TestPlayProtocol(unittest.TestCase):
         self.assertEqual({c.market_id for c in cands2}, ids)
         self.assertEqual(session.state().home_score + session.state().away_score, 0)
 
+    def test_qb_from_ticker_team_when_cache_has_no_uuid(self) -> None:
+        rows = [
+            row(
+                "KXNFLFIRSTTD-26SEP24ATLGB-GBCWATSON9",
+                "Christian Watson: 1st Touchdown",
+                series="KXNFLFIRSTTD",
+            ),
+            row(
+                "KXNFLTD-26SEP24ATLGB-GBCWATSON9-1",
+                "Christian Watson: 1+ touchdowns",
+                series="KXNFLTD",
+            ),
+            row(
+                "KXNFLPASSTDS-26SEP24ATLGB-GBJLOVE10-1",
+                "Jordan Love: 1+ passing touchdowns",
+                series="KXNFLPASSTDS",
+            ),
+            row(
+                "KXNFLPASSTDS-26SEP24ATLGB-ATLMRILEY9-1",
+                "Michael Penix: 1+ passing touchdowns",
+                series="KXNFLPASSTDS",
+            ),
+            row(
+                "KXNFL1QTOTAL-26SEP24ATLGB-7",
+                "Will there be over 6.5 1Q points scored?",
+                series="KXNFL1QTOTAL",
+                floor=6.5,
+            ),
+        ]
+        session = make_browse_session("26SEP24ATLGB", rows)
+        _draft, cands, msg = arm_td_draft(
+            session, rows, parse_play_query("watson td re"), intent="receiving"
+        )
+        ids = {c.market_id for c in cands}
+        self.assertIn("KXNFLPASSTDS-26SEP24ATLGB-GBJLOVE10-1", ids)
+        self.assertNotIn("KXNFLPASSTDS-26SEP24ATLGB-ATLMRILEY9-1", ids)
+        self.assertIn("KXNFL1QTOTAL-26SEP24ATLGB-7", ids)
+        self.assertIn("QB pass armed", msg)
+
     def test_rush_omits_qb(self) -> None:
         rows = fixture()
         session = make_browse_session("26SEP17DETBUF", rows)

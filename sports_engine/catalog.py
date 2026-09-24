@@ -88,33 +88,42 @@ def football_team(row: Any) -> str | None:
     raw = getattr(row, "raw", None)
     if not isinstance(raw, dict):
         return None
-    custom = raw.get("custom")
-    if not isinstance(custom, dict):
-        return None
-    val = custom.get("football_team")
-    if not val:
-        return None
-    return str(val).strip().lower()
+    for blob in (raw, raw.get("custom"), raw.get("custom_strike")):
+        if not isinstance(blob, dict):
+            continue
+        for key in ("football_team", "team", "nfl_team"):
+            val = blob.get(key)
+            if val:
+                return str(val).strip().lower()
+    return None
 
 
-def same_team(a: Any, b: Any) -> bool:
+def same_team(a: Any, b: Any, game_code: str = "") -> bool:
     ta, tb = football_team(a), football_team(b)
     if ta and tb:
         return ta == tb
+    if game_code:
+        ca = team_abbrev_from_row(a, game_code)
+        cb = team_abbrev_from_row(b, game_code)
+        if ca and cb:
+            return ca == cb
     return False
 
 
 def row_floor(row: Any) -> float | None:
     raw = getattr(row, "raw", None)
-    if not isinstance(raw, dict):
-        return None
-    val = raw.get("floor_strike")
-    if val is None or val == "":
-        return None
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return None
+    if isinstance(raw, dict):
+        val = raw.get("floor_strike")
+        if val is not None and val != "":
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                pass
+    title = row_title(row)
+    plus = re.search(r"(\d+)\+", title)
+    if plus:
+        return int(plus.group(1)) - 0.5
+    return None
 
 
 def floor_equals(row: Any, expected: float) -> bool:
@@ -168,15 +177,26 @@ def find_player_td_ladder(rows: Sequence[Any], name_tokens: Sequence[str], floor
     return hits[0] if len(hits) == 1 else None
 
 
-def find_qb_pass_td(rows: Sequence[Any], trigger_row: Any, floor: float) -> Any | None:
+def find_qb_pass_td(
+    rows: Sequence[Any],
+    trigger_row: Any,
+    floor: float,
+    game_code: str = "",
+) -> Any | None:
     hits = [
         row
         for row in rows
         if row_series(row) == "KXNFLPASSTDS"
         and floor_equals(row, floor)
-        and same_team(trigger_row, row)
+        and same_team(trigger_row, row, game_code)
     ]
-    return hits[0] if len(hits) == 1 else None
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        named = [row for row in hits if "pass" in row_title(row).lower()]
+        if len(named) == 1:
+            return named[0]
+    return None
 
 
 def find_q_total(rows: Sequence[Any], quarter: int, floor: float = 6.5) -> Any | None:

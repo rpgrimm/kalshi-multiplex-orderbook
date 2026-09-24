@@ -14,6 +14,7 @@ from ..catalog import (
     find_q_total,
     football_team,
     market_id,
+    team_abbrev_from_row,
     unique_player_rows,
 )
 from ..models import BetSide, CandidateBet, CandidateStatus, EventType, GameState
@@ -44,6 +45,9 @@ def preview_td_cluster(
     trigger = first or (hits[0] if hits else None)
     player_next = _player_tds(game_state, display) + 1
     team_key = football_team(trigger) if trigger is not None else None
+    if not team_key and trigger is not None:
+        abbr = team_abbrev_from_row(trigger, game_state.game_code)
+        team_key = abbr.lower() if abbr else None
     team_rec_now = game_state.team_rec_tds.get(str(team_key or "").lower(), 0)
     team_rec_next = team_rec_now + 1
     out: list[CandidateBet] = []
@@ -68,7 +72,12 @@ def preview_td_cluster(
     ladder = find_player_td_ladder(rows, name_tokens, 0.5 + float(player_next - 1))
     add(ladder, f"{display} {player_next}+ TDs ({intent or 'td'})")
     if intent == "receiving" and trigger is not None:
-        qb = find_qb_pass_td(rows, trigger, 0.5 + float(team_rec_next - 1))
+        qb = find_qb_pass_td(
+            rows,
+            trigger,
+            0.5 + float(team_rec_next - 1),
+            game_code=game_state.game_code,
+        )
         add(qb, f"same-team QB {team_rec_next}+ pass TD")
     qrow = find_q_total(rows, game_state.quarter, 6.5)
     add(qrow, f"Q{game_state.quarter} over 6.5")

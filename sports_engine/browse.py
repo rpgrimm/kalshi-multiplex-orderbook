@@ -62,6 +62,8 @@ def _event_fields(session: SportsSession, rows: Sequence[Any], name_tokens: Sequ
     trigger = first or (hits[0] if hits else None)
     team = team_abbrev_from_row(trigger, session.state().game_code) if trigger is not None else None
     team_key = football_team(trigger) if trigger is not None else None
+    if not team_key and team:
+        team_key = team.lower()
     return display, team, team_key or ""
 
 
@@ -102,9 +104,14 @@ def arm_td_draft(
         team_key=team_key,
         display=display,
     )
+    has_qb = any("PASSTDS" in c.market_id.upper() for c in cands)
     hint = "type re for QB pass · ru for rush · Enter confirms"
     if use_intent == "receiving":
-        hint = "QB pass armed · Enter confirms send"
+        hint = (
+            "QB pass armed · Enter confirms send"
+            if has_qb
+            else "QB pass NOT found · Enter confirms"
+        )
     elif use_intent == "rush":
         hint = "rush (no QB) · Enter confirms send"
     return draft, cands, format_candidates(cands, armed=True) + " · " + hint
