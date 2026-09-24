@@ -559,6 +559,26 @@ def short_leg_label(row: Any) -> str:
     return suffix or ticker
 
 
+def package_preview_lines(resolved: ResolvedPackage) -> list[str]:
+    """Human lines listing every package leg (resolved ticker/title or miss)."""
+    lines = [f"PACKAGE {resolved.package.id}  ({resolved.package.title})"]
+    for i, leg in enumerate(resolved.legs, 1):
+        if leg.row is not None:
+            title = str(
+                getattr(leg.row, "title", "")
+                or getattr(leg.row, "yes_sub_title", "")
+                or ""
+            )
+            ticker = str(getattr(leg.row, "ticker", "") or "")
+            lines.append(f"  {i}. {title or ticker}")
+            lines.append(f"     {ticker}")
+        else:
+            lines.append(
+                f"  {i}. MISS {leg.id}: {leg.reason or 'unresolved'}"
+            )
+    return lines
+
+
 def preview_status_line(resolved: ResolvedPackage, *, count_yes: int, mode: str) -> str:
     ok_labels: list[str] = []
     missed: list[str] = []

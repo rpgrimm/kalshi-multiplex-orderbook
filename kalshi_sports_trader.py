@@ -66,6 +66,7 @@ from typing import Any, Iterable
 from kalshi_sports_packages import (
     load_browse_packages,
     package_for_trigger,
+    package_preview_lines,
     preview_status_line,
     resolve_package,
     send_summary_line,
@@ -2134,6 +2135,7 @@ Orders / exits
   L                  show recent memory log + force dump
 
 Packages
+  Detail on a trigger       lists every leg that would be sent (ticker + quote)
   Enter on player First TD  arm cluster (that player + same-team QB 1+ pass TD + over 6.5 1Q)
   Enter again               send all resolved legs (session --count-yes)
   1 while armed             send the trigger market only
@@ -2415,6 +2417,10 @@ def render_browser(state: BrowserState) -> None:
                     lines.append(f"  book age: {age:.1f}s   seq={q.seq}")
             else:
                 lines.append("  book: (waiting for websocket snapshot)")
+            pkg_block = package_detail_block(state, row)
+            if pkg_block:
+                lines.append("")
+                lines.extend(pkg_block)
             lines.append("")
             ensure_package_quotes(state)
             if state.package_confirm:
@@ -2539,6 +2545,48 @@ def package_enter_hint(state: BrowserState, row: MarketRow | None) -> str:
     if pkg is None:
         return ""
     return f"Enter ARM PKG {pkg.id} (not single BUY)"
+
+
+def package_detail_block(state: BrowserState, row: MarketRow) -> list[str]:
+    """On market detail, list every package leg that Enter would send."""
+    if not state.packages:
+        return []
+    pkg = package_for_trigger(state.packages, row)
+    if pkg is None:
+        return []
+    if (
+        state.package_confirm
+        and state.package_confirm_ticker == row.ticker
+        and state.package_resolved is not None
+    ):
+        resolved = state.package_resolved
+    else:
+        resolved = resolve_package(pkg, row, state.rows)
+    tickers = [
+        str(leg.row.ticker)
+        for leg in resolved.resolved_legs()
+        if getattr(leg, "row", None) is not None
+    ]
+    if tickers:
+        state.tracker.ensure_quotes(tickers)
+    count_yes = effective_count_yes(state.args)
+    mode = "LIVE" if state.args.live else "DRY-RUN"
+    n_ok = len(resolved.resolved_legs())
+    n_all = len(resolved.legs)
+    lines = [
+        f"PACKAGE {resolved.package.id}  {n_ok}/{n_all} resolved  "
+        f"BUY YES x{count_yes} each ({mode})",
+        f"  {resolved.package.title}",
+    ]
+    for i, leg in enumerate(resolved.legs, 1):
+        if leg.row is not None:
+            q = state.tracker.quote(leg.row.ticker)
+            title = short_label(leg.row.title or leg.row.yes_sub_title or "", 52)
+            lines.append(f"  {i}. {title}")
+            lines.append(f"     {format_quote_cell(q)}  {leg.row.ticker}")
+        else:
+            lines.append(f"  {i}. MISS {leg.id}: {leg.reason or 'unresolved'}")
+    return lines
 
 
 def package_confirm_footer(state: BrowserState) -> str:

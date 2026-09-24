@@ -12,6 +12,7 @@ from kalshi_sports_packages import (
     load_browse_packages,
     load_packages,
     package_for_trigger,
+    package_preview_lines,
     resolve_package,
     team_key,
 )
@@ -160,6 +161,13 @@ class TestSportsPackages(unittest.TestCase):
         self.assertNotIn("KXNFLPASSTDS-26SEP17DETBUF-BUFJALLEN17-2", tickers)
         self.assertNotIn("KXNFL1QTOTAL-26SEP17DETBUF-4", tickers)
         self.assertEqual(team_key(shakir), BUF.lower())
+        preview = "\n".join(package_preview_lines(resolved))
+        self.assertIn("Khalil Shakir: 1st Touchdown", preview)
+        self.assertIn("Josh Allen: 1+ passing touchdowns", preview)
+        self.assertIn("over 6.5 1Q points", preview)
+        self.assertIn("KXNFLPASSTDS-26SEP17DETBUF-BUFJALLEN17-1", preview)
+        self.assertNotIn("Jared Goff", preview)
+        self.assertNotIn("2+ passing", preview)
 
     def test_goff_first_td_resolves_goff_1_not_allen(self) -> None:
         goff = self.by_ticker["KXNFLFIRSTTD-26SEP17DETBUF-DETJGOFF16"]
