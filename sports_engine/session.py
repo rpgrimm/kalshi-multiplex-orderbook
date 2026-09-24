@@ -35,9 +35,11 @@ class SportsSession:
         self.execution = execution or ExecutionEngine(backend=backend)
         self.mock = backend if isinstance(self.execution.backend, MockExecutionBackend) else None
 
-    def ingest(self, event: GameEvent) -> list[CandidateBet]:
+    def ingest(self, event: GameEvent, *, evaluate: bool = True) -> list[CandidateBet]:
         stored = self.store.append(event)
         self.state_engine.apply_event(stored)
+        if not evaluate:
+            return []
         candidates = self.strategy_engine.evaluate(self.state_engine.get_state())
         self.arming.observe(candidates)
         return candidates

@@ -65,14 +65,15 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from sports_engine.browse import (
+    arm_td_draft,
+    apply_td_draft,
     catalog_player_names,
     ingest_quarter_end,
     ingest_score,
-    ingest_td_play,
     make_browse_session,
     parse_time_line,
 )
-from sports_engine.catalog import unique_player_rows
+from sports_engine.catalog import row_series, unique_player_rows
 from sports_engine.play_protocol import parse_play_query, tab_complete_player
 
 PROD_REST_HOST = "https://api.elections.kalshi.com/trade-api/v2"
@@ -2093,9 +2094,11 @@ Modes (vim-style)
   FILTER             type query; Tab completes player names
   f or /             enter FILTER mode
   Tab                complete player last name (wa → watson)
-  Enter              lock player (stay FILTER) or fire a complete `td rec`
-  `watson td rec`    first TD + QB 1+ pass + this-Q 6.5 (candidates, not sent)
-  `watson td ru`     rush: no QB pass TD
+  Enter              lock player; after `td` arm First TD+6.5; with a draft, confirm/send
+  `td` then Enter    arm First TD + this-Q 6.5 (no score change yet)
+  then `re`          add same-team QB 1+ pass (once; rec == re)
+  then `ru`          rush: drop QB pass
+  Enter again        send armed YES legs (dry-run unless --live) and then update score
   t                  TIMEKEEPING: qend ends quarter (NO on missed overs)
   Esc                leave FILTER/TIME → NORMAL
   Ctrl-U             clear filter + locked player
@@ -2172,16 +2175,28 @@ class BrowserState:
     committed_player: str = ""
     last_play_raw: str = ""
     time_text: str = ""
+    draft: Any = None
+
+    def market_available(self, row: MarketRow) -> bool:
+        if self.session is None:
+            return True
+        if self.session.state().game_tds >= 1 and row_series(row) == "KXNFLFIRSTTD":
+            return False
+        return True
 
     def category_counts(self) -> dict[str, int]:
         counts = {k: 0 for k in CATEGORY_ORDER}
         for row in self.rows:
+            if not self.market_available(row):
+                continue
             counts[classify_market(row)] = counts.get(classify_market(row), 0) + 1
         return counts
 
     def filtered_rows(self) -> list[MarketRow]:
         out: list[MarketRow] = []
         for row in self.rows:
+            if not self.market_available(row):
+                continue
             if self.category != "all" and classify_market(row) != self.category:
                 continue
             if not row_matches_filter(row, self.filter_text):
@@ -2243,9 +2258,18 @@ def format_filter_line(state: BrowserState, match_count: int | None = None) -> s
     if state.input_mode == "time":
         return f"TIME> {state.time_text}█  · qend · gb 7 · Esc normal"
     if filtering:
+        if state.draft is not None:
+            return (
+                f"FILTER> {needle}█{count_bit}{intent_bit}{play_bit}  "
+                f"· re QB · ru rush · Enter confirms send"
+            )
+        if state.committed_player:
+            return (
+                f"FILTER> {needle}█{count_bit}{play_bit}  "
+                f"· td then Enter to arm · re/ru after"
+            )
         return (
-            f"FILTER> {needle}█{count_bit}{intent_bit}{play_bit}  "
-            f"· Tab name · Enter lock player · td rec"
+            f"FILTER> {needle}█{count_bit}  · Tab name · Enter lock player"
         )
     if needle:
         return f"filter: {needle}{count_bit}{intent_bit}{play_bit}  · f filter · Ctrl-U clear · NORMAL"
@@ -2280,30 +2304,66 @@ def clear_filter(state: BrowserState) -> None:
     state.committed_player = ""
     state.last_play_raw = ""
     state.time_text = ""
+    state.draft = None
 
 
 def _play_quantity(state: BrowserState) -> int:
     return effective_count_yes(state.args)
 
 
-def maybe_fire_td_play(state: BrowserState) -> None:
-    if state.session is None:
+def _sync_draft_intent(state: BrowserState) -> None:
+    """If a TD draft is open, re/ru updates the QB leg once per intent change."""
+    if state.session is None or state.draft is None:
         return
     q = parse_play_query(state.filter_text)
-    if not q.is_complete_td():
+    if q.intent is None or q.intent == state.draft.intent:
         return
-    if q.raw == state.last_play_raw:
-        return
-    _cands, msg = ingest_td_play(
+    draft, _cands, msg = arm_td_draft(
         state.session,
         state.rows,
         q,
         quantity=_play_quantity(state),
-        auto_arm=True,
+        previous=state.draft,
+        intent=q.intent,
     )
-    state.last_play_raw = q.raw
-    state.committed_player = " ".join(q.name_tokens)
+    state.draft = draft
     state.message = msg
+
+
+def confirm_td_draft(state: BrowserState) -> None:
+    if state.session is None or state.draft is None:
+        return
+    if state.order_busy:
+        state.message = "order already in flight"
+        return
+    draft = state.draft
+    armed = [b for b in state.session.arming.armed_bets() if b.armed_id in set(draft.armed_ids)]
+    tickers = [b.market_id for b in armed]
+    if tickers:
+        state.tracker.ensure_quotes(tickers, force=True)
+    sent = 0
+    missed: list[str] = []
+    state.order_busy = True
+    try:
+        for bet in armed:
+            row = next((r for r in state.rows if r.ticker.upper() == bet.market_id.upper()), None)
+            if row is None:
+                missed.append(bet.market_id)
+                continue
+            quote = state.tracker.quote(row.ticker)
+            ok, status = buy_yes_for_market(args=state.args, row=row, quote=quote)
+            if ok:
+                sent += 1
+            else:
+                missed.append(short_label(status, 40))
+    finally:
+        state.order_busy = False
+        state.last_order_ts = time.time()
+    recorded = apply_td_draft(state.session, draft)
+    state.draft = None
+    extra = f" · missed {len(missed)}" if missed else ""
+    state.message = f"sent {sent}/{len(armed)}{extra} · {recorded}"
+    leave_filter_mode(state)
 
 
 def handle_filter_tab(state: BrowserState) -> None:
@@ -2316,7 +2376,7 @@ def handle_filter_tab(state: BrowserState) -> None:
         state.committed_player = hits[0]
         if not state.filter_text.endswith(" "):
             state.filter_text += " "
-        state.message = f"player {hits[0]} · type td rec / td ru"
+        state.message = f"player {hits[0]} · type td then Enter"
     elif hits:
         state.message = "tab: " + ", ".join(hits[:8])
     else:
@@ -2327,9 +2387,20 @@ def handle_filter_tab(state: BrowserState) -> None:
 
 def handle_filter_enter(state: BrowserState) -> None:
     q = parse_play_query(state.filter_text)
-    if q.is_complete_td():
-        maybe_fire_td_play(state)
-        leave_filter_mode(state)
+    if state.draft is not None:
+        confirm_td_draft(state)
+        return
+    if q.kind == "td" and q.name_tokens and state.session is not None:
+        draft, _cands, msg = arm_td_draft(
+            state.session,
+            state.rows,
+            q,
+            quantity=_play_quantity(state),
+            intent=q.intent,
+        )
+        state.draft = draft
+        state.committed_player = " ".join(q.name_tokens)
+        state.message = msg
         return
     if q.name_tokens and q.kind is None and q.intent is None:
         hits, display = unique_player_rows(state.rows, q.name_tokens)
@@ -2337,11 +2408,9 @@ def handle_filter_enter(state: BrowserState) -> None:
             last = display.split()[-1]
             state.committed_player = last
             state.filter_text = last + " "
-            state.message = f"player {display} · type td rec / td ru"
+            state.message = f"player {display} · type td then Enter"
             return
         handle_filter_tab(state)
-        if state.committed_player:
-            return
         return
     leave_filter_mode(state)
 
@@ -2396,7 +2465,7 @@ def append_filter_char(state: BrowserState, ch: str) -> None:
     # Typing from categories with an active filter jumps into All markets.
     if state.mode == "categories":
         open_category(state, "all")
-    maybe_fire_td_play(state)
+    _sync_draft_intent(state)
 
 
 def render_browser(state: BrowserState) -> None:
@@ -2748,7 +2817,10 @@ def handle_enter(state: BrowserState) -> None:
         # Enter confirms quit; caller checks quit_confirm after this.
         return
     if state.input_mode == "filter":
-        leave_filter_mode(state)
+        handle_filter_enter(state)
+        return
+    if state.draft is not None:
+        confirm_td_draft(state)
         return
     if state.mode == "categories":
         items = state.category_items()

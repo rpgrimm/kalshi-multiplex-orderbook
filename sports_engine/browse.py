@@ -1,10 +1,11 @@
-"""Browse-side helpers: build a session and turn a play line into events.
+"""Browse-side helpers: draft a TD play, then confirm to apply stats.
 
-Does not submit Kalshi orders. Arming is explicit here after candidates appear.
+Arming a draft does not change GameState and does not send Kalshi orders.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from .catalog import (
@@ -19,8 +20,20 @@ from .models import CandidateBet, EventType, GameEvent
 from .play_protocol import PlayQuery
 from .session import SportsSession
 from .strategies.quarter_end import QuarterEndStrategy
-from .strategies.td_cluster import TdClusterStrategy
+from .strategies.td_cluster import TdClusterStrategy, preview_td_cluster
 from .strategy_engine import StrategyEngine
+
+
+@dataclass
+class DraftPlay:
+    player: str
+    name_tokens: tuple[str, ...]
+    kind: str
+    intent: str | None = None
+    armed_ids: list[str] = field(default_factory=list)
+    team: str | None = None
+    team_key: str = ""
+    display: str = ""
 
 
 def make_browse_session(game_code: str, rows: Sequence[Any]) -> SportsSession:
@@ -35,11 +48,86 @@ def make_browse_session(game_code: str, rows: Sequence[Any]) -> SportsSession:
     )
 
 
-def format_candidates(cands: list[CandidateBet]) -> str:
+def format_candidates(cands: list[CandidateBet], *, armed: bool = False) -> str:
     if not cands:
         return "no candidates"
     bits = [f"{c.side.value.upper()} {c.market_id} ({c.reason})" for c in cands]
-    return f"{len(cands)} candidates (not sent): " + " · ".join(bits)
+    verb = "armed (Enter confirms / sends)" if armed else "candidates (not sent)"
+    return f"{len(cands)} {verb}: " + " · ".join(bits)
+
+
+def _event_fields(session: SportsSession, rows: Sequence[Any], name_tokens: Sequence[str]) -> tuple[str, str | None, str]:
+    hits, display = unique_player_rows(rows, name_tokens)
+    first = find_player_first_td(rows, name_tokens)
+    trigger = first or (hits[0] if hits else None)
+    team = team_abbrev_from_row(trigger, session.state().game_code) if trigger is not None else None
+    team_key = football_team(trigger) if trigger is not None else None
+    return display, team, team_key or ""
+
+
+def arm_td_draft(
+    session: SportsSession,
+    rows: Sequence[Any],
+    query: PlayQuery,
+    *,
+    quantity: int = 1,
+    previous: DraftPlay | None = None,
+    intent: str | None = None,
+) -> tuple[DraftPlay | None, list[CandidateBet], str]:
+    """Build/rebuild a draft from current state. Does not apply the TD."""
+    tokens = list(query.name_tokens)
+    display, team, team_key = _event_fields(session, rows, tokens)
+    if not display:
+        return previous, [], f"no unique player for {' '.join(tokens)}"
+    use_intent = intent if intent is not None else query.intent
+    if previous is not None:
+        for armed_id in previous.armed_ids:
+            try:
+                session.arming.disarm(armed_id)
+            except KeyError:
+                pass
+    cands = preview_td_cluster(rows, session.state(), tokens, use_intent)
+    session.arming.observe(cands)
+    armed_ids: list[str] = []
+    for cand in cands:
+        bet = session.arm(cand.candidate_id, quantity=quantity)
+        armed_ids.append(bet.armed_id)
+    draft = DraftPlay(
+        player=display.split()[-1],
+        name_tokens=tuple(tokens),
+        kind="td",
+        intent=use_intent,
+        armed_ids=armed_ids,
+        team=team,
+        team_key=team_key,
+        display=display,
+    )
+    hint = "type re for QB pass · ru for rush · Enter confirms"
+    if use_intent == "receiving":
+        hint = "QB pass armed · Enter confirms send"
+    elif use_intent == "rush":
+        hint = "rush (no QB) · Enter confirms send"
+    return draft, cands, format_candidates(cands, armed=True) + " · " + hint
+
+
+def apply_td_draft(session: SportsSession, draft: DraftPlay) -> str:
+    """Record the TD in GameState after the operator confirms. No extra candidates."""
+    event = GameEvent(
+        type=EventType.TOUCHDOWN,
+        team=draft.team,
+        player=draft.display,
+        quarter=session.state().quarter,
+        payload={"intent": draft.intent or "receiving", "points": 6, "team_key": draft.team_key},
+        source="browse-confirm",
+        raw=f"{draft.player} td {draft.intent or ''}".strip(),
+    )
+    session.ingest(event, evaluate=False)
+    st = session.state()
+    return (
+        f"recorded {draft.display} TD · "
+        f"Q{st.quarter} {st.away} {st.away_score}-{st.home_score} {st.home} · "
+        f"game TDs {st.game_tds}"
+    )
 
 
 def ingest_td_play(
@@ -50,32 +138,17 @@ def ingest_td_play(
     quantity: int = 1,
     auto_arm: bool = True,
 ) -> tuple[list[CandidateBet], str]:
-    tokens = list(query.name_tokens)
-    hits, display = unique_player_rows(rows, tokens)
-    if not display:
-        return [], f"no unique player for {' '.join(tokens)}"
-    first = find_player_first_td(rows, tokens)
-    trigger = first or (hits[0] if hits else None)
-    team = team_abbrev_from_row(trigger, session.state().game_code) if trigger is not None else None
-    team_key = football_team(trigger) if trigger is not None else None
-    event = GameEvent(
-        type=EventType.TOUCHDOWN,
-        team=team,
-        player=display,
-        quarter=session.state().quarter,
-        payload={"intent": query.intent, "points": 6, "team_key": team_key or ""},
-        source="browse-filter",
-        raw=query.raw,
+    """Test helper: preview + optional arm, still does not apply stats."""
+    draft, cands, msg = arm_td_draft(
+        session, rows, query, quantity=quantity, intent=query.intent
     )
-    cands = session.ingest(event)
-    armed_n = 0
-    if auto_arm:
-        for cand in cands:
-            session.arm(cand.candidate_id, quantity=quantity)
-            armed_n += 1
-    msg = format_candidates(cands)
-    if auto_arm:
-        msg += f" · armed {armed_n} (not sent)"
+    if not auto_arm and draft is not None:
+        for armed_id in draft.armed_ids:
+            try:
+                session.arming.disarm(armed_id)
+            except KeyError:
+                pass
+        return cands, format_candidates(cands)
     return cands, msg
 
 
@@ -105,7 +178,7 @@ def ingest_score(session: SportsSession, team: str, points: int) -> str:
         source="timekeeping",
         raw=f"{team} {points}",
     )
-    session.ingest(event)
+    session.ingest(event, evaluate=False)
     st = session.state()
     return f"score {st.away} {st.away_score}-{st.home_score} {st.home}"
 
