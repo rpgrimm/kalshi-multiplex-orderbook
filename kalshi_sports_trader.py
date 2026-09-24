@@ -64,6 +64,17 @@ from typing import Any, Iterable
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+from sports_engine.browse import (
+    catalog_player_names,
+    ingest_quarter_end,
+    ingest_score,
+    ingest_td_play,
+    make_browse_session,
+    parse_time_line,
+)
+from sports_engine.catalog import unique_player_rows
+from sports_engine.play_protocol import parse_play_query, tab_complete_player
+
 PROD_REST_HOST = "https://api.elections.kalshi.com/trade-api/v2"
 PROD_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
 DEMO_REST_HOST = "https://external-api.demo.kalshi.co/trade-api/v2"
@@ -1745,12 +1756,8 @@ def filter_tokens(text: str) -> list[str]:
 
 
 def row_matches_filter(row: MarketRow, filter_text: str) -> bool:
-    """Loose multi-word match: every token must appear somewhere in haystack.
-
-    Example: "patrick mahomes td" matches a market whose title/ticker contains
-    those words in any order (and with other text in between).
-    """
-    tokens = filter_tokens(filter_text)
+    """Name + kind match. Intent tokens (re/ru) are not title search."""
+    tokens = parse_play_query(filter_text).filter_tokens()
     if not tokens:
         return True
     hay = market_haystack(row)
@@ -2083,10 +2090,15 @@ SPORTS TRADER — KEYBOARD HELP (Ctrl-H)
 ======================================
 Modes (vim-style)
   NORMAL             navigate; letters are commands (default)
-  FILTER             type query; all letters/digits/space go to filter>
+  FILTER             type query; Tab completes player names
   f or /             enter FILTER mode
-  Esc / Enter        leave FILTER → NORMAL (keeps query)
-  Ctrl-U             clear filter text
+  Tab                complete player last name (wa → watson)
+  Enter              lock player (stay FILTER) or fire a complete `td rec`
+  `watson td rec`    first TD + QB 1+ pass + this-Q 6.5 (candidates, not sent)
+  `watson td ru`     rush: no QB pass TD
+  t                  TIMEKEEPING: qend ends quarter (NO on missed overs)
+  Esc                leave FILTER/TIME → NORMAL
+  Ctrl-U             clear filter + locked player
 
 NORMAL navigation
   ↑ / k / Ctrl-P     move up
@@ -2140,7 +2152,7 @@ class BrowserState:
     tracker: BackgroundBookTracker
     args: argparse.Namespace
     mode: str = "categories"  # categories | markets | detail | help | orders
-    input_mode: str = "normal"  # normal | filter
+    input_mode: str = "normal"  # normal | filter | time
     category: str = "game_lines"
     filter_text: str = ""
     cursor: int = 0
@@ -2156,6 +2168,10 @@ class BrowserState:
     sell_confirm_ticker: str = ""
     sell_confirm_qty: int = 0
     return_mode: str = "categories"  # mode to restore when leaving orders
+    session: Any = None
+    committed_player: str = ""
+    last_play_raw: str = ""
+    time_text: str = ""
 
     def category_counts(self) -> dict[str, int]:
         counts = {k: 0 for k in CATEGORY_ORDER}
@@ -2217,12 +2233,23 @@ def format_filter_line(state: BrowserState, match_count: int | None = None) -> s
     else:
         unit = "match" if match_count == 1 else "matches"
         count_bit = f"  · {match_count} {unit}"
+    q = parse_play_query(needle)
+    intent_bit = ""
+    if q.intent == "rush":
+        intent_bit = "  · RUSH"
+    elif q.intent == "receiving":
+        intent_bit = "  · REC"
+    play_bit = f"  · player {state.committed_player}" if state.committed_player else ""
+    if state.input_mode == "time":
+        return f"TIME> {state.time_text}█  · qend · gb 7 · Esc normal"
     if filtering:
-        # Block caret so typed chars are obvious; real tty cursor parks here too.
-        return f"FILTER> {needle}█{count_bit}  · Esc/Enter normal · Ctrl-U clear"
+        return (
+            f"FILTER> {needle}█{count_bit}{intent_bit}{play_bit}  "
+            f"· Tab name · Enter lock player · td rec"
+        )
     if needle:
-        return f"filter: {needle}{count_bit}  · f filter · Ctrl-U clear · NORMAL"
-    return f"filter: (empty){count_bit}  · f filter · NORMAL"
+        return f"filter: {needle}{count_bit}{intent_bit}{play_bit}  · f filter · Ctrl-U clear · NORMAL"
+    return f"filter: (empty){count_bit}  · f filter · t time · NORMAL"
 
 
 def enter_filter_mode(state: BrowserState, *, jump_all: bool = False) -> None:
@@ -2241,7 +2268,8 @@ def enter_filter_mode(state: BrowserState, *, jump_all: bool = False) -> None:
 
 def leave_filter_mode(state: BrowserState) -> None:
     state.input_mode = "normal"
-    state.message = ""
+    if not state.message:
+        state.message = ""
 
 
 def clear_filter(state: BrowserState) -> None:
@@ -2249,6 +2277,114 @@ def clear_filter(state: BrowserState) -> None:
     state.cursor = 0
     state.offset = 0
     state.message = ""
+    state.committed_player = ""
+    state.last_play_raw = ""
+    state.time_text = ""
+
+
+def _play_quantity(state: BrowserState) -> int:
+    return effective_count_yes(state.args)
+
+
+def maybe_fire_td_play(state: BrowserState) -> None:
+    if state.session is None:
+        return
+    q = parse_play_query(state.filter_text)
+    if not q.is_complete_td():
+        return
+    if q.raw == state.last_play_raw:
+        return
+    _cands, msg = ingest_td_play(
+        state.session,
+        state.rows,
+        q,
+        quantity=_play_quantity(state),
+        auto_arm=True,
+    )
+    state.last_play_raw = q.raw
+    state.committed_player = " ".join(q.name_tokens)
+    state.message = msg
+
+
+def handle_filter_tab(state: BrowserState) -> None:
+    names = catalog_player_names(state.rows)
+    new_text, hits = tab_complete_player(state.filter_text, names)
+    state.filter_text = new_text
+    state.cursor = 0
+    state.offset = 0
+    if len(hits) == 1:
+        state.committed_player = hits[0]
+        if not state.filter_text.endswith(" "):
+            state.filter_text += " "
+        state.message = f"player {hits[0]} · type td rec / td ru"
+    elif hits:
+        state.message = "tab: " + ", ".join(hits[:8])
+    else:
+        state.message = "no name match"
+    if state.mode == "categories":
+        open_category(state, "all")
+
+
+def handle_filter_enter(state: BrowserState) -> None:
+    q = parse_play_query(state.filter_text)
+    if q.is_complete_td():
+        maybe_fire_td_play(state)
+        leave_filter_mode(state)
+        return
+    if q.name_tokens and q.kind is None and q.intent is None:
+        hits, display = unique_player_rows(state.rows, q.name_tokens)
+        if display:
+            last = display.split()[-1]
+            state.committed_player = last
+            state.filter_text = last + " "
+            state.message = f"player {display} · type td rec / td ru"
+            return
+        handle_filter_tab(state)
+        if state.committed_player:
+            return
+        return
+    leave_filter_mode(state)
+
+
+def enter_time_mode(state: BrowserState) -> None:
+    state.input_mode = "time"
+    state.time_text = ""
+    st = state.session.state() if state.session is not None else None
+    if st is not None:
+        state.message = (
+            f"TIME Q{st.quarter} {st.away} {st.away_score}-{st.home_score} {st.home} "
+            f"· qend · {st.away.lower()} 7"
+        )
+    else:
+        state.message = "TIME · qend · team score"
+
+
+def handle_time_enter(state: BrowserState) -> None:
+    if state.session is None:
+        state.input_mode = "normal"
+        return
+    parsed = parse_time_line(state.time_text, state.session)
+    if parsed is None:
+        state.message = "time: qend | q 2 | gb 7"
+        return
+    kind, rest = parsed
+    qty = _play_quantity(state)
+    if kind == "qend":
+        _cands, msg = ingest_quarter_end(state.session, quantity=qty, auto_arm=True)
+        state.message = msg
+        state.time_text = ""
+    elif kind == "quarter":
+        from sports_engine.models import EventType, GameEvent
+
+        session = state.session
+        session.ingest(GameEvent(type=EventType.QUARTER, quarter=int(rest), source="timekeeping"))
+        st = session.state()
+        state.message = f"quarter Q{st.quarter}"
+        state.time_text = ""
+    elif kind == "score":
+        team, pts = rest.split()
+        state.message = ingest_score(state.session, team, int(pts))
+        state.time_text = ""
 
 
 def append_filter_char(state: BrowserState, ch: str) -> None:
@@ -2260,6 +2396,7 @@ def append_filter_char(state: BrowserState, ch: str) -> None:
     # Typing from categories with an active filter jumps into All markets.
     if state.mode == "categories":
         open_category(state, "all")
+    maybe_fire_td_play(state)
 
 
 def render_browser(state: BrowserState) -> None:
@@ -2282,11 +2419,23 @@ def render_browser(state: BrowserState) -> None:
         match_count = sum(1 for row in state.rows if row_matches_filter(row, state.filter_text))
 
     lines: list[str] = []
-    mode_tag = "FILTER" if state.input_mode == "filter" else "NORMAL"
+    if state.input_mode == "filter":
+        mode_tag = "FILTER"
+    elif state.input_mode == "time":
+        mode_tag = "TIME"
+    else:
+        mode_tag = "NORMAL"
     lines.append(
         f"{state.seed_series}-{state.game_code}   markets={len(state.rows)}   "
         f"{mode_tag}   {ws_line}"
     )
+    if state.session is not None:
+        st = state.session.state()
+        n_arm = len(state.session.arming.armed_bets())
+        lines.append(
+            f"Q{st.quarter}  {st.away} {st.away_score}-{st.home_score} {st.home}  "
+            f"thisQ {st.points_this_quarter}  | armed {n_arm}"
+        )
     filter_line_idx = len(lines)  # 0-based index in lines; terminal row = idx + 1
     filter_line = format_filter_line(state, match_count)
     lines.append(filter_line)
@@ -2433,9 +2582,12 @@ def render_browser(state: BrowserState) -> None:
     sys.stdout.write("\n".join(lines) + "\n")
     # Park the real terminal cursor on the filter caret only in FILTER mode.
     if state.input_mode == "filter" and state.mode in {"categories", "markets"}:
-        # "FILTER> " prefix is 8 chars; caret sits on the █ after needle.
-        caret_col = 8 + len(state.filter_text) + 1  # 1-based columns
-        caret_row = filter_line_idx + 1  # 1-based rows after clear+home
+        caret_col = 8 + len(state.filter_text) + 1
+        caret_row = filter_line_idx + 1
+        sys.stdout.write(f"\033[{caret_row};{caret_col}H")
+    elif state.input_mode == "time":
+        caret_col = 6 + len(state.time_text) + 1
+        caret_row = filter_line_idx + 1
         sys.stdout.write(f"\033[{caret_row};{caret_col}H")
     sys.stdout.flush()
 
@@ -2621,6 +2773,9 @@ def handle_back(state: BrowserState) -> bool:
     if state.input_mode == "filter":
         leave_filter_mode(state)
         return False
+    if state.input_mode == "time":
+        state.input_mode = "normal"
+        return False
     if state.mode == "help":
         state.mode = state.prev_mode
         return False
@@ -2717,8 +2872,9 @@ def run_browser(
         rows=rows,
         tracker=tracker,
         args=args,
+        session=make_browse_session(game_code, rows),
         message=(
-            f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · o orders · d detail · L log · f filter · Ctrl-H help"
+            f"NORMAL · / wa Tab watson · td rec · t qend · Enter BUY YES x{count_yes} ({mode}) · Ctrl-H"
         ),
     )
 
@@ -2800,13 +2956,34 @@ def run_browser(
                 clear_filter(state)
                 continue
 
+            if state.input_mode == "time":
+                if kind == "escape":
+                    state.input_mode = "normal"
+                    continue
+                if kind == "enter":
+                    handle_time_enter(state)
+                    continue
+                if kind == "backspace":
+                    state.time_text = state.time_text[:-1]
+                    continue
+                if kind == "ctrl" and value == "u":
+                    state.time_text = ""
+                    continue
+                if kind == "char" and value.isprintable() and value != "\t":
+                    state.time_text += value
+                    continue
+                continue
+
             # ---- FILTER input mode: all printable chars type into the query ----
             if state.input_mode == "filter":
                 if kind == "escape":
                     leave_filter_mode(state)
                     continue
                 if kind == "enter":
-                    leave_filter_mode(state)
+                    handle_filter_enter(state)
+                    continue
+                if kind == "char" and value == "\t":
+                    handle_filter_tab(state)
                     continue
                 if kind == "backspace":
                     if state.filter_text:
@@ -2917,6 +3094,10 @@ def run_browser(
 
             if kind == "char" and value in {"o", "O"} and state.mode != "help":
                 open_orders_page(state)
+                continue
+
+            if kind == "char" and value in {"t", "T"} and state.mode != "help":
+                enter_time_mode(state)
                 continue
 
             if state.mode == "orders" and kind == "char" and value in {"r", "R"}:

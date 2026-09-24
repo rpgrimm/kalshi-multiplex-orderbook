@@ -16,11 +16,11 @@ class ExecutionEngine:
     def trigger_satisfied(self, bet: ArmedBet, game_state: GameState) -> bool:
         if bet.trigger == "total_score > 0":
             return (game_state.away_score + game_state.home_score) > 0
-        # Unknown trigger: do not fire. Explicit arming is not enough by itself
-        # if the trigger string is unrecognized.
-        if not bet.trigger:
+        if bet.trigger.startswith("td:") or bet.trigger == "quarter_end":
             return True
-        return bet.trigger == "always"
+        if not bet.trigger or bet.trigger == "always":
+            return True
+        return False
 
     def evaluate(
         self,

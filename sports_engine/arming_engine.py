@@ -31,6 +31,9 @@ class ArmingEngine:
         cand = self._candidates.get(candidate_id)
         if cand is None:
             raise KeyError(f"unknown candidate {candidate_id}")
+        for existing in self.armed_bets():
+            if existing.market_id == cand.market_id and existing.side == cand.side:
+                return existing
         qty = int(quantity if quantity is not None else (cand.suggested_quantity or 1))
         bet = ArmedBet(
             candidate_id=cand.candidate_id,

@@ -99,6 +99,17 @@ class TeamStats:
 
 
 @dataclass
+class PlayerTdStat:
+    name: str
+    rec_td: int = 0
+    rush_td: int = 0
+
+    @property
+    def total_td(self) -> int:
+        return int(self.rec_td) + int(self.rush_td)
+
+
+@dataclass
 class GameState:
     game_code: str = ""
     away: str = "AWAY"
@@ -110,6 +121,21 @@ class GameState:
     home_stats: TeamStats = field(default_factory=TeamStats)
     event_count: int = 0
     last_event_id: str | None = None
+    last_event: GameEvent | None = None
+    players: dict[str, PlayerTdStat] = field(default_factory=dict)
+    team_rec_tds: dict[str, int] = field(default_factory=dict)
+    away_score_at_q_start: int = 0
+    home_score_at_q_start: int = 0
+
+    @property
+    def game_tds(self) -> int:
+        return int(self.away_stats.touchdowns) + int(self.home_stats.touchdowns)
+
+    @property
+    def points_this_quarter(self) -> int:
+        return (self.away_score + self.home_score) - (
+            self.away_score_at_q_start + self.home_score_at_q_start
+        )
 
     @property
     def away_score(self) -> int:
