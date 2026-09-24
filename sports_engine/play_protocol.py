@@ -7,7 +7,8 @@ from dataclasses import dataclass
 KIND_TD = frozenset({"td", "touchdown", "touchdowns"})
 INTENT_REC = frozenset({"re", "rec", "recv", "receiving"})
 INTENT_RUSH = frozenset({"ru", "rush", "rushing"})
-RESERVED = KIND_TD | INTENT_REC | INTENT_RUSH
+PAT_TOKENS = frozenset({"pat", "xp", "xpt", "extra"})
+RESERVED = KIND_TD | INTENT_REC | INTENT_RUSH | PAT_TOKENS
 
 
 @dataclass(frozen=True)
@@ -15,13 +16,14 @@ class PlayQuery:
     name_tokens: tuple[str, ...]
     kind: str | None  # "td" or None
     intent: str | None  # "receiving" | "rush" | None
+    pat: bool = False
     raw: str = ""
 
     def is_complete_td(self) -> bool:
         return bool(self.name_tokens) and self.kind == "td" and self.intent in {"receiving", "rush"}
 
     def filter_tokens(self) -> list[str]:
-        """Tokens that may AND against market haystack. Never includes re/ru."""
+        """Tokens that may AND against market haystack. Never includes re/ru/pat."""
         toks = list(self.name_tokens)
         if self.kind == "td":
             toks.append("td")
@@ -32,6 +34,7 @@ def parse_play_query(text: str) -> PlayQuery:
     raw = str(text or "")
     intent: str | None = None
     kind: str | None = None
+    pat = False
     name: list[str] = []
     for tok in raw.lower().split():
         if tok in INTENT_REC:
@@ -40,9 +43,11 @@ def parse_play_query(text: str) -> PlayQuery:
             intent = "rush"
         elif tok in KIND_TD:
             kind = "td"
+        elif tok in PAT_TOKENS:
+            pat = True
         else:
             name.append(tok)
-    return PlayQuery(name_tokens=tuple(name), kind=kind, intent=intent, raw=raw)
+    return PlayQuery(name_tokens=tuple(name), kind=kind, intent=intent, pat=pat, raw=raw)
 
 
 def last_token(text: str) -> tuple[str, str]:

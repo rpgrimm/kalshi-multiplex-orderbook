@@ -36,8 +36,13 @@ class GameStateEngine:
 
         if event.type is EventType.SCORE:
             stats = state.team_stats(event.team)
-            if stats is not None and "set" in event.payload:
-                stats.score = max(0, int(event.payload.get("set") or 0))
+            if stats is not None:
+                if "set" in event.payload:
+                    stats.score = max(0, int(event.payload.get("set") or 0))
+                else:
+                    pts = event.points()
+                    if pts:
+                        stats.score += pts
         elif event.type is EventType.QUARTER and event.payload.get("end"):
             away_q = state.away_score - state.away_score_at_q_start
             home_q = state.home_score - state.home_score_at_q_start

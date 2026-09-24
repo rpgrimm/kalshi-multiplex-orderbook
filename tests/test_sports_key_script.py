@@ -109,10 +109,11 @@ class TestKeyScript(unittest.TestCase):
         self.assertGreaterEqual(len(drafts), 2)
         first_ids = {a["ticker"] for a in drafts[0]["armed"]}
         self.assertIn("KXNFLFIRSTTD-26SEP17DETBUF-BUFKSHAKIR10", first_ids)
-        self.assertIn("KXNFL1QTOTAL-26SEP17DETBUF-7", first_ids)
+        self.assertNotIn("KXNFL1QTOTAL-26SEP17DETBUF-7", first_ids)
         self.assertFalse(any("PASSTDS" in t for t in first_ids))
         rec_ids = {a["ticker"] for a in drafts[-1]["armed"]}
         self.assertIn("KXNFLPASSTDS-26SEP17DETBUF-BUFJALLEN17-1", rec_ids)
+        self.assertNotIn("KXNFL1QTOTAL-26SEP17DETBUF-7", rec_ids)
         self.assertEqual(len(confirms), 1)
         sent = {b["ticker"] for b in confirms[0]["would_send"]}
         self.assertEqual(sent, rec_ids)
@@ -135,6 +136,19 @@ class TestKeyScript(unittest.TestCase):
         self.assertEqual(q.intent, "receiving")
         self.assertNotIn("tdre", state.filter_text.lower())
         self.assertIn("td re", state.filter_text.lower())
+
+    def test_script_pat_adds_q_total(self) -> None:
+        state = make_headless_state(
+            seed_series="KXNFLGAME",
+            game_code="26SEP17DETBUF",
+            rows=fixture_rows(),
+            args=args(),
+        )
+        report = run_key_script(state, "/ shakir Enter td Enter re pat Enter")
+        confirms = [e for e in report["log"] if e["event"] == "confirm"]
+        sent = {b["ticker"] for b in confirms[0]["would_send"]}
+        self.assertIn("KXNFL1QTOTAL-26SEP17DETBUF-7", sent)
+        self.assertEqual(report["state"]["away_score"] + report["state"]["home_score"], 7)
 
     def test_script_without_confirm_does_not_change_score(self) -> None:
         state = make_headless_state(

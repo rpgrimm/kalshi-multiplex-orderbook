@@ -36,8 +36,13 @@ def preview_td_cluster(
     game_state: GameState,
     name_tokens: Sequence[str],
     intent: str | None,
+    *,
+    include_pat: bool = False,
 ) -> list[CandidateBet]:
-    """Candidates for the *next* TD. Score/TDs must not have been applied yet."""
+    """Candidates for the *next* TD. Score/TDs must not have been applied yet.
+
+    Quarter 6.5 is omitted until PAT is confirmed (TD alone is 6).
+    """
     hits, display = unique_player_rows(rows, name_tokens)
     if not display:
         return []
@@ -79,8 +84,9 @@ def preview_td_cluster(
             game_code=game_state.game_code,
         )
         add(qb, f"same-team QB {team_rec_next}+ pass TD")
-    qrow = find_q_total(rows, game_state.quarter, 6.5)
-    add(qrow, f"Q{game_state.quarter} over 6.5")
+    if include_pat:
+        qrow = find_q_total(rows, game_state.quarter, 6.5)
+        add(qrow, f"Q{game_state.quarter} over 6.5 (PAT)")
     return out
 
 
@@ -115,4 +121,10 @@ class TdClusterStrategy:
         tk = str(event.payload.get("team_key") or "").lower()
         if tk and intent != "rush":
             rewind.team_rec_tds[tk] = max(0, rewind.team_rec_tds.get(tk, 0) - 1)
-        return preview_td_cluster(self.rows, rewind, tokens, intent)
+        return preview_td_cluster(
+            self.rows,
+            rewind,
+            tokens,
+            intent,
+            include_pat=bool(event.payload.get("pat")),
+        )

@@ -2130,10 +2130,11 @@ Modes (vim-style)
   FILTER             type query; Tab completes player names
   f or /             enter FILTER mode
   Tab                complete player last name (wa → watson)
-  Enter              lock player; after `td` arm First TD+6.5; with a draft, confirm/send
-  `td` then Enter    arm First TD + this-Q 6.5 (no score change yet)
+  Enter              lock player; after `td` arm First TD + 1+; with a draft, confirm/send
+  `td` then Enter    arm First TD + player 1+ (no Q 6.5 yet — TD is only 6)
   then `re`          add same-team QB 1+ pass (once; rec == re)
   then `ru`          rush: drop QB pass
+  then `pat`         PAT good: add this-Q over 6.5
   Enter again        send armed YES legs (dry-run unless --live) and then update score
   t                  TIMEKEEPING: qend ends quarter (NO on missed overs)
   Esc                leave FILTER/TIME → NORMAL
@@ -2304,7 +2305,7 @@ def format_filter_line(state: BrowserState, match_count: int | None = None) -> s
         if state.committed_player:
             return (
                 f"FILTER> {needle}█{count_bit}{play_bit}  "
-                f"· td then Enter to arm · re/ru after"
+                f"· td Enter · re/ru · pat for Q 6.5"
             )
         return (
             f"FILTER> {needle}█{count_bit}  · Tab name · Enter lock player"
@@ -2350,11 +2351,12 @@ def _play_quantity(state: BrowserState) -> int:
 
 
 def _sync_draft_intent(state: BrowserState) -> None:
-    """If a TD draft is open, re/ru updates the QB leg once per intent change."""
+    """If a TD draft is open, re/ru/pat updates legs when those tokens change."""
     if state.session is None or state.draft is None:
         return
     q = parse_play_query(state.filter_text)
-    if q.intent is None or q.intent == state.draft.intent:
+    want_intent = q.intent if q.intent is not None else state.draft.intent
+    if want_intent == state.draft.intent and q.pat == state.draft.pat:
         return
     draft, _cands, msg = arm_td_draft(
         state.session,
@@ -2362,7 +2364,8 @@ def _sync_draft_intent(state: BrowserState) -> None:
         q,
         quantity=_play_quantity(state),
         previous=state.draft,
-        intent=q.intent,
+        intent=want_intent,
+        include_pat=q.pat,
     )
     state.draft = draft
     state.message = msg

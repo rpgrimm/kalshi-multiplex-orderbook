@@ -56,6 +56,8 @@ class TestPlayProtocol(unittest.TestCase):
         self.assertEqual(q.kind, "td")
         self.assertEqual(q.intent, "receiving")
         self.assertEqual(q.filter_tokens(), ["wa", "td"])
+        self.assertTrue(parse_play_query("shakir td rec pat").pat)
+        self.assertEqual(parse_play_query("shakir td rec pat").filter_tokens(), ["shakir", "td"])
         self.assertTrue(parse_play_query("shakir td rec").is_complete_td())
         self.assertFalse(parse_play_query("shakir td").is_complete_td())
 
@@ -74,7 +76,7 @@ class TestPlayProtocol(unittest.TestCase):
         self.assertIsNotNone(draft)
         self.assertIn("KXNFLFIRSTTD-26SEP17DETBUF-BUFKSHAKIR10", ids)
         self.assertIn("KXNFLTD-26SEP17DETBUF-BUFKSHAKIR10-1", ids)
-        self.assertIn("KXNFL1QTOTAL-26SEP17DETBUF-7", ids)
+        self.assertNotIn("KXNFL1QTOTAL-26SEP17DETBUF-7", ids)
         self.assertFalse(any("PASSTDS" in i for i in ids))
         self.assertEqual(session.state().game_tds, 0)
         self.assertEqual(session.state().away_score + session.state().home_score, 0)
@@ -136,8 +138,24 @@ class TestPlayProtocol(unittest.TestCase):
         ids = {c.market_id for c in cands}
         self.assertIn("KXNFLPASSTDS-26SEP24ATLGB-GBJLOVE10-1", ids)
         self.assertNotIn("KXNFLPASSTDS-26SEP24ATLGB-ATLMRILEY9-1", ids)
-        self.assertIn("KXNFL1QTOTAL-26SEP24ATLGB-7", ids)
+        self.assertNotIn("KXNFL1QTOTAL-26SEP24ATLGB-7", ids)
         self.assertIn("QB pass armed", msg)
+
+    def test_pat_adds_q_total_and_one_point(self) -> None:
+        rows = fixture()
+        session = make_browse_session("26SEP17DETBUF", rows)
+        q = parse_play_query("shakir td re pat")
+        self.assertTrue(q.pat)
+        draft, cands, msg = arm_td_draft(
+            session, rows, q, intent="receiving", include_pat=True
+        )
+        ids = {c.market_id for c in cands}
+        self.assertIn("KXNFL1QTOTAL-26SEP17DETBUF-7", ids)
+        self.assertIn("KXNFLPASSTDS-26SEP17DETBUF-BUFJALLEN17-1", ids)
+        self.assertIn("Q 6.5 armed", msg)
+        assert draft is not None
+        apply_td_draft(session, draft)
+        self.assertEqual(session.state().home_score + session.state().away_score, 7)
 
     def test_rush_omits_qb(self) -> None:
         rows = fixture()

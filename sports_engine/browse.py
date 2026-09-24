@@ -34,6 +34,7 @@ class DraftPlay:
     team: str | None = None
     team_key: str = ""
     display: str = ""
+    pat: bool = False
 
 
 def make_browse_session(game_code: str, rows: Sequence[Any]) -> SportsSession:
@@ -75,6 +76,7 @@ def arm_td_draft(
     quantity: int = 1,
     previous: DraftPlay | None = None,
     intent: str | None = None,
+    include_pat: bool | None = None,
 ) -> tuple[DraftPlay | None, list[CandidateBet], str]:
     """Build/rebuild a draft from current state. Does not apply the TD."""
     tokens = list(query.name_tokens)
@@ -82,13 +84,16 @@ def arm_td_draft(
     if not display:
         return previous, [], f"no unique player for {' '.join(tokens)}"
     use_intent = intent if intent is not None else query.intent
+    use_pat = query.pat if include_pat is None else bool(include_pat)
     if previous is not None:
         for armed_id in previous.armed_ids:
             try:
                 session.arming.disarm(armed_id)
             except KeyError:
                 pass
-    cands = preview_td_cluster(rows, session.state(), tokens, use_intent)
+    cands = preview_td_cluster(
+        rows, session.state(), tokens, use_intent, include_pat=use_pat
+    )
     session.arming.observe(cands)
     armed_ids: list[str] = []
     for cand in cands:
@@ -103,18 +108,19 @@ def arm_td_draft(
         team=team,
         team_key=team_key,
         display=display,
+        pat=use_pat,
     )
     has_qb = any("PASSTDS" in c.market_id.upper() for c in cands)
-    hint = "type re for QB pass · ru for rush · Enter confirms"
+    has_q = any("QTOTAL" in c.market_id.upper() for c in cands)
+    bits = ["type re for QB · pat for Q 6.5 · Enter confirms"]
     if use_intent == "receiving":
-        hint = (
-            "QB pass armed · Enter confirms send"
-            if has_qb
-            else "QB pass NOT found · Enter confirms"
-        )
+        bits = ["QB pass armed" if has_qb else "QB pass NOT found"]
     elif use_intent == "rush":
-        hint = "rush (no QB) · Enter confirms send"
-    return draft, cands, format_candidates(cands, armed=True) + " · " + hint
+        bits = ["rush (no QB)"]
+    if use_pat:
+        bits.append("Q 6.5 armed" if has_q else "Q 6.5 NOT found")
+    bits.append("Enter confirms")
+    return draft, cands, format_candidates(cands, armed=True) + " · " + " · ".join(bits)
 
 
 def apply_td_draft(session: SportsSession, draft: DraftPlay) -> str:
@@ -124,14 +130,31 @@ def apply_td_draft(session: SportsSession, draft: DraftPlay) -> str:
         team=draft.team,
         player=draft.display,
         quarter=session.state().quarter,
-        payload={"intent": draft.intent or "receiving", "points": 6, "team_key": draft.team_key},
+        payload={
+            "intent": draft.intent or "receiving",
+            "points": 6,
+            "team_key": draft.team_key,
+            "pat": draft.pat,
+        },
         source="browse-confirm",
         raw=f"{draft.player} td {draft.intent or ''}".strip(),
     )
     session.ingest(event, evaluate=False)
+    if draft.pat:
+        session.ingest(
+            GameEvent(
+                type=EventType.EXTRA_POINT,
+                team=draft.team,
+                payload={"points": 1},
+                source="browse-confirm",
+                raw="pat",
+            ),
+            evaluate=False,
+        )
     st = session.state()
+    extra = " + PAT" if draft.pat else ""
     return (
-        f"recorded {draft.display} TD · "
+        f"recorded {draft.display} TD{extra} · "
         f"Q{st.quarter} {st.away} {st.away_score}-{st.home_score} {st.home} · "
         f"game TDs {st.game_tds}"
     )
