@@ -1,0 +1,38 @@
+{
+  "id": "first_td_cluster",
+  "title": "First TD cluster",
+  "enabled": true,
+  "trigger": {
+    "series": "KXNFLFIRSTTD",
+    "exclude_title_substrings": ["D/ST", "No Touchdown"]
+  },
+  "legs": [
+    {
+      "id": "player_first_td",
+      "role": "trigger",
+      "action": "buy_yes",
+      "count": "session"
+    },
+    {
+      "id": "qb_1_pass_td",
+      "action": "buy_yes",
+      "count": "session",
+      "required": false,
+      "match": {
+        "series": "KXNFLPASSTDS",
+        "same_team_as_trigger": true,
+        "floor_strike": 0.5
+      }
+    },
+    {
+      "id": "q1_over_6_5",
+      "action": "buy_yes",
+      "count": "session",
+      "required": false,
+      "match": {
+        "series": "KXNFL1QTOTAL",
+        "floor_strike": 6.5
+      }
+    }
+  ]
+}
