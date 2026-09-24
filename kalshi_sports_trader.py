@@ -3151,6 +3151,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--engine-demo",
+        action="store_true",
+        help=(
+            "Run the sports_engine architecture slice (event → state → candidate "
+            "→ arm → mock execution). Skips catalog/browse. Never sends Kalshi orders."
+        ),
+    )
+    p.add_argument(
         "--no-ws",
         action="store_true",
         help="With --browse, do not start the background WebSocket tracker.",
@@ -3260,6 +3268,12 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         eprint(f"error: {exc}")
         return 2
+
+    if bool(getattr(args, "engine_demo", False)):
+        from sports_engine.demo import run_engine_demo
+
+        eprint("--engine-demo: mock execution only (Kalshi orders are not sent)")
+        return run_engine_demo(args, game_code=game_code, seed_series=seed_series)
 
     statuses = normalize_status_filter(args.status)
     league = league_prefix_from_series(seed_series)
