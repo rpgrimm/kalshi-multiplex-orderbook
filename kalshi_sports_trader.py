@@ -2472,6 +2472,8 @@ def handle_filter_enter(state: BrowserState) -> None:
         )
         state.draft = draft
         state.committed_player = " ".join(q.name_tokens)
+        if not state.filter_text.endswith(" "):
+            state.filter_text += " "
         state.message = msg
         _log_script_draft(state)
         return

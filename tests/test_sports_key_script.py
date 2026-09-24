@@ -9,8 +9,9 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from kalshi_sports_trader import MarketRow, make_headless_state, run_key_script
+from kalshi_sports_trader import MarketRow, append_filter_char, make_headless_state, run_key_script
 from sports_engine.key_script import parse_key_script
+from sports_engine.play_protocol import parse_play_query
 from sports_engine.market_cache import load_market_cache, save_market_cache
 
 BUF = "team-buf"
@@ -117,6 +118,23 @@ class TestKeyScript(unittest.TestCase):
         self.assertEqual(sent, rec_ids)
         self.assertEqual(report["state"]["game_tds"], 1)
         self.assertEqual(report["state"]["away_score"] + report["state"]["home_score"], 6)
+
+    def test_td_enter_leaves_space_so_re_is_not_tdre(self) -> None:
+        state = make_headless_state(
+            seed_series="KXNFLGAME",
+            game_code="26SEP17DETBUF",
+            rows=fixture_rows(),
+            args=args(),
+        )
+        run_key_script(state, "/ shakir Enter td Enter")
+        self.assertTrue(state.filter_text.endswith(" "), state.filter_text)
+        append_filter_char(state, "r")
+        append_filter_char(state, "e")
+        q = parse_play_query(state.filter_text)
+        self.assertEqual(q.kind, "td")
+        self.assertEqual(q.intent, "receiving")
+        self.assertNotIn("tdre", state.filter_text.lower())
+        self.assertIn("td re", state.filter_text.lower())
 
     def test_script_without_confirm_does_not_change_score(self) -> None:
         state = make_headless_state(
