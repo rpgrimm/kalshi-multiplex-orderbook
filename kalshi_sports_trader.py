@@ -64,9 +64,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from kalshi_sports_packages import (
+    intent_label,
     load_browse_packages,
     package_for_trigger,
     package_preview_lines,
+    parse_filter_query,
     preview_status_line,
     resolve_package,
     send_summary_line,
@@ -1760,15 +1762,17 @@ def market_haystack(row: MarketRow) -> str:
 
 
 def filter_tokens(text: str) -> list[str]:
-    """Whitespace-split query tokens (order-independent matching)."""
-    return [tok for tok in str(text or "").lower().split() if tok]
+    """Market-match tokens only. `ru`/`re` are package intent, not title match."""
+    market_tokens, _intent = parse_filter_query(text)
+    return market_tokens
 
 
 def row_matches_filter(row: MarketRow, filter_text: str) -> bool:
-    """Loose multi-word match: every token must appear somewhere in haystack.
+    """Loose multi-word match: every market token must appear in haystack.
 
     Example: "patrick mahomes td" matches a market whose title/ticker contains
     those words in any order (and with other text in between).
+    Intent tokens `ru`/`re` are stripped so "watson td ru" still hits First TD.
     """
     tokens = filter_tokens(filter_text)
     if not tokens:
@@ -2136,7 +2140,10 @@ Orders / exits
 
 Packages
   Detail on a trigger       lists every leg that would be sent (ticker + quote)
-  Enter on player First TD  arm cluster (that player + same-team QB 1+ pass TD + over 6.5 1Q)
+  Filter `ru` / `re`        rush vs receiving TD intent (does not have to match title)
+  `watson td ru`            First TD + 6.5 1Q; omit QB 1+ pass TD
+  `watson td re`            First TD + same-team QB 1+ pass TD + 6.5 1Q
+  Enter on player First TD  arm cluster (legs depend on ru/re; default keeps QB pass)
   Enter again               send all resolved legs (session --count-yes)
   1 while armed             send the trigger market only
   Esc / other               cancel arm; no orders
@@ -2251,11 +2258,23 @@ def format_filter_line(state: BrowserState, match_count: int | None = None) -> s
     else:
         unit = "match" if match_count == 1 else "matches"
         count_bit = f"  · {match_count} {unit}"
+    _market, intent = parse_filter_query(needle)
+    intent_bit = ""
+    if intent == "rush":
+        intent_bit = "  · RUSH"
+    elif intent == "receiving":
+        intent_bit = "  · REC"
     if filtering:
         # Block caret so typed chars are obvious; real tty cursor parks here too.
-        return f"FILTER> {needle}█{count_bit}  · Esc/Enter normal · Ctrl-U clear"
+        return (
+            f"FILTER> {needle}█{count_bit}{intent_bit}  "
+            f"· Esc/Enter normal · Ctrl-U clear"
+        )
     if needle:
-        return f"filter: {needle}{count_bit}  · f filter · Ctrl-U clear · NORMAL"
+        return (
+            f"filter: {needle}{count_bit}{intent_bit}  "
+            f"· f filter · Ctrl-U clear · NORMAL"
+        )
     return f"filter: (empty){count_bit}  · f filter · NORMAL"
 
 
@@ -2561,7 +2580,9 @@ def package_detail_block(state: BrowserState, row: MarketRow) -> list[str]:
     ):
         resolved = state.package_resolved
     else:
-        resolved = resolve_package(pkg, row, state.rows)
+        resolved = resolve_package(
+            pkg, row, state.rows, filter_text=state.filter_text
+        )
     tickers = [
         str(leg.row.ticker)
         for leg in resolved.resolved_legs()
@@ -2572,18 +2593,24 @@ def package_detail_block(state: BrowserState, row: MarketRow) -> list[str]:
     count_yes = effective_count_yes(state.args)
     mode = "LIVE" if state.args.live else "DRY-RUN"
     n_ok = len(resolved.resolved_legs())
+    n_skip = len(resolved.skipped_legs())
     n_all = len(resolved.legs)
+    _market, intent = parse_filter_query(state.filter_text)
     lines = [
-        f"PACKAGE {resolved.package.id}  {n_ok}/{n_all} resolved  "
+        f"PACKAGE {resolved.package.id}  {n_ok}/{n_all} send  "
         f"BUY YES x{count_yes} each ({mode})",
-        f"  {resolved.package.title}",
+        f"  {resolved.package.title}  · intent: {intent_label(intent)}",
     ]
+    if n_skip:
+        lines[-1] += f"  · {n_skip} skipped"
     for i, leg in enumerate(resolved.legs, 1):
         if leg.row is not None:
             q = state.tracker.quote(leg.row.ticker)
             title = short_label(leg.row.title or leg.row.yes_sub_title or "", 52)
             lines.append(f"  {i}. {title}")
             lines.append(f"     {format_quote_cell(q)}  {leg.row.ticker}")
+        elif str(leg.reason or "").startswith("skipped:"):
+            lines.append(f"  {i}. SKIP {leg.id}: {leg.reason}")
         else:
             lines.append(f"  {i}. MISS {leg.id}: {leg.reason or 'unresolved'}")
     return lines
@@ -2613,7 +2640,9 @@ def cancel_package_confirm(
 
 
 def arm_package(state: BrowserState, package: Any, row: MarketRow) -> None:
-    resolved = resolve_package(package, row, state.rows)
+    resolved = resolve_package(
+        package, row, state.rows, filter_text=state.filter_text
+    )
     state.package_confirm = True
     state.package_confirm_id = package.id
     state.package_confirm_ticker = row.ticker

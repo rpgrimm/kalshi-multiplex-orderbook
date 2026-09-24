@@ -18,6 +18,7 @@
       "action": "buy_yes",
       "count": "session",
       "required": false,
+      "omit_when_intent": ["rush"],
       "match": {
         "series": "KXNFLPASSTDS",
         "same_team_as_trigger": true,

@@ -13,6 +13,7 @@ from kalshi_sports_packages import (
     load_packages,
     package_for_trigger,
     package_preview_lines,
+    parse_filter_query,
     resolve_package,
     team_key,
 )
@@ -143,6 +144,8 @@ class TestSportsPackages(unittest.TestCase):
             "qb_1_pass_td",
             "q1_over_6_5",
         ])
+        qb = next(leg for leg in pkg.legs if leg.id == "qb_1_pass_td")
+        self.assertEqual(qb.omit_when_intent, ("rush",))
 
     def test_shakir_resolves_allen_1_and_q1_6_5_not_goff_or_allen_2(self) -> None:
         shakir = self.by_ticker["KXNFLFIRSTTD-26SEP17DETBUF-BUFKSHAKIR10"]
@@ -168,6 +171,48 @@ class TestSportsPackages(unittest.TestCase):
         self.assertIn("KXNFLPASSTDS-26SEP17DETBUF-BUFJALLEN17-1", preview)
         self.assertNotIn("Jared Goff", preview)
         self.assertNotIn("2+ passing", preview)
+
+    def test_filter_intent_tokens_ru_re(self) -> None:
+        self.assertEqual(
+            parse_filter_query("watson td ru"), (["watson", "td"], "rush")
+        )
+        self.assertEqual(
+            parse_filter_query("watson td re"), (["watson", "td"], "receiving")
+        )
+        self.assertEqual(
+            parse_filter_query("td watson rush"), (["td", "watson"], "rush")
+        )
+        # last intent token wins
+        self.assertEqual(parse_filter_query("re ru watson")[1], "rush")
+        self.assertEqual(parse_filter_query("ru re watson")[1], "receiving")
+
+    def test_rush_omits_qb_pass_td(self) -> None:
+        shakir = self.by_ticker["KXNFLFIRSTTD-26SEP17DETBUF-BUFKSHAKIR10"]
+        resolved = resolve_package(
+            self.pkg, shakir, self.rows, filter_text="watson td ru"
+        )
+        tickers = {leg.row.ticker for leg in resolved.resolved_legs()}
+        self.assertEqual(
+            tickers,
+            {
+                "KXNFLFIRSTTD-26SEP17DETBUF-BUFKSHAKIR10",
+                "KXNFL1QTOTAL-26SEP17DETBUF-7",
+            },
+        )
+        skipped_ids = {leg.id for leg in resolved.skipped_legs()}
+        self.assertEqual(skipped_ids, {"qb_1_pass_td"})
+        preview = "\n".join(package_preview_lines(resolved))
+        self.assertIn("SKIP qb_1_pass_td", preview)
+        self.assertNotIn("Josh Allen: 1+", preview)
+
+    def test_receiving_keeps_qb_pass_td(self) -> None:
+        shakir = self.by_ticker["KXNFLFIRSTTD-26SEP17DETBUF-BUFKSHAKIR10"]
+        resolved = resolve_package(
+            self.pkg, shakir, self.rows, filter_text="shakir td re"
+        )
+        tickers = {leg.row.ticker for leg in resolved.resolved_legs()}
+        self.assertIn("KXNFLPASSTDS-26SEP17DETBUF-BUFJALLEN17-1", tickers)
+        self.assertFalse(resolved.skipped_legs())
 
     def test_goff_first_td_resolves_goff_1_not_allen(self) -> None:
         goff = self.by_ticker["KXNFLFIRSTTD-26SEP17DETBUF-DETJGOFF16"]

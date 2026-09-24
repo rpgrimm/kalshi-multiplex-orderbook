@@ -18,6 +18,12 @@ WarnFn = Callable[[str], None]
 USER_PACKAGES_DIR = Path.home() / ".config" / "kalshi-multiplex-orderbook" / "packages"
 EXAMPLES_PACKAGES_REL = Path("examples") / "packages"
 
+# Filter tokens that do not match market text; they select package intent.
+# Last one wins if both appear. `ru` = rush (omit QB pass TD); `re` = receiving.
+RUSH_FILTER_TOKENS = frozenset({"ru", "rush", "rushing"})
+RECEIVING_FILTER_TOKENS = frozenset({"re", "rec", "recv", "receiving"})
+INTENT_FILTER_TOKENS = RUSH_FILTER_TOKENS | RECEIVING_FILTER_TOKENS
+
 # Kalshi game codes are DATE + away + home, e.g. 26SEP17DETBUF / 26SEP14DENKC.
 _GAME_DATE_RE = re.compile(r"^(\d{2}[A-Z]{3}\d{2})([A-Z]+)$")
 
@@ -93,6 +99,7 @@ class PackageLeg:
     role: str | None = None
     required: bool = False
     match: LegMatch | None = None
+    omit_when_intent: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -128,8 +135,19 @@ class ResolvedPackage:
     def resolved_legs(self) -> list[ResolvedLeg]:
         return [leg for leg in self.legs if leg.row is not None]
 
+    def skipped_legs(self) -> list[ResolvedLeg]:
+        return [
+            leg
+            for leg in self.legs
+            if leg.row is None and str(leg.reason or "").startswith("skipped:")
+        ]
+
     def unresolved_legs(self) -> list[ResolvedLeg]:
-        return [leg for leg in self.legs if leg.row is None]
+        return [
+            leg
+            for leg in self.legs
+            if leg.row is None and not str(leg.reason or "").startswith("skipped:")
+        ]
 
     def required_unresolved(self) -> list[ResolvedLeg]:
         return [leg for leg in self.unresolved_legs() if leg.required]
@@ -225,6 +243,13 @@ def _parse_leg(raw: dict[str, Any]) -> PackageLeg:
         )
     elif match_raw is not None:
         raise ValueError(f"leg {leg_id}: match must be an object")
+    omit_raw = raw.get("omit_when_intent") or []
+    if isinstance(omit_raw, str):
+        omit_when = (omit_raw.strip().lower(),) if omit_raw.strip() else ()
+    elif isinstance(omit_raw, list):
+        omit_when = tuple(str(x).strip().lower() for x in omit_raw if str(x).strip())
+    else:
+        raise ValueError(f"leg {leg_id}: omit_when_intent must be a list")
     return PackageLeg(
         id=leg_id,
         action=action,
@@ -232,6 +257,7 @@ def _parse_leg(raw: dict[str, Any]) -> PackageLeg:
         role=role_s,
         required=bool(raw.get("required", False)),
         match=match,
+        omit_when_intent=omit_when,
     )
 
 
@@ -483,6 +509,35 @@ def row_series(row: Any) -> str:
     return ticker_parts(ticker)[0]
 
 
+def parse_filter_query(text: str) -> tuple[list[str], str | None]:
+    """Split filter text into (market_tokens, intent).
+
+    Intent tokens (`ru`/`rush`, `re`/`rec`) are reserved: they do not have to
+    appear in a market title. Last intent token wins. Intent is `rush`,
+    `receiving`, or None.
+    """
+    market: list[str] = []
+    intent: str | None = None
+    for tok in str(text or "").lower().split():
+        if not tok:
+            continue
+        if tok in RUSH_FILTER_TOKENS:
+            intent = "rush"
+        elif tok in RECEIVING_FILTER_TOKENS:
+            intent = "receiving"
+        else:
+            market.append(tok)
+    return market, intent
+
+
+def intent_label(intent: str | None) -> str:
+    if intent == "rush":
+        return "RUSH (omit QB pass TD)"
+    if intent == "receiving":
+        return "RECEIVING (include QB pass TD)"
+    return "default (QB pass ON; type ru or re)"
+
+
 def trigger_matches(package: Package, row: Any) -> bool:
     if not package.enabled:
         return False
@@ -526,9 +581,27 @@ def _match_related_leg(
     return None, f"ambiguous: {len(hits)} matches"
 
 
-def resolve_package(package: Package, trigger_row: Any, rows: Sequence[Any]) -> ResolvedPackage:
+def resolve_package(
+    package: Package,
+    trigger_row: Any,
+    rows: Sequence[Any],
+    *,
+    filter_text: str = "",
+) -> ResolvedPackage:
+    _market_tokens, intent = parse_filter_query(filter_text)
     resolved = ResolvedPackage(package=package, trigger_row=trigger_row, legs=[])
     for leg in package.legs:
+        if intent and intent in leg.omit_when_intent:
+            resolved.legs.append(
+                ResolvedLeg(
+                    id=leg.id,
+                    required=False,
+                    role=leg.role,
+                    row=None,
+                    reason=f"skipped: {intent} TD (no {leg.id})",
+                )
+            )
+            continue
         if (leg.role or "") == "trigger":
             resolved.legs.append(
                 ResolvedLeg(
@@ -572,6 +645,8 @@ def package_preview_lines(resolved: ResolvedPackage) -> list[str]:
             ticker = str(getattr(leg.row, "ticker", "") or "")
             lines.append(f"  {i}. {title or ticker}")
             lines.append(f"     {ticker}")
+        elif str(leg.reason or "").startswith("skipped:"):
+            lines.append(f"  {i}. SKIP {leg.id}: {leg.reason}")
         else:
             lines.append(
                 f"  {i}. MISS {leg.id}: {leg.reason or 'unresolved'}"
@@ -582,23 +657,27 @@ def package_preview_lines(resolved: ResolvedPackage) -> list[str]:
 def preview_status_line(resolved: ResolvedPackage, *, count_yes: int, mode: str) -> str:
     ok_labels: list[str] = []
     missed: list[str] = []
+    skipped: list[str] = []
     for leg in resolved.legs:
         if leg.row is not None:
             ok_labels.append(short_leg_label(leg.row))
+        elif str(leg.reason or "").startswith("skipped:"):
+            skipped.append(leg.id)
         else:
             tag = leg.id if not leg.reason else f"{leg.id} ({leg.reason})"
             missed.append(tag)
     missed_bit = ", ".join(missed) if missed else "none"
+    skip_bit = f" · skip {', '.join(skipped)}" if skipped else ""
     ok_bit = " + ".join(ok_labels) if ok_labels else "(none)"
     req = resolved.required_unresolved()
     if req:
         req_ids = ", ".join(leg.id for leg in req)
         return (
-            f"PKG {resolved.package.id}: {ok_bit} · missed {missed_bit} · "
+            f"PKG {resolved.package.id}: {ok_bit} · missed {missed_bit}{skip_bit} · "
             f"required unresolved ({req_ids}) — cannot send"
         )
     return (
-        f"PKG {resolved.package.id}: {ok_bit} · missed {missed_bit} · "
+        f"PKG {resolved.package.id}: {ok_bit} · missed {missed_bit}{skip_bit} · "
         f"Enter sends BUY YES x{count_yes} ({mode}) · 1=trigger only · Esc cancels"
     )
 
