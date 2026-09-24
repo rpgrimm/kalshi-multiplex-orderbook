@@ -2864,8 +2864,6 @@ def run_browser(
         log_path_disp = ORDER_LOG.path or default_log
     eprint(f"order memory log: {log_path_disp} (no write during submit)")
 
-    count_yes = effective_count_yes(args)
-    mode = "LIVE" if args.live else "DRY-RUN"
     state = BrowserState(
         seed_series=seed_series,
         game_code=game_code,
@@ -2873,9 +2871,6 @@ def run_browser(
         tracker=tracker,
         args=args,
         session=make_browse_session(game_code, rows),
-        message=(
-            f"NORMAL · / wa Tab watson · td rec · t qend · Enter BUY YES x{count_yes} ({mode}) · Ctrl-H"
-        ),
     )
 
     fd = sys.stdin.fileno()
