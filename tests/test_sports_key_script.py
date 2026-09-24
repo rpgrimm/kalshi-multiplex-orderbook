@@ -9,7 +9,14 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from kalshi_sports_trader import MarketRow, append_filter_char, make_headless_state, run_key_script
+from kalshi_sports_trader import (
+    SESSION_BETS,
+    MarketRow,
+    append_filter_char,
+    confirm_td_draft,
+    make_headless_state,
+    run_key_script,
+)
 from sports_engine.key_script import parse_key_script
 from sports_engine.play_protocol import parse_play_query
 from sports_engine.market_cache import load_market_cache, save_market_cache
@@ -149,6 +156,23 @@ class TestKeyScript(unittest.TestCase):
         sent = {b["ticker"] for b in confirms[0]["would_send"]}
         self.assertIn("KXNFL1QTOTAL-26SEP17DETBUF-7", sent)
         self.assertEqual(report["state"]["away_score"] + report["state"]["home_score"], 7)
+
+    def test_dry_confirm_records_qb_leg_without_quotes(self) -> None:
+        SESSION_BETS.bets.clear()
+        state = make_headless_state(
+            seed_series="KXNFLGAME",
+            game_code="26SEP17DETBUF",
+            rows=fixture_rows(),
+            args=args(),
+        )
+        run_key_script(state, "/ shakir Enter td Enter re")
+        state.script_mode = False
+        confirm_td_draft(state)
+        tickers = {b.ticker.upper() for b in SESSION_BETS.bets if b.remaining > 0}
+        self.assertIn("KXNFLFIRSTTD-26SEP17DETBUF-BUFKSHAKIR10", tickers)
+        self.assertIn("KXNFLTD-26SEP17DETBUF-BUFKSHAKIR10-1", tickers)
+        self.assertIn("KXNFLPASSTDS-26SEP17DETBUF-BUFJALLEN17-1", tickers)
+        SESSION_BETS.bets.clear()
 
     def test_script_without_confirm_does_not_change_score(self) -> None:
         state = make_headless_state(

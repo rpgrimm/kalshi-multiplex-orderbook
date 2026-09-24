@@ -1816,6 +1816,9 @@ class NullBookTracker:
     def quote(self, ticker: str) -> QuoteSnap | None:
         return None
 
+    def wait_for_quotes(self, tickers: Iterable[str], timeout: float = 1.5) -> None:
+        return None
+
     def ready_count(self) -> int:
         return 0
 
@@ -2040,6 +2043,18 @@ class BackgroundBookTracker:
         )
         self._quotes[t] = q
         return q
+
+    def wait_for_quotes(self, tickers: Iterable[str], timeout: float = 1.5) -> None:
+        """Block briefly so off-screen confirm legs (QB pass) can get a YES ask."""
+        wanted = [str(t).upper() for t in tickers if t]
+        if not wanted:
+            return
+        deadline = time.time() + max(0.0, float(timeout))
+        while time.time() < deadline:
+            self.ensure_quotes(wanted, force=True)
+            if all((self.quote(t) and self.quote(t).yes_ask is not None) for t in wanted):
+                return
+            time.sleep(0.05)
 
     def ready_count(self) -> int:
         if self.store is None:
@@ -2415,6 +2430,9 @@ def confirm_td_draft(state: BrowserState) -> None:
         tickers = [b.market_id for b in armed]
         if tickers:
             state.tracker.ensure_quotes(tickers, force=True)
+            waiter = getattr(state.tracker, "wait_for_quotes", None)
+            if callable(waiter):
+                waiter(tickers, timeout=1.5)
         state.order_busy = True
         try:
             for bet in armed:
@@ -2423,6 +2441,19 @@ def confirm_td_draft(state: BrowserState) -> None:
                     missed.append(bet.market_id)
                     continue
                 quote = state.tracker.quote(row.ticker)
+                live = bool(getattr(state.args, "live", False))
+                if (quote is None or quote.yes_ask is None) and not live:
+                    SESSION_BETS.record_buy(
+                        ticker=row.ticker,
+                        title=row.title or row.yes_sub_title or "",
+                        count=_play_quantity(state),
+                        limit_cents=None,
+                        live=False,
+                        dry_run=True,
+                        note=f"DRY-RUN BUY YES {row.ticker} (no YES ask yet)",
+                    )
+                    sent += 1
+                    continue
                 ok, status = buy_yes_for_market(args=state.args, row=row, quote=quote)
                 if ok:
                     sent += 1
@@ -2435,6 +2466,11 @@ def confirm_td_draft(state: BrowserState) -> None:
         sent = len(would_send)
         state.script_log.append({"event": "confirm", "would_send": would_send})
     recorded = apply_td_draft(state.session, draft)
+    for armed_id in list(draft.armed_ids):
+        try:
+            state.session.arming.disarm(armed_id)
+        except KeyError:
+            pass
     state.draft = None
     extra = f" · missed {len(missed)}" if missed else ""
     state.message = f"sent {sent}/{len(armed)}{extra} · {recorded}"
