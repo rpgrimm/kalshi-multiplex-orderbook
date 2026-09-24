@@ -65,10 +65,14 @@ from typing import Any, Iterable
 
 from kalshi_sports_game_state import (
     GameState,
+    default_game_state_path,
+    delete_game_state_file,
+    load_game_state,
     parse_play_command,
     parse_score_command,
     resolve_end_quarter_no_bets,
     resolve_play_bets,
+    save_game_state,
 )
 from kalshi_sports_packages import (
     intent_label,
@@ -2264,6 +2268,10 @@ Game state / armed bets
   b                         ARMED BETS page (Enter send all, x drop row)
   Clear filter (Ctrl-U)     then retype the play to record the next TD
   Hidden from list          sent/armed tickers, and all First TD after one is recorded
+  W                         save game state JSON now (also auto-saves on play/score/send)
+  0 then Enter              reset in-memory state and delete the JSON file
+  --fresh-game              ignore saved JSON and start empty
+  File                      ~/.local/share/kalshi-multiplex-orderbook/sports-game-{env}-{game}.json
 
 Packages (market Enter still works)
   Detail on a trigger       lists every leg that would be sent (ticker + quote)
@@ -2323,7 +2331,9 @@ class BrowserState:
     package_confirm_ticker: str = ""
     package_resolved: Any = None
     game: GameState | None = None
+    game_state_path: str = ""
     end_q_confirm: bool = False
+    reset_game_confirm: bool = False
 
     def market_available(self, row: MarketRow) -> bool:
         if self.game is not None and self.game.should_hide_market(row):
@@ -2442,6 +2452,17 @@ def clear_filter(state: BrowserState) -> None:
         state.game.score_set_for_query = False
 
 
+def persist_game_state(state: BrowserState, *, note: str = "") -> str:
+    if state.game is None or not state.game_state_path:
+        return ""
+    try:
+        path = save_game_state(state.game, state.game_state_path)
+    except Exception as exc:  # noqa: BLE001
+        return f"game-state save failed: {exc}"
+    extra = f" ({note})" if note else ""
+    return f"saved{extra} {path}"
+
+
 def maybe_consume_filter_command(state: BrowserState) -> None:
     """If the filter is a play or score command, record/arm it once."""
     game = state.game
@@ -2466,6 +2487,7 @@ def maybe_consume_filter_command(state: BrowserState) -> None:
             tickers = [b.ticker for b in bets]
             if tickers:
                 state.tracker.ensure_quotes(tickers)
+            persist_game_state(state, note="play")
         return
     score = parse_score_command(text, game)
     if score is None:
@@ -2475,6 +2497,7 @@ def maybe_consume_filter_command(state: BrowserState) -> None:
         team, pts = score
         state.message = game.set_score(team, pts)
         game.score_set_for_query = True
+        persist_game_state(state, note="score")
 
 
 def append_filter_char(state: BrowserState, ch: str) -> None:
@@ -3167,7 +3190,26 @@ def submit_armed_bets(state: BrowserState, pending: list | None = None) -> None:
         state.order_busy = False
         state.last_order_ts = time.time()
     extra = f" · missed {len(missed)}" if missed else ""
+    persist_game_state(state, note="send")
     state.message = f"ARMED sent {sent}/{len(pending)}{extra}"
+
+
+def request_reset_game(state: BrowserState) -> None:
+    state.reset_game_confirm = True
+    path = state.game_state_path or "(no file)"
+    state.message = f"RESET game state and delete {path}? Enter yes · Esc/other cancels"
+
+
+def confirm_reset_game(state: BrowserState) -> None:
+    state.reset_game_confirm = False
+    if state.game_state_path:
+        try:
+            delete_game_state_file(state.game_state_path)
+        except Exception as exc:  # noqa: BLE001
+            state.message = f"reset: could not delete file: {exc}"
+            return
+    state.game = GameState.from_game_code(state.game_code)
+    state.message = f"game state cleared · {state.game.header_line()}"
 
 
 def request_end_quarter(state: BrowserState) -> None:
@@ -3195,6 +3237,7 @@ def confirm_end_quarter(state: BrowserState) -> None:
     else:
         qmsg = f"already Q4 · {game.header_line()}"
     n = len(nos)
+    persist_game_state(state, note="end-q")
     state.message = f"ended prior Q · sent {n} BUY NO overs · {qmsg}"
 
 
@@ -3233,6 +3276,10 @@ def handle_back(state: BrowserState) -> bool:
     if state.end_q_confirm:
         state.end_q_confirm = False
         state.message = "end quarter cancelled"
+        return False
+    if state.reset_game_confirm:
+        state.reset_game_confirm = False
+        state.message = "reset cancelled"
         return False
     if state.input_mode == "filter":
         leave_filter_mode(state)
@@ -3345,6 +3392,32 @@ def run_browser(
 
     count_yes = effective_count_yes(args)
     mode = "LIVE" if args.live else "DRY-RUN"
+    env_name = str(getattr(args, "kalshi_env", None) or getattr(args, "env", "prod"))
+    game_path = str(
+        getattr(args, "game_state_file", None)
+        or default_game_state_path(game_code, env_name)
+    )
+    game = GameState.from_game_code(game_code)
+    loaded_note = "fresh game state"
+    if not bool(getattr(args, "fresh_game", False)):
+        try:
+            if Path(game_path).is_file():
+                loaded = load_game_state(game_path)
+                if loaded.game_code and loaded.game_code != game.game_code:
+                    eprint(
+                        f"warning: game-state file is {loaded.game_code}, this session is {game.game_code}; ignoring file"
+                    )
+                else:
+                    game = loaded
+                    loaded_note = f"loaded game state {game_path}"
+        except Exception as exc:  # noqa: BLE001
+            eprint(f"warning: could not load game state {game_path}: {exc}")
+            loaded_note = "fresh game state (load failed)"
+    else:
+        loaded_note = "fresh game state (--fresh-game)"
+    eprint(f"{loaded_note}")
+    eprint(f"game state file: {game_path}  (W save · 0 reset)")
+
     state = BrowserState(
         seed_series=seed_series,
         game_code=game_code,
@@ -3352,9 +3425,10 @@ def run_browser(
         tracker=tracker,
         args=args,
         packages=packages,
-        game=GameState.from_game_code(game_code),
+        game=game,
+        game_state_path=game_path,
         message=(
-            f"NORMAL · / watson td re to ARM · b armed · [ ] quarter · e end Q · o orders · Ctrl-H"
+            f"NORMAL · / watson td re to ARM · b armed · [ ] quarter · e end Q · W save · 0 reset · Ctrl-H"
         ),
     )
 
@@ -3419,6 +3493,14 @@ def run_browser(
                     continue
                 state.end_q_confirm = False
                 state.message = "end quarter cancelled"
+                continue
+
+            if state.reset_game_confirm:
+                if kind == "enter":
+                    confirm_reset_game(state)
+                    continue
+                state.reset_game_confirm = False
+                state.message = "reset cancelled"
                 continue
 
             # Package confirm on markets/detail: Enter sends all; 1 sends trigger.
@@ -3583,12 +3665,20 @@ def run_browser(
 
             if kind == "char" and value == "[" and state.input_mode != "filter" and state.game is not None:
                 state.message = state.game.shift_quarter(-1)
+                persist_game_state(state, note="quarter")
                 continue
             if kind == "char" and value == "]" and state.input_mode != "filter" and state.game is not None:
                 state.message = state.game.shift_quarter(1)
+                persist_game_state(state, note="quarter")
                 continue
             if kind == "char" and value in {"e", "E"} and state.input_mode != "filter" and state.mode != "help":
                 request_end_quarter(state)
+                continue
+            if kind == "char" and value in {"w", "W"} and state.input_mode != "filter" and state.mode != "help":
+                state.message = persist_game_state(state, note="manual") or "no game-state path"
+                continue
+            if kind == "char" and value == "0" and state.input_mode != "filter" and state.mode != "help":
+                request_reset_game(state)
                 continue
 
             if state.mode == "armed" and kind == "char" and value in {"x", "X"}:
@@ -3596,6 +3686,7 @@ def run_browser(
                     dropped = state.game.drop_armed_at(state.cursor)
                     state.message = f"dropped {dropped.ticker}" if dropped else "nothing to drop"
                     clamp_cursor(state, len(state.game.armed))
+                    persist_game_state(state, note="drop")
                 continue
 
             if state.mode == "orders" and kind == "char" and value in {"r", "R"}:
@@ -3842,6 +3933,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-packages",
         action="store_true",
         help="Disable bet packages; Enter on a market stays single BUY YES.",
+    )
+    p.add_argument(
+        "--game-state-file",
+        default=None,
+        help=(
+            "JSON file for quarter/score/TDs/armed/sent. Default: "
+            "~/.local/share/kalshi-multiplex-orderbook/sports-game-{env}-{game}.json"
+        ),
+    )
+    p.add_argument(
+        "--fresh-game",
+        action="store_true",
+        help="Ignore any saved game-state JSON and start empty (does not delete the file).",
     )
     p.add_argument(
         "--no-ws",

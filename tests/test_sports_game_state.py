@@ -8,10 +8,12 @@ from types import SimpleNamespace
 
 from kalshi_sports_game_state import (
     GameState,
+    load_game_state,
     parse_play_command,
     parse_score_command,
     resolve_end_quarter_no_bets,
     resolve_play_bets,
+    save_game_state,
 )
 
 BUF = "f9acd396-ba35-4cae-a431-a44b2af707b0"
@@ -148,6 +150,24 @@ class TestGameState(unittest.TestCase):
         self.assertFalse(self.state.should_hide_market(goff_pass))
         self.state.mark_sent(shakir_1.ticker)
         self.assertTrue(self.state.should_hide_market(shakir_1))
+
+    def test_game_state_roundtrip_file(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        resolve_play_bets(
+            state=self.state, rows=self.rows, player_tokens=["shakir"], intent="receiving"
+        )
+        self.state.set_score("BUF", 7)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "game.json"
+            save_game_state(self.state, path)
+            loaded = load_game_state(path)
+        self.assertEqual(loaded.game_tds, 1)
+        self.assertEqual(loaded.home_score, 7)
+        self.assertTrue(loaded.armed)
+        first = next(r for r in self.rows if "FIRSTTD" in r.ticker and "SHAKIR" in r.ticker)
+        self.assertTrue(loaded.should_hide_market(first))
 
 
 if __name__ == "__main__":

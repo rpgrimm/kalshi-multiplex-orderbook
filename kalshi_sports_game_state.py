@@ -8,7 +8,9 @@ quarter's over-totals that did not hit.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Sequence
 
 from kalshi_sports_packages import (
@@ -226,6 +228,114 @@ class GameState:
         if ticker and self.has_armed_or_sent(ticker):
             return True
         return False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "game_code": self.game_code,
+            "away": self.away,
+            "home": self.home,
+            "quarter": self.quarter,
+            "away_score": self.away_score,
+            "home_score": self.home_score,
+            "away_score_at_q_start": self.away_score_at_q_start,
+            "home_score_at_q_start": self.home_score_at_q_start,
+            "game_tds": self.game_tds,
+            "team_rec_tds": dict(self.team_rec_tds),
+            "players": {k: asdict(v) for k, v in self.players.items()},
+            "armed": [asdict(b) for b in self.armed],
+            "sent_tickers": sorted(self.sent_tickers),
+            "plays": list(self.plays),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "GameState":
+        game_code = str(data.get("game_code") or "")
+        state = cls.from_game_code(game_code)
+        if data.get("away"):
+            state.away = str(data["away"]).upper()
+        if data.get("home"):
+            state.home = str(data["home"]).upper()
+        state.quarter = max(1, min(4, int(data.get("quarter") or 1)))
+        state.away_score = int(data.get("away_score") or 0)
+        state.home_score = int(data.get("home_score") or 0)
+        state.away_score_at_q_start = int(data.get("away_score_at_q_start") or 0)
+        state.home_score_at_q_start = int(data.get("home_score_at_q_start") or 0)
+        state.game_tds = int(data.get("game_tds") or 0)
+        rec = data.get("team_rec_tds") or {}
+        if isinstance(rec, dict):
+            state.team_rec_tds = {str(k): int(v) for k, v in rec.items()}
+        players = data.get("players") or {}
+        if isinstance(players, dict):
+            out: dict[str, PlayerStat] = {}
+            for key, raw in players.items():
+                if not isinstance(raw, dict):
+                    continue
+                out[str(key)] = PlayerStat(
+                    name=str(raw.get("name") or key),
+                    key=str(raw.get("key") or key),
+                    rec_td=int(raw.get("rec_td") or 0),
+                    rush_td=int(raw.get("rush_td") or 0),
+                )
+            state.players = out
+        armed = data.get("armed") or []
+        if isinstance(armed, list):
+            bets: list[ArmedBet] = []
+            for raw in armed:
+                if not isinstance(raw, dict) or not raw.get("ticker"):
+                    continue
+                bets.append(
+                    ArmedBet(
+                        ticker=str(raw.get("ticker") or "").upper(),
+                        title=str(raw.get("title") or ""),
+                        side=str(raw.get("side") or "buy_yes"),
+                        reason=str(raw.get("reason") or ""),
+                        player=str(raw.get("player") or ""),
+                        series=str(raw.get("series") or ""),
+                    )
+                )
+            state.armed = bets
+        sent = data.get("sent_tickers") or []
+        if isinstance(sent, list):
+            state.sent_tickers = {str(x).upper() for x in sent if x}
+        plays = data.get("plays") or []
+        if isinstance(plays, list):
+            state.plays = [str(x) for x in plays]
+        return state
+
+
+def default_game_state_path(game_code: str, kalshi_env: str = "prod") -> Path:
+    code = str(game_code or "game").upper()
+    env = str(kalshi_env or "prod").lower()
+    return (
+        Path.home()
+        / ".local"
+        / "share"
+        / "kalshi-multiplex-orderbook"
+        / f"sports-game-{env}-{code}.json"
+    )
+
+
+def save_game_state(state: GameState, path: str | Path) -> Path:
+    dest = Path(path).expanduser()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(state.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return dest
+
+
+def load_game_state(path: str | Path) -> GameState:
+    src = Path(path).expanduser()
+    data = json.loads(src.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("game state file must be a JSON object")
+    return GameState.from_dict(data)
+
+
+def delete_game_state_file(path: str | Path) -> bool:
+    src = Path(path).expanduser()
+    if not src.is_file():
+        return False
+    src.unlink()
+    return True
 
 
 def parse_score_command(text: str, state: GameState) -> tuple[str, int] | None:
