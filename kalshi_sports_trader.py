@@ -63,6 +63,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from kalshi_sports_game_state import (
+    GameState,
+    parse_play_command,
+    parse_score_command,
+    resolve_end_quarter_no_bets,
+    resolve_play_bets,
+)
 from kalshi_sports_packages import (
     intent_label,
     load_browse_packages,
@@ -806,6 +813,25 @@ def make_buy_yes_limit_payload(
     }
 
 
+def make_buy_no_limit_payload(
+    *,
+    ticker: str,
+    count: int,
+    no_limit_cents: int,
+    time_in_force: str = "immediate_or_cancel",
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "action": "buy",
+        "side": "no",
+        "count": int(count),
+        "type": "limit",
+        "client_order_id": str(uuid.uuid4()),
+        "no_price": clamp_price_cents(no_limit_cents),
+        "time_in_force": time_in_force,
+    }
+
+
 def make_sell_yes_limit_payload(
     *,
     ticker: str,
@@ -832,26 +858,45 @@ def make_event_order_v2_payload(legacy_payload: dict[str, Any]) -> dict[str, Any
         raise ValueError("sports trader currently supports limit orders only")
     action = str(legacy_payload.get("action") or "").lower()
     side = str(legacy_payload.get("side") or "").lower()
-    if side != "yes" or action not in {"buy", "sell"}:
+    if action not in {"buy", "sell"} or side not in {"yes", "no"}:
         raise ValueError(f"unsupported order shape action={action!r} side={side!r}")
-    yes_price = legacy_payload.get("yes_price")
-    if yes_price is None:
-        raise ValueError(f"{action.upper()} YES limit order missing yes_price")
     tif = legacy_payload.get("time_in_force") or "immediate_or_cancel"
     if tif == "GTT":
         tif = "good_till_canceled"
-    # V2 YES book: BUY YES = bid, SELL YES = ask (reduce_only).
+    if action == "buy" and side == "yes":
+        yes_price = legacy_payload.get("yes_price")
+        if yes_price is None:
+            raise ValueError("BUY YES limit order missing yes_price")
+        v2_side = "bid"
+        price_cents = int(yes_price)
+        reduce_only = False
+    elif action == "buy" and side == "no":
+        no_price = legacy_payload.get("no_price")
+        if no_price is None:
+            raise ValueError("BUY NO limit order missing no_price")
+        v2_side = "ask"
+        price_cents = 100 - int(no_price)
+        reduce_only = False
+    elif action == "sell" and side == "yes":
+        yes_price = legacy_payload.get("yes_price")
+        if yes_price is None:
+            raise ValueError("SELL YES limit order missing yes_price")
+        v2_side = "ask"
+        price_cents = int(yes_price)
+        reduce_only = True
+    else:
+        raise ValueError(f"unsupported order shape action={action!r} side={side!r}")
     return {
         "ticker": legacy_payload["ticker"],
         "client_order_id": legacy_payload.get("client_order_id") or str(uuid.uuid4()),
-        "side": "bid" if action == "buy" else "ask",
+        "side": v2_side,
         "count": fixed_contract_count(legacy_payload["count"]),
-        "price": fixed_dollar_price_from_cents(yes_price),
+        "price": fixed_dollar_price_from_cents(price_cents),
         "time_in_force": tif,
         "self_trade_prevention_type": "taker_at_cross",
         "post_only": False,
         "cancel_order_on_pause": False,
-        "reduce_only": action == "sell",
+        "reduce_only": reduce_only,
     }
 
 
@@ -1045,6 +1090,77 @@ def buy_yes_for_market(
             dry_run=False,
             note=msg,
         )
+    return ok, msg
+
+
+def buy_no_for_market(
+    *,
+    args: argparse.Namespace,
+    row: "MarketRow",
+    quote: "QuoteSnap | None",
+) -> tuple[bool, str]:
+    """BUY NO for --count-yes contracts. Dry-run unless --live."""
+    count = effective_count_yes(args)
+    if count <= 0:
+        return False, "ORDER ERROR: --count-yes must be positive"
+    try:
+        resolve_auth_settings(args, required=True)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"ORDER ERROR auth: {exc}"
+    ask = quote.no_ask if quote is not None else None
+    if ask is None:
+        return False, (
+            f"ORDER BLOCKED {row.ticker}: no NO ask yet "
+            "(wait for book / ensure market is on-screen)"
+        )
+    slip = int(getattr(args, "slippage_cents", 1) or 0)
+    limit_cents = clamp_price_cents(int(ask) + slip)
+    legacy = make_buy_no_limit_payload(
+        ticker=row.ticker,
+        count=count,
+        no_limit_cents=limit_cents,
+        time_in_force=str(getattr(args, "time_in_force", "immediate_or_cancel")),
+    )
+    try:
+        v2 = make_event_order_v2_payload(legacy)
+    except Exception as extra:  # noqa: BLE001
+        return False, f"ORDER ERROR payload: {extra}"
+    mode = "LIVE" if args.live else "DRY-RUN"
+    summary = (
+        f"{mode} BUY NO {row.ticker} count={count} "
+        f"ask={fmt_cents(ask)} limit={fmt_cents(limit_cents)} slip=+{slip}c"
+    )
+    ORDER_LOG.record(
+        summary,
+        kind="order_built",
+        detail=f"payload_v2={json.dumps(v2, sort_keys=True)}",
+        ticker=row.ticker,
+        mode=mode,
+        live=bool(args.live),
+        ok=None if args.live else True,
+    )
+    if not args.live:
+        return True, summary + " (not submitted; memory-log)"
+    try:
+        info = signed_json_request(
+            args,
+            method="POST",
+            path="/trade-api/v2/portfolio/events/orders",
+            body=v2,
+            timeout=float(getattr(args, "order_submit_timeout", 10.0)),
+        )
+    except Exception as extra:  # noqa: BLE001
+        fail = f"ORDER FAIL {row.ticker}: {extra}"
+        ORDER_LOG.record(fail, kind="order_error", detail=str(extra), ticker=row.ticker, mode=mode, live=True, ok=False)
+        return False, fail
+    http_status = info.get("http_status")
+    ok = http_status is None or (isinstance(http_status, int) and 200 <= http_status < 300)
+    msg = (
+        f"LIVE OK BUY NO {row.ticker} count={count} limit={fmt_cents(limit_cents)} http={http_status}"
+        if ok
+        else f"LIVE REJECT BUY NO {row.ticker} http={http_status}"
+    )
+    ORDER_LOG.record(msg, kind="order_response", ticker=row.ticker, mode=mode, live=True, ok=ok)
     return ok, msg
 
 
@@ -2138,11 +2254,19 @@ Orders / exits
   Prefer --demo      for first live tests
   L                  show recent memory log + force dump
 
-Packages
+Game state / armed bets
+  Header                    Qn  AWAY a-b HOME  thisQ pts  player TDs  armed N
+  / watson td re            ARM receiving TD (first TD + 1+ TDs + QB 1+ pass + thisQ 6.5)
+  / watson td ru            ARM rushing TD (no QB pass). 2nd `td re` arms 2+ TDs / QB 2+
+  / atl 7  or  gb=14        set that team's score (this game only)
+  [ / ]                     previous / next quarter (no orders)
+  e then Enter              END quarter: BUY NO on thisQ overs that missed, then Q+1
+  b                         ARMED BETS page (Enter send all, x drop row)
+  Clear filter (Ctrl-U)     then retype the play to record the next TD
+
+Packages (market Enter still works)
   Detail on a trigger       lists every leg that would be sent (ticker + quote)
   Filter `ru` / `re`        rush vs receiving TD intent (does not have to match title)
-  `watson td ru`            First TD + 6.5 1Q; omit QB 1+ pass TD
-  `watson td re`            First TD + same-team QB 1+ pass TD + 6.5 1Q
   Enter on player First TD  arm cluster (legs depend on ru/re; default keeps QB pass)
   Enter again               send all resolved legs (session --count-yes)
   1 while armed             send the trigger market only
@@ -2175,7 +2299,7 @@ class BrowserState:
     rows: list[MarketRow]
     tracker: BackgroundBookTracker
     args: argparse.Namespace
-    mode: str = "categories"  # categories | markets | detail | help | orders
+    mode: str = "categories"  # categories | markets | detail | help | orders | armed
     input_mode: str = "normal"  # normal | filter
     category: str = "game_lines"
     filter_text: str = ""
@@ -2197,6 +2321,8 @@ class BrowserState:
     package_confirm_id: str = ""
     package_confirm_ticker: str = ""
     package_resolved: Any = None
+    game: GameState | None = None
+    end_q_confirm: bool = False
 
     def category_counts(self) -> dict[str, int]:
         counts = {k: 0 for k in CATEGORY_ORDER}
@@ -2302,6 +2428,44 @@ def clear_filter(state: BrowserState) -> None:
     state.cursor = 0
     state.offset = 0
     state.message = ""
+    if state.game is not None:
+        state.game.play_armed_for_query = False
+        state.game.score_set_for_query = False
+
+
+def maybe_consume_filter_command(state: BrowserState) -> None:
+    """If the filter is a play or score command, record/arm it once."""
+    game = state.game
+    if game is None:
+        return
+    text = state.filter_text
+    play = parse_play_command(text)
+    if play is None:
+        game.play_armed_for_query = False
+    else:
+        if not game.play_armed_for_query:
+            tokens, intent = play
+            bets, msg = resolve_play_bets(
+                state=game,
+                rows=state.rows,
+                player_tokens=tokens,
+                intent=intent,
+            )
+            game.play_armed_for_query = True
+            if msg:
+                state.message = msg + " · b armed"
+            tickers = [b.ticker for b in bets]
+            if tickers:
+                state.tracker.ensure_quotes(tickers)
+        return
+    score = parse_score_command(text, game)
+    if score is None:
+        game.score_set_for_query = False
+        return
+    if not game.score_set_for_query:
+        team, pts = score
+        state.message = game.set_score(team, pts)
+        game.score_set_for_query = True
 
 
 def append_filter_char(state: BrowserState, ch: str) -> None:
@@ -2313,6 +2477,7 @@ def append_filter_char(state: BrowserState, ch: str) -> None:
     # Typing from categories with an active filter jumps into All markets.
     if state.mode == "categories":
         open_category(state, "all")
+    maybe_consume_filter_command(state)
 
 
 def render_browser(state: BrowserState) -> None:
@@ -2340,6 +2505,8 @@ def render_browser(state: BrowserState) -> None:
         f"{state.seed_series}-{state.game_code}   markets={len(state.rows)}   "
         f"{mode_tag}   {ws_line}"
     )
+    if state.game is not None:
+        lines.append(state.game.header_line())
     filter_line_idx = len(lines)  # 0-based index in lines; terminal row = idx + 1
     filter_line = format_filter_line(state, match_count)
     lines.append(filter_line)
@@ -2497,6 +2664,35 @@ def render_browser(state: BrowserState) -> None:
             lines.append(
                 f"NORMAL · highlight row · Enter arms SELL-ALL exit ({mode}) · r refresh · Esc back · q quit?"
             )
+    elif state.mode == "armed":
+        game = state.game
+        mode = "LIVE" if state.args.live else "DRY-RUN"
+        items = list(game.armed) if game is not None else []
+        lines.append(f"ARMED BETS  ({mode})  {len(items)} queued")
+        lines.append("  Enter send all · x drop row · Esc back")
+        lines.append("")
+        clamp_cursor(state, len(items))
+        if not items:
+            lines.append("  (none)  Type `watson td re` in filter to arm.")
+        else:
+            tickers = [it.ticker for it in items]
+            state.tracker.ensure_quotes(tickers)
+            end = min(len(items), state.offset + state.page_size)
+            for idx in range(state.offset, end):
+                it = items[idx]
+                mark = ">" if idx == state.cursor else " "
+                q = state.tracker.quote(it.ticker)
+                side = "YES" if it.side == "buy_yes" else "NO "
+                lines.append(
+                    f" {mark} BUY {side}  {format_quote_cell(q)}  {short_label(it.title, 40)}"
+                )
+                lines.append(f"      {it.reason}")
+                lines.append(f"      {it.ticker}")
+        lines.append("")
+        if state.end_q_confirm:
+            lines.append("END QUARTER confirm is pending on the previous screen.")
+        else:
+            lines.append(f"NORMAL · Enter sends all armed ({mode}) · x drop · Esc back")
 
     lines.append("")
     clear_screen()
@@ -2895,6 +3091,95 @@ def handle_sell_all(state: BrowserState) -> None:
         state.message = f"{status} · {extra}"
 
 
+def row_by_ticker(state: BrowserState, ticker: str) -> MarketRow | None:
+    t = str(ticker or "").upper()
+    return next((r for r in state.rows if r.ticker.upper() == t), None)
+
+
+def open_armed_page(state: BrowserState) -> None:
+    state.return_mode = state.mode if state.mode not in {"armed", "help"} else state.return_mode
+    state.prev_mode = state.mode if state.mode != "help" else state.prev_mode
+    state.mode = "armed"
+    state.input_mode = "normal"
+    state.cursor = 0
+    state.offset = 0
+    n = len(state.game.armed) if state.game is not None else 0
+    state.message = f"armed bets: {n}"
+
+
+def submit_armed_bets(state: BrowserState, pending: list | None = None) -> None:
+    game = state.game
+    if game is None:
+        state.message = "no game state"
+        return
+    if pending is None:
+        pending = list(game.armed)
+    if not pending:
+        state.message = "no armed bets"
+        return
+    if state.order_busy:
+        state.message = "order already in flight"
+        return
+    now = time.time()
+    if now - state.last_order_ts < 0.35:
+        state.message = "order debounced — wait a moment"
+        return
+    tickers = [b.ticker for b in pending]
+    state.tracker.ensure_quotes(tickers, force=True)
+    sent = 0
+    missed: list[str] = []
+    state.order_busy = True
+    try:
+        for bet in pending:
+            row = row_by_ticker(state, bet.ticker)
+            if row is None:
+                missed.append(bet.ticker)
+                continue
+            quote = state.tracker.quote(row.ticker)
+            if bet.side == "buy_no":
+                ok, status = buy_no_for_market(args=state.args, row=row, quote=quote)
+            else:
+                ok, status = buy_yes_for_market(args=state.args, row=row, quote=quote)
+            if ok:
+                game.mark_sent(bet.ticker)
+                sent += 1
+            else:
+                missed.append(short_label(status, 40))
+    finally:
+        state.order_busy = False
+        state.last_order_ts = time.time()
+    extra = f" · missed {len(missed)}" if missed else ""
+    state.message = f"ARMED sent {sent}/{len(pending)}{extra}"
+
+
+def request_end_quarter(state: BrowserState) -> None:
+    if state.game is None:
+        return
+    state.end_q_confirm = True
+    pts = state.game.points_this_quarter
+    state.message = (
+        f"END Q{state.game.quarter} with {pts} pts this Q? Enter submits BUY NO "
+        f"on overs that missed, then advances quarter. Esc cancels."
+    )
+
+
+def confirm_end_quarter(state: BrowserState) -> None:
+    game = state.game
+    if game is None:
+        state.end_q_confirm = False
+        return
+    nos = resolve_end_quarter_no_bets(state=game, rows=state.rows)
+    state.end_q_confirm = False
+    if nos:
+        submit_armed_bets(state, nos)
+    if game.quarter < 4:
+        qmsg = game.shift_quarter(1)
+    else:
+        qmsg = f"already Q4 · {game.header_line()}"
+    n = len(nos)
+    state.message = f"ended prior Q · sent {n} BUY NO overs · {qmsg}"
+
+
 def handle_enter(state: BrowserState) -> None:
     if state.quit_confirm:
         # Enter confirms quit; caller checks quit_confirm after this.
@@ -2913,6 +3198,8 @@ def handle_enter(state: BrowserState) -> None:
         handle_market_enter(state)
     elif state.mode == "orders":
         handle_sell_all(state)
+    elif state.mode == "armed":
+        submit_armed_bets(state)
     elif state.mode == "help":
         state.mode = state.prev_mode
 
@@ -2924,6 +3211,10 @@ def handle_back(state: BrowserState) -> bool:
         return False
     if state.package_confirm:
         cancel_package_confirm(state)
+        return False
+    if state.end_q_confirm:
+        state.end_q_confirm = False
+        state.message = "end quarter cancelled"
         return False
     if state.input_mode == "filter":
         leave_filter_mode(state)
@@ -2937,6 +3228,13 @@ def handle_back(state: BrowserState) -> bool:
         state.cursor = 0
         state.offset = 0
         state.message = "left orders"
+        return False
+    if state.mode == "armed":
+        state.mode = state.return_mode or "categories"
+        state.input_mode = "normal"
+        state.cursor = 0
+        state.offset = 0
+        state.message = "left armed bets"
         return False
     if state.mode == "detail":
         state.mode = "markets"
@@ -3036,8 +3334,9 @@ def run_browser(
         tracker=tracker,
         args=args,
         packages=packages,
+        game=GameState.from_game_code(game_code),
         message=(
-            f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · o orders · d detail · L log · f filter · Ctrl-H help"
+            f"NORMAL · / watson td re to ARM · b armed · [ ] quarter · e end Q · o orders · Ctrl-H"
         ),
     )
 
@@ -3096,6 +3395,14 @@ def run_browser(
                 cancel_sell_confirm(state)
                 continue
 
+            if state.end_q_confirm:
+                if kind == "enter":
+                    confirm_end_quarter(state)
+                    continue
+                state.end_q_confirm = False
+                state.message = "end quarter cancelled"
+                continue
+
             # Package confirm on markets/detail: Enter sends all; 1 sends trigger.
             if state.package_confirm:
                 if kind == "enter":
@@ -3144,6 +3451,7 @@ def run_browser(
                         state.cursor = 0
                         state.offset = 0
                         state.message = ""
+                        maybe_consume_filter_command(state)
                     else:
                         leave_filter_mode(state)
                     continue
@@ -3201,6 +3509,8 @@ def run_browser(
                 if state.mode == "markets"
                 else len(orders_page_items(state))
                 if state.mode == "orders"
+                else len(state.game.armed) if state.game is not None else 0
+                if state.mode == "armed"
                 else 0
             )
 
@@ -3247,6 +3557,27 @@ def run_browser(
 
             if kind == "char" and value in {"o", "O"} and state.mode != "help":
                 open_orders_page(state)
+                continue
+
+            if kind == "char" and value in {"b", "B"} and state.mode != "help" and state.input_mode != "filter":
+                open_armed_page(state)
+                continue
+
+            if kind == "char" and value == "[" and state.input_mode != "filter" and state.game is not None:
+                state.message = state.game.shift_quarter(-1)
+                continue
+            if kind == "char" and value == "]" and state.input_mode != "filter" and state.game is not None:
+                state.message = state.game.shift_quarter(1)
+                continue
+            if kind == "char" and value in {"e", "E"} and state.input_mode != "filter" and state.mode != "help":
+                request_end_quarter(state)
+                continue
+
+            if state.mode == "armed" and kind == "char" and value in {"x", "X"}:
+                if state.game is not None:
+                    dropped = state.game.drop_armed_at(state.cursor)
+                    state.message = f"dropped {dropped.ticker}" if dropped else "nothing to drop"
+                    clamp_cursor(state, len(state.game.armed))
                 continue
 
             if state.mode == "orders" and kind == "char" and value in {"r", "R"}:
