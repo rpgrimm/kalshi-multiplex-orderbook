@@ -74,6 +74,13 @@ from sports_engine.browse import (
     parse_time_line,
 )
 from sports_engine.catalog import row_series, unique_player_rows
+from sports_engine.key_script import parse_key_script
+from sports_engine.market_cache import (
+    clear_market_cache,
+    default_cache_path,
+    load_market_cache,
+    save_market_cache,
+)
 from sports_engine.play_protocol import parse_play_query, tab_complete_player
 
 PROD_REST_HOST = "https://api.elections.kalshi.com/trade-api/v2"
@@ -1784,6 +1791,35 @@ class QuoteSnap:
     updated_ts: float = 0.0
 
 
+class NullBookTracker:
+    """Headless tracker for --script. No websocket, no quotes."""
+
+    def __init__(self) -> None:
+        self.status = "off"
+        self.error: str | None = None
+        self.subscribed_n = 0
+        self.enabled = False
+        self.auth_label = ""
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+    def poll_status(self) -> None:
+        return None
+
+    def ensure_quotes(self, tickers: Iterable[str], *, force: bool = False) -> None:
+        return None
+
+    def quote(self, ticker: str) -> QuoteSnap | None:
+        return None
+
+    def ready_count(self) -> int:
+        return 0
+
+
 class BackgroundBookTracker:
     """Silently maintain live books over one multiplex WebSocket.
 
@@ -2176,6 +2212,8 @@ class BrowserState:
     last_play_raw: str = ""
     time_text: str = ""
     draft: Any = None
+    script_mode: bool = False
+    script_log: list[dict[str, Any]] = field(default_factory=list)
 
     def market_available(self, row: MarketRow) -> bool:
         if self.session is None:
@@ -2328,6 +2366,24 @@ def _sync_draft_intent(state: BrowserState) -> None:
     )
     state.draft = draft
     state.message = msg
+    _log_script_draft(state)
+
+
+def _log_script_draft(state: BrowserState) -> None:
+    if not state.script_mode or state.session is None:
+        return
+    armed = state.session.arming.armed_bets()
+    state.script_log.append(
+        {
+            "event": "draft",
+            "filter": state.filter_text,
+            "message": state.message,
+            "armed": [
+                {"ticker": b.market_id, "side": b.side.value, "quantity": b.quantity}
+                for b in armed
+            ],
+        }
+    )
 
 
 def confirm_td_draft(state: BrowserState) -> None:
@@ -2338,27 +2394,43 @@ def confirm_td_draft(state: BrowserState) -> None:
         return
     draft = state.draft
     armed = [b for b in state.session.arming.armed_bets() if b.armed_id in set(draft.armed_ids)]
-    tickers = [b.market_id for b in armed]
-    if tickers:
-        state.tracker.ensure_quotes(tickers, force=True)
+    would_send = [
+        {
+            "ticker": b.market_id,
+            "side": b.side.value,
+            "quantity": b.quantity,
+            "reason": next(
+                (c.reason for c in state.session.arming.candidates() if c.candidate_id == b.candidate_id),
+                b.trigger,
+            ),
+        }
+        for b in armed
+    ]
     sent = 0
     missed: list[str] = []
-    state.order_busy = True
-    try:
-        for bet in armed:
-            row = next((r for r in state.rows if r.ticker.upper() == bet.market_id.upper()), None)
-            if row is None:
-                missed.append(bet.market_id)
-                continue
-            quote = state.tracker.quote(row.ticker)
-            ok, status = buy_yes_for_market(args=state.args, row=row, quote=quote)
-            if ok:
-                sent += 1
-            else:
-                missed.append(short_label(status, 40))
-    finally:
-        state.order_busy = False
-        state.last_order_ts = time.time()
+    if not state.script_mode:
+        tickers = [b.market_id for b in armed]
+        if tickers:
+            state.tracker.ensure_quotes(tickers, force=True)
+        state.order_busy = True
+        try:
+            for bet in armed:
+                row = next((r for r in state.rows if r.ticker.upper() == bet.market_id.upper()), None)
+                if row is None:
+                    missed.append(bet.market_id)
+                    continue
+                quote = state.tracker.quote(row.ticker)
+                ok, status = buy_yes_for_market(args=state.args, row=row, quote=quote)
+                if ok:
+                    sent += 1
+                else:
+                    missed.append(short_label(status, 40))
+        finally:
+            state.order_busy = False
+            state.last_order_ts = time.time()
+    else:
+        sent = len(would_send)
+        state.script_log.append({"event": "confirm", "would_send": would_send})
     recorded = apply_td_draft(state.session, draft)
     state.draft = None
     extra = f" · missed {len(missed)}" if missed else ""
@@ -2401,6 +2473,7 @@ def handle_filter_enter(state: BrowserState) -> None:
         state.draft = draft
         state.committed_player = " ".join(q.name_tokens)
         state.message = msg
+        _log_script_draft(state)
         return
     if q.name_tokens and q.kind is None and q.intent is None:
         hits, display = unique_player_rows(state.rows, q.name_tokens)
@@ -2876,6 +2949,83 @@ def handle_back(state: BrowserState) -> bool:
         clear_filter(state)
         return False
     return False
+
+
+def make_headless_state(
+    *,
+    seed_series: str,
+    game_code: str,
+    rows: list[MarketRow],
+    args: argparse.Namespace,
+) -> BrowserState:
+    return BrowserState(
+        seed_series=seed_series,
+        game_code=game_code,
+        rows=rows,
+        tracker=NullBookTracker(),
+        args=args,
+        session=make_browse_session(game_code, rows),
+        mode="markets",
+        category="all",
+        script_mode=True,
+    )
+
+
+def run_key_script(state: BrowserState, script: str) -> dict[str, Any]:
+    """Drive the same FILTER/Enter handlers as --browse. No TTY."""
+    for kind, value in parse_key_script(script):
+        if kind == "slash":
+            enter_filter_mode(state, jump_all=True)
+            continue
+        if kind == "enter":
+            if state.input_mode == "time":
+                handle_time_enter(state)
+            elif state.input_mode == "filter":
+                handle_filter_enter(state)
+            else:
+                handle_enter(state)
+            continue
+        if kind == "escape":
+            handle_back(state)
+            continue
+        if kind == "char" and value == "\t":
+            if state.input_mode == "filter":
+                handle_filter_tab(state)
+            continue
+        if kind == "word":
+            if state.input_mode == "time":
+                if state.time_text and not state.time_text.endswith(" "):
+                    state.time_text += " "
+                state.time_text += value
+                continue
+            if state.input_mode != "filter":
+                enter_filter_mode(state, jump_all=True)
+            if state.filter_text and not state.filter_text.endswith(" "):
+                append_filter_char(state, " ")
+            for ch in value:
+                append_filter_char(state, ch)
+            continue
+        if kind == "char" and state.input_mode == "filter":
+            append_filter_char(state, value)
+    st = state.session.state() if state.session is not None else None
+    return {
+        "script": script,
+        "game_code": state.game_code,
+        "filter": state.filter_text,
+        "message": state.message,
+        "committed_player": state.committed_player,
+        "state": None
+        if st is None
+        else {
+            "quarter": st.quarter,
+            "away": st.away,
+            "home": st.home,
+            "away_score": st.away_score,
+            "home_score": st.home_score,
+            "game_tds": st.game_tds,
+        },
+        "log": list(state.script_log),
+    }
 
 
 def run_browser(
@@ -3407,6 +3557,43 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--cache-market",
+        action="store_true",
+        help=(
+            "Write discovered markets to disk (default: "
+            "~/.local/share/kalshi-multiplex-orderbook/market-cache/{env}-{game}.json)."
+        ),
+    )
+    p.add_argument(
+        "--use-cache",
+        action="store_true",
+        help="Skip REST discovery; load --cache-market file instead.",
+    )
+    p.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Delete the cache file, then discover again unless --use-cache finds nothing.",
+    )
+    p.add_argument(
+        "--cache-file",
+        default=None,
+        help="Override market-cache JSON path.",
+    )
+    p.add_argument(
+        "--script",
+        default=None,
+        help=(
+            "Headless operator script using the same FILTER/Enter handlers, e.g. "
+            "'/ wa Enter td Enter re Enter'. Dumps JSON bets. Implies no TTY. "
+            "Does not submit Kalshi orders."
+        ),
+    )
+    p.add_argument(
+        "--script-file",
+        default=None,
+        help="Read --script text from a file.",
+    )
+    p.add_argument(
         "--no-ws",
         action="store_true",
         help="With --browse, do not start the background WebSocket tracker.",
@@ -3525,6 +3712,14 @@ def main(argv: list[str] | None = None) -> int:
 
     statuses = normalize_status_filter(args.status)
     league = league_prefix_from_series(seed_series)
+    cache_path = Path(args.cache_file) if getattr(args, "cache_file", None) else default_cache_path(
+        game_code, str(args.kalshi_env)
+    )
+    if bool(getattr(args, "clear_cache", False)):
+        if clear_market_cache(cache_path):
+            eprint(f"cleared cache {cache_path}")
+        else:
+            eprint(f"no cache file {cache_path}")
 
     t0 = time.time()
     eprint(
@@ -3534,26 +3729,56 @@ def main(argv: list[str] | None = None) -> int:
     eprint(f"status_filter={'all' if not statuses else ','.join(sorted(statuses))}")
     eprint(f"discovery={args.discovery} scan_all_series={bool(args.scan_all_series)}")
 
-    candidates = build_candidate_series(
-        args.host,
-        league_prefix=league,
-        seed_series=seed_series,
-        explicit_series=args.series or None,
-        include_season_long=bool(args.include_season_long),
-        scan_all_series=bool(args.scan_all_series),
-    )
-    if args.max_series and args.max_series > 0:
-        candidates = candidates[: args.max_series]
-    eprint(f"probing {len(candidates)} series")
+    rows: list[MarketRow] | None = None
+    hits: list[Any] = []
+    errors: list[Any] = []
+    loaded_cache = False
+    use_cache = bool(getattr(args, "use_cache", False))
+    if use_cache and cache_path.is_file():
+        data = load_market_cache(cache_path)
+        rows = []
+        for rec in data.get("markets") or []:
+            if not isinstance(rec, dict):
+                continue
+            row = market_row_from_raw(rec)
+            if row is not None:
+                rows.append(row)
+        hits = sorted({r.series_ticker for r in rows})
+        loaded_cache = True
+        eprint(f"loaded {len(rows)} markets from cache {cache_path}")
+    elif use_cache:
+        eprint(f"error: --use-cache but no file at {cache_path} (run --cache-market first)")
+        return 2
 
-    rows, hits, errors = discover_game_markets(
-        args.host,
-        game_code=game_code,
-        statuses=statuses,
-        candidate_series=candidates,
-        discovery=str(args.discovery),
-        pause_s=max(0.0, float(args.pause)),
-    )
+    if rows is None:
+        candidates = build_candidate_series(
+            args.host,
+            league_prefix=league,
+            seed_series=seed_series,
+            explicit_series=args.series or None,
+            include_season_long=bool(args.include_season_long),
+            scan_all_series=bool(args.scan_all_series),
+        )
+        if args.max_series and args.max_series > 0:
+            candidates = candidates[: args.max_series]
+        eprint(f"probing {len(candidates)} series")
+        rows, hits, errors = discover_game_markets(
+            args.host,
+            game_code=game_code,
+            statuses=statuses,
+            candidate_series=candidates,
+            discovery=str(args.discovery),
+            pause_s=max(0.0, float(args.pause)),
+        )
+        if bool(getattr(args, "cache_market", False)) and rows:
+            save_market_cache(
+                cache_path,
+                rows=rows,
+                game_code=game_code,
+                seed_series=seed_series,
+                kalshi_env=str(args.kalshi_env),
+            )
+            eprint(f"cached {len(rows)} markets → {cache_path}")
     elapsed = time.time() - t0
 
     if not rows:
@@ -3584,6 +3809,30 @@ def main(argv: list[str] | None = None) -> int:
                 elapsed=elapsed,
             )
         return 1
+
+    script_text = getattr(args, "script", None)
+    script_file = getattr(args, "script_file", None)
+    if script_file:
+        script_text = Path(script_file).expanduser().read_text(encoding="utf-8")
+    if script_text:
+        state = make_headless_state(
+            seed_series=seed_series,
+            game_code=game_code,
+            rows=rows,
+            args=args,
+        )
+        report = run_key_script(state, script_text)
+        print(json.dumps(report, indent=2))
+        return 0
+
+    if (
+        bool(getattr(args, "cache_market", False))
+        and not args.browse
+        and not args.watch
+        and not args.json
+    ):
+        print(f"{len(rows)} markets → {cache_path}")
+        return 0
 
     if args.browse:
         # Compact discovery summary on stderr; UI owns the screen.
