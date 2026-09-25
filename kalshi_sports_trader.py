@@ -67,6 +67,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from sports_engine.browse import (
     arm_extra_draft,
     arm_fg_draft,
+    arm_ncaaf_fg_draft,
     arm_ncaaf_td_draft,
     arm_qend_draft,
     arm_td_draft,
@@ -2818,6 +2819,26 @@ def handle_filter_enter(state: BrowserState) -> None:
         state.message = msg
         _log_script_draft(state)
         return
+    if q.kind == "fg" and _college_mode(state) and state.session is not None:
+        st = state.session.state()
+        if not q.name_tokens:
+            state.message = f"fg which team? {st.away.lower()} / {st.home.lower()}"
+            return
+        team = resolve_game_team(q.name_tokens[0], st.away, st.home)
+        if not team:
+            handle_filter_tab(state)
+            return
+        draft, _cands, msg = arm_ncaaf_fg_draft(
+            state.session,
+            state.rows,
+            q,
+            quantity=_play_quantity(state),
+        )
+        state.draft = draft
+        state.filter_text = f"{team.lower()} fg "
+        state.message = msg
+        _log_script_draft(state)
+        return
     if q.kind == "fg" and state.session is not None:
         st = state.session.state()
         if not q.name_tokens:
@@ -3416,6 +3437,7 @@ def run_key_script(state: BrowserState, script: str) -> dict[str, Any]:
 PROMPT_HELP = """
 NCAAF prompt  (no market list, no /)
   f td          arm Florida TD bundle
+  f fg          Florida FG +3 and newly cleared totals
   f td re       receiving (2+ on the next rec)
   f td d        plus D/ST
   pat / 2pt     extra point after a sent TD

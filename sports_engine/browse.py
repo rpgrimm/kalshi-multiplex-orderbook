@@ -178,6 +178,47 @@ def arm_ncaaf_td_draft(
     return draft, cands, format_candidates(cands, armed=True) + " · " + " · ".join(bits)
 
 
+def arm_ncaaf_fg_draft(
+    session: SportsSession,
+    rows: Sequence[Any],
+    query: PlayQuery,
+    *,
+    quantity: int = 1,
+    previous: DraftPlay | None = None,
+) -> tuple[DraftPlay | None, list[CandidateBet], str]:
+    st = session.state()
+    token = query.name_tokens[0] if query.name_tokens else ""
+    team = resolve_game_team(token, st.away, st.home)
+    if not team:
+        return previous, [], f"fg team? {st.away.lower()} or {st.home.lower()}"
+    if previous is not None:
+        for armed_id in previous.armed_ids:
+            try:
+                session.arming.disarm(armed_id)
+            except KeyError:
+                pass
+    cands = preview_extra_overs(
+        rows, st, team, 3, sent=session.sent_markets
+    )
+    session.arming.observe(cands)
+    armed_ids: list[str] = []
+    for cand in cands:
+        bet = session.arm(cand.candidate_id, quantity=quantity)
+        armed_ids.append(bet.armed_id)
+    draft = DraftPlay(
+        player="",
+        name_tokens=(team.lower(),),
+        kind="fg",
+        armed_ids=armed_ids,
+        team=team,
+        team_key=team.lower(),
+        display=team,
+        college=True,
+    )
+    hint = "empty Enter sends" if cands else "no new overs · empty Enter records FG +3"
+    return draft, cands, format_candidates(cands, armed=True) + f" · {team} FG +3 · {hint}"
+
+
 def arm_fg_draft(
     session: SportsSession,
     rows: Sequence[Any],

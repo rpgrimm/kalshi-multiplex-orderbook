@@ -45,6 +45,13 @@ class TestNcaafPrompt(unittest.TestCase):
         # dry-run confirm records session bets
         self.assertNotEqual(orders, ["no orders"])
 
+    def test_f_fg(self) -> None:
+        state = self._state()
+        armed = handle_prompt_line(state, "f fg")
+        self.assertTrue(any(line.startswith("READY ") for line in armed))
+        handle_prompt_line(state, "")
+        self.assertEqual(state.session.state().home_score, 3)
+
     def test_quit(self) -> None:
         state = self._state()
         self.assertEqual(handle_prompt_line(state, "q"), ["quit"])

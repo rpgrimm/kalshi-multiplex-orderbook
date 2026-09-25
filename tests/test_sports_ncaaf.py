@@ -12,9 +12,11 @@ from sports_engine.models import EventType, GameEvent
 from sports_engine.browse import (
     apply_extra_draft,
     apply_extra_miss,
+    apply_fg_draft,
     apply_qend_draft,
     apply_td_draft,
     arm_extra_draft,
+    arm_ncaaf_fg_draft,
     arm_ncaaf_td_draft,
     arm_qend_draft,
     make_browse_session,
@@ -289,6 +291,19 @@ class TestNcaafTd(unittest.TestCase):
         self.assertEqual(ids.get("KXNCAAF1HTOTAL-26SEP26MISSFLA-14"), "yes")
         self.assertEqual(ids.get("KXNCAAF1HTEAMTOTAL-26SEP26MISSFLA-MISS6"), "yes")
         self.assertTrue(any("2Q" in t for t in ids))
+
+    def test_f_fg_is_plus_3_clears_q25_not_q55(self) -> None:
+        rows = fixture()
+        session = make_browse_session("26SEP26MISSFLA", rows)
+        draft, cands, _ = arm_ncaaf_fg_draft(session, rows, parse_play_query("f fg"))
+        ids = {c.market_id for c in cands}
+        self.assertTrue(any(i.endswith("-3") and "1QTOTAL" in i for i in ids))
+        self.assertFalse(any(i.endswith("-6") and "1QTOTAL" in i for i in ids))
+        self.assertEqual(session.state().home_score, 0)
+        assert draft is not None
+        apply_fg_draft(session, draft)
+        self.assertEqual(session.state().home_score, 3)
+        self.assertIsNone(session.pending_extra_team)
 
 
 if __name__ == "__main__":
