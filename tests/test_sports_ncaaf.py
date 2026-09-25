@@ -8,6 +8,7 @@ import unittest
 from types import SimpleNamespace
 
 from kalshi_sports_trader import make_headless_state, run_key_script
+from sports_engine.models import EventType, GameEvent
 from sports_engine.browse import (
     apply_extra_draft,
     apply_extra_miss,
@@ -56,12 +57,23 @@ def fixture():
         row(f"KXNCAAF1Q-{g}-FLA", "Florida wins the 1st quarter", series="KXNCAAF1Q"),
         row(f"KXNCAAF1Q-{g}-MISS", "Ole Miss wins the 1st quarter", series="KXNCAAF1Q"),
         row(f"KXNCAAF1Q-{g}-TIE", "1st quarter tie", series="KXNCAAF1Q"),
+        row(f"KXNCAAF2Q-{g}-FLA", "Florida wins the 2nd quarter", series="KXNCAAF2Q"),
+        row(f"KXNCAAF2Q-{g}-MISS", "Ole Miss wins the 2nd quarter", series="KXNCAAF2Q"),
+        row(f"KXNCAAF2Q-{g}-TIE", "2nd quarter tie", series="KXNCAAF2Q"),
         row(f"KXNCAAF1QSPREAD-{g}-FLA3", "Florida wins 1Q by over 2.5 points", series="KXNCAAF1QSPREAD", floor=2.5),
         row(f"KXNCAAF1QSPREAD-{g}-FLA4", "Florida wins 1Q by over 3.5 points", series="KXNCAAF1QSPREAD", floor=3.5),
         row(f"KXNCAAF1QSPREAD-{g}-FLA7", "Florida wins 1Q by over 6.5 points", series="KXNCAAF1QSPREAD", floor=6.5),
         row(f"KXNCAAF1QSPREAD-{g}-FLA8", "Florida wins 1Q by over 7.5 points", series="KXNCAAF1QSPREAD", floor=7.5),
         row(f"KXNCAAF1QSPREAD-{g}-MISS3", "Ole Miss wins 1Q by over 2.5 points", series="KXNCAAF1QSPREAD", floor=2.5),
         row(f"KXNCAAF1QSPREAD-{g}-MISS7", "Ole Miss wins 1Q by over 6.5 points", series="KXNCAAF1QSPREAD", floor=6.5),
+        row(f"KXNCAAF1H-{g}-FLA", "Florida wins the 1st half", series="KXNCAAF1H"),
+        row(f"KXNCAAF1H-{g}-MISS", "Ole Miss wins the 1st half", series="KXNCAAF1H"),
+        row(f"KXNCAAF1H-{g}-TIE", "Tie in the 1st half", series="KXNCAAF1H"),
+        row(f"KXNCAAF1HSPREAD-{g}-FLA5", "Florida wins 1H by over 4.5 points", series="KXNCAAF1HSPREAD", floor=4.5),
+        row(f"KXNCAAF1HSPREAD-{g}-FLA7", "Florida wins 1H by over 6.5 points", series="KXNCAAF1HSPREAD", floor=6.5),
+        row(f"KXNCAAF1HSPREAD-{g}-MISS5", "Ole Miss wins 1H by over 4.5 points", series="KXNCAAF1HSPREAD", floor=4.5),
+        row(f"KXNCAAF1HTOTAL-{g}-14", "Over 13.5 1H points scored", series="KXNCAAF1HTOTAL", floor=13.5),
+        row(f"KXNCAAF1HTEAMTOTAL-{g}-MISS6", "Ole Miss scores over 5.5 1H points", series="KXNCAAF1HTEAMTOTAL", floor=5.5),
     ]
 
 
@@ -221,6 +233,7 @@ class TestNcaafTd(unittest.TestCase):
         self.assertEqual(ids.get("KXNCAAF1QSPREAD-26SEP26MISSFLA-MISS3"), "no")
         self.assertEqual(ids.get("KXNCAAF1QTOTAL-26SEP26MISSFLA-6"), "yes")
         self.assertEqual(ids.get("KXNCAAF1QTOTAL-26SEP26MISSFLA-8"), "no")
+        self.assertFalse(any("1HSPREAD" in i or i.startswith("KXNCAAF1H-") for i in ids))
         self.assertEqual(session.state().quarter, 1)
         assert qend is not None
         apply_qend_draft(session, qend)
@@ -238,6 +251,44 @@ class TestNcaafTd(unittest.TestCase):
         confirms = [e for e in report["log"] if e["event"] == "confirm"]
         sent = {b["ticker"] for b in confirms[0]["would_send"]}
         self.assertTrue(any(t.endswith("-TIE") for t in sent))
+
+    def test_q2_end_settles_first_half(self) -> None:
+        rows = fixture()
+        session = make_browse_session("26SEP26MISSFLA", rows)
+        session.ingest(
+            GameEvent(type=EventType.QUARTER, quarter=2, source="test"),
+            evaluate=False,
+        )
+        session.ingest(
+            GameEvent(
+                type=EventType.SCORE,
+                team="MISS",
+                payload={"set": 6},
+                source="test",
+            ),
+            evaluate=False,
+        )
+        session.ingest(
+            GameEvent(
+                type=EventType.SCORE,
+                team="FLA",
+                payload={"set": 14},
+                source="test",
+            ),
+            evaluate=False,
+        )
+        self.assertEqual(session.state().quarter, 2)
+        _draft, cands, msg = arm_qend_draft(session, rows)
+        ids = {c.market_id: c.side.value for c in cands}
+        self.assertIn("1H", msg)
+        self.assertEqual(ids.get("KXNCAAF1H-26SEP26MISSFLA-FLA"), "yes")
+        self.assertEqual(ids.get("KXNCAAF1H-26SEP26MISSFLA-MISS"), "no")
+        self.assertEqual(ids.get("KXNCAAF1H-26SEP26MISSFLA-TIE"), "no")
+        self.assertEqual(ids.get("KXNCAAF1HSPREAD-26SEP26MISSFLA-FLA7"), "yes")
+        self.assertEqual(ids.get("KXNCAAF1HSPREAD-26SEP26MISSFLA-MISS5"), "no")
+        self.assertEqual(ids.get("KXNCAAF1HTOTAL-26SEP26MISSFLA-14"), "yes")
+        self.assertEqual(ids.get("KXNCAAF1HTEAMTOTAL-26SEP26MISSFLA-MISS6"), "yes")
+        self.assertTrue(any("2Q" in t for t in ids))
 
 
 if __name__ == "__main__":

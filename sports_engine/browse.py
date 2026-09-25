@@ -419,7 +419,9 @@ def arm_qend_draft(
         draft,
         cands,
         format_candidates(cands, armed=True)
-        + f" · Q{q} {st.away} {away_q}-{home_q} {st.home} · Enter ends quarter",
+        + f" · Q{q} {st.away} {away_q}-{home_q} {st.home}"
+        + (" · also 1H" if q == 2 else " · also 2H" if q == 4 else "")
+        + " · Enter ends quarter",
     )
 
 
