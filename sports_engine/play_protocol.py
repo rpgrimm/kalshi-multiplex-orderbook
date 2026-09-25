@@ -5,16 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 KIND_TD = frozenset({"td", "touchdown", "touchdowns"})
+KIND_FG = frozenset({"fg", "fieldgoal", "fieldgoals"})
 INTENT_REC = frozenset({"re", "rec", "recv", "receiving"})
 INTENT_RUSH = frozenset({"ru", "rush", "rushing"})
 PAT_TOKENS = frozenset({"pat", "xp", "xpt", "extra"})
-RESERVED = KIND_TD | INTENT_REC | INTENT_RUSH | PAT_TOKENS
+RESERVED = KIND_TD | KIND_FG | INTENT_REC | INTENT_RUSH | PAT_TOKENS
 
 
 @dataclass(frozen=True)
 class PlayQuery:
     name_tokens: tuple[str, ...]
-    kind: str | None  # "td" or None
+    kind: str | None  # "td" | "fg" | None
     intent: str | None  # "receiving" | "rush" | None
     pat: bool = False
     raw: str = ""
@@ -22,11 +23,18 @@ class PlayQuery:
     def is_complete_td(self) -> bool:
         return bool(self.name_tokens) and self.kind == "td" and self.intent in {"receiving", "rush"}
 
+    def is_complete_fg(self) -> bool:
+        return self.kind == "fg" and bool(self.name_tokens)
+
     def filter_tokens(self) -> list[str]:
         """Tokens that may AND against market haystack. Never includes re/ru/pat."""
         toks = list(self.name_tokens)
         if self.kind == "td":
             toks.append("td")
+        if self.kind == "fg":
+            # 1-char team prefix matches the game code (KCMIA) on every ticker.
+            toks = [t for t in toks if len(t) >= 2]
+            toks.append("fg")
         return toks
 
 
@@ -43,6 +51,8 @@ def parse_play_query(text: str) -> PlayQuery:
             intent = "rush"
         elif tok in KIND_TD:
             kind = "td"
+        elif tok in KIND_FG:
+            kind = "fg"
         elif tok in PAT_TOKENS:
             pat = True
         else:

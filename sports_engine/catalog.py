@@ -199,6 +199,62 @@ def find_qb_pass_td(
     return None
 
 
+def resolve_game_team(token: str, away: str, home: str) -> str | None:
+    """Map `m` / `mia` onto this game's abbreviations. Unique prefix only."""
+    tok = str(token or "").strip().upper()
+    if not tok:
+        return None
+    teams = [str(away or "").upper(), str(home or "").upper()]
+    teams = [t for t in teams if t]
+    exact = [t for t in teams if t == tok]
+    if len(exact) == 1:
+        return exact[0]
+    prefixes = [t for t in teams if t.startswith(tok)]
+    if len(prefixes) == 1:
+        return prefixes[0]
+    return None
+
+
+def tab_complete_team(text: str, teams: Sequence[str]) -> tuple[str, list[str]]:
+    from .play_protocol import last_token, RESERVED
+
+    prefix, tok = last_token(text)
+    if tok.lower() in {r.lower() for r in RESERVED}:
+        return text, []
+    needle = tok.lower()
+    labels = []
+    seen: set[str] = set()
+    for team in teams:
+        label = str(team or "").lower()
+        if not label or label in seen:
+            continue
+        if not needle or label.startswith(needle):
+            seen.add(label)
+            labels.append(label)
+    if not tok:
+        return text, labels
+    if len(labels) == 1:
+        return prefix + labels[0], labels
+    return text, labels
+
+
+def find_team_fg(
+    rows: Sequence[Any],
+    team: str,
+    floor: float,
+    game_code: str,
+) -> Any | None:
+    want = str(team or "").upper()
+    hits = [
+        row
+        for row in rows
+        if row_series(row) == "KXNFLFG"
+        and floor_equals(row, floor)
+        and team_abbrev_from_row(row, game_code) == want
+    ]
+    return hits[0] if len(hits) == 1 else None
+
+
 def find_q_total(rows: Sequence[Any], quarter: int, floor: float = 6.5) -> Any | None:
     series = Q_TOTAL_SERIES.get(int(quarter))
     if not series:

@@ -12,6 +12,7 @@ from .catalog import (
     find_player_first_td,
     football_team,
     player_last_names,
+    resolve_game_team,
     team_abbrev_from_row,
     teams_from_game_code,
     unique_player_rows,
@@ -19,6 +20,7 @@ from .catalog import (
 from .models import CandidateBet, EventType, GameEvent
 from .play_protocol import PlayQuery
 from .session import SportsSession
+from .strategies.fg_ladder import FgLadderStrategy, preview_fg_ladder
 from .strategies.quarter_end import QuarterEndStrategy
 from .strategies.td_cluster import TdClusterStrategy, preview_td_cluster
 from .strategy_engine import StrategyEngine
@@ -44,7 +46,7 @@ def make_browse_session(game_code: str, rows: Sequence[Any]) -> SportsSession:
         away=away,
         home=home,
         strategy_engine=StrategyEngine(
-            [TdClusterStrategy(rows), QuarterEndStrategy(rows)]
+            [TdClusterStrategy(rows), FgLadderStrategy(rows), QuarterEndStrategy(rows)]
         ),
     )
 
@@ -121,6 +123,61 @@ def arm_td_draft(
         bits.append("Q 6.5 armed" if has_q else "Q 6.5 NOT found")
     bits.append("Enter confirms")
     return draft, cands, format_candidates(cands, armed=True) + " · " + " · ".join(bits)
+
+
+def arm_fg_draft(
+    session: SportsSession,
+    rows: Sequence[Any],
+    query: PlayQuery,
+    *,
+    quantity: int = 1,
+    previous: DraftPlay | None = None,
+) -> tuple[DraftPlay | None, list[CandidateBet], str]:
+    st = session.state()
+    token = query.name_tokens[0] if query.name_tokens else ""
+    team = resolve_game_team(token, st.away, st.home)
+    if not team:
+        return previous, [], f"fg team? {st.away.lower()} or {st.home.lower()}"
+    if previous is not None:
+        for armed_id in previous.armed_ids:
+            try:
+                session.arming.disarm(armed_id)
+            except KeyError:
+                pass
+    cands = preview_fg_ladder(rows, st, team)
+    session.arming.observe(cands)
+    armed_ids: list[str] = []
+    for cand in cands:
+        bet = session.arm(cand.candidate_id, quantity=quantity)
+        armed_ids.append(bet.armed_id)
+    draft = DraftPlay(
+        player="",
+        name_tokens=(team.lower(),),
+        kind="fg",
+        armed_ids=armed_ids,
+        team=team,
+        team_key=team.lower(),
+        display=team,
+    )
+    hint = "Enter confirms send" if cands else "no FG ladder market"
+    return draft, cands, format_candidates(cands, armed=True) + f" · {team} FG · {hint}"
+
+
+def apply_fg_draft(session: SportsSession, draft: DraftPlay) -> str:
+    event = GameEvent(
+        type=EventType.FIELD_GOAL,
+        team=draft.team,
+        quarter=session.state().quarter,
+        payload={"points": 3, "team_key": draft.team_key},
+        source="browse-confirm",
+        raw=f"fg {draft.team}",
+    )
+    session.ingest(event, evaluate=False)
+    st = session.state()
+    return (
+        f"recorded {draft.team} FG · "
+        f"Q{st.quarter} {st.away} {st.away_score}-{st.home_score} {st.home}"
+    )
 
 
 def apply_td_draft(session: SportsSession, draft: DraftPlay) -> str:

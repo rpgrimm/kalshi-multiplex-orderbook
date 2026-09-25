@@ -65,7 +65,9 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from sports_engine.browse import (
+    arm_fg_draft,
     arm_td_draft,
+    apply_fg_draft,
     apply_td_draft,
     catalog_player_names,
     ingest_quarter_end,
@@ -73,7 +75,7 @@ from sports_engine.browse import (
     make_browse_session,
     parse_time_line,
 )
-from sports_engine.catalog import row_series, unique_player_rows
+from sports_engine.catalog import resolve_game_team, row_series, tab_complete_team, unique_player_rows
 from sports_engine.key_script import parse_key_script
 from sports_engine.market_cache import (
     clear_market_cache,
@@ -2150,6 +2152,7 @@ Modes (vim-style)
   then `re`          add same-team QB 1+ pass (once; rec == re)
   then `ru`          rush: drop QB pass
   then `pat`         PAT good: add this-Q over 6.5
+  `fg m` then Enter  arm this game's team FG ladder (m→MIA, k→KC). Confirm Enter sends.
   Enter again        send armed YES legs (dry-run unless --live) and then update score
   t                  TIMEKEEPING: qend ends quarter (NO on missed overs)
   Esc                leave FILTER/TIME → NORMAL
@@ -2320,7 +2323,7 @@ def format_filter_line(state: BrowserState, match_count: int | None = None) -> s
         if state.committed_player:
             return (
                 f"FILTER> {needle}█{count_bit}{play_bit}  "
-                f"· td Enter · re/ru · pat for Q 6.5"
+                f"· td Enter · re/ru · pat · fg team"
             )
         return (
             f"FILTER> {needle}█{count_bit}  · Tab name · Enter lock player"
@@ -2465,7 +2468,10 @@ def confirm_td_draft(state: BrowserState) -> None:
     else:
         sent = len(would_send)
         state.script_log.append({"event": "confirm", "would_send": would_send})
-    recorded = apply_td_draft(state.session, draft)
+    if draft.kind == "fg":
+        recorded = apply_fg_draft(state.session, draft)
+    else:
+        recorded = apply_td_draft(state.session, draft)
     for armed_id in list(draft.armed_ids):
         try:
             state.session.arming.disarm(armed_id)
@@ -2478,6 +2484,24 @@ def confirm_td_draft(state: BrowserState) -> None:
 
 
 def handle_filter_tab(state: BrowserState) -> None:
+    q = parse_play_query(state.filter_text)
+    if q.kind == "fg" and state.session is not None:
+        st = state.session.state()
+        new_text, hits = tab_complete_team(state.filter_text, [st.away, st.home])
+        state.filter_text = new_text
+        state.cursor = 0
+        state.offset = 0
+        if len(hits) == 1:
+            team = resolve_game_team(hits[0], st.away, st.home) or hits[0].upper()
+            state.filter_text = f"fg {team.lower()} "
+            state.message = f"team {team} · Enter to arm FG"
+        elif hits:
+            state.message = "tab: " + ", ".join(hits)
+        else:
+            state.message = f"fg team? {st.away.lower()} or {st.home.lower()}"
+        if state.mode == "categories":
+            open_category(state, "all")
+        return
     names = catalog_player_names(state.rows)
     new_text, hits = tab_complete_player(state.filter_text, names)
     state.filter_text = new_text
@@ -2500,6 +2524,26 @@ def handle_filter_enter(state: BrowserState) -> None:
     q = parse_play_query(state.filter_text)
     if state.draft is not None:
         confirm_td_draft(state)
+        return
+    if q.kind == "fg" and state.session is not None:
+        st = state.session.state()
+        if not q.name_tokens:
+            state.message = f"fg which team? {st.away.lower()} / {st.home.lower()}"
+            return
+        team = resolve_game_team(q.name_tokens[0], st.away, st.home)
+        if not team:
+            handle_filter_tab(state)
+            return
+        draft, _cands, msg = arm_fg_draft(
+            state.session,
+            state.rows,
+            q,
+            quantity=_play_quantity(state),
+        )
+        state.draft = draft
+        state.filter_text = f"fg {team.lower()} "
+        state.message = msg
+        _log_script_draft(state)
         return
     if q.kind == "td" and q.name_tokens and state.session is not None:
         draft, _cands, msg = arm_td_draft(
