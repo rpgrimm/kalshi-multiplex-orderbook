@@ -13,11 +13,13 @@ from sports_engine.browse import (
     apply_extra_draft,
     apply_extra_miss,
     apply_fg_draft,
+    apply_safety_draft,
     apply_qend_draft,
     apply_td_draft,
     arm_extra_draft,
     arm_ncaaf_fg_draft,
     arm_ncaaf_td_draft,
+    arm_safety_draft,
     arm_qend_draft,
     make_browse_session,
 )
@@ -312,6 +314,27 @@ class TestNcaafTd(unittest.TestCase):
         assert draft is not None
         apply_fg_draft(session, draft)
         self.assertEqual(session.state().home_score, 3)
+        self.assertIsNone(session.pending_extra_team)
+
+    def test_f_saf_is_plus_2(self) -> None:
+        rows = fixture()
+        session = make_browse_session("26SEP26MISSFLA", rows)
+        session.ingest(
+            GameEvent(
+                type=EventType.SCORE,
+                team="FLA",
+                payload={"set": 6},
+                source="test",
+            ),
+            evaluate=False,
+        )
+        draft, cands, _ = arm_safety_draft(session, rows, parse_play_query("f saf"))
+        ids = {c.market_id for c in cands}
+        self.assertTrue(any("1QTOTAL" in i and i.endswith("-8") for i in ids))
+        self.assertEqual(session.state().home_score, 6)
+        assert draft is not None
+        apply_safety_draft(session, draft)
+        self.assertEqual(session.state().home_score, 8)
         self.assertIsNone(session.pending_extra_team)
 
     def test_q4_qend_settles_game_if_not_tied(self) -> None:

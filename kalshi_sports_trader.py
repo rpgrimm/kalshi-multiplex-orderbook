@@ -69,12 +69,14 @@ from sports_engine.browse import (
     arm_fg_draft,
     arm_ncaaf_fg_draft,
     arm_ncaaf_td_draft,
+    arm_safety_draft,
     arm_qend_draft,
     arm_td_draft,
     apply_extra_draft,
     apply_extra_miss,
     apply_fg_draft,
     apply_qend_draft,
+    apply_safety_draft,
     apply_td_draft,
     catalog_player_names,
     ingest_quarter_end,
@@ -2753,6 +2755,8 @@ def confirm_td_draft(state: BrowserState) -> None:
     state.session.mark_sent(b.market_id for b in armed)
     if draft.kind == "fg":
         recorded = apply_fg_draft(state.session, draft)
+    elif draft.kind == "saf":
+        recorded = apply_safety_draft(state.session, draft)
     elif draft.kind == "extra":
         recorded = apply_extra_draft(state.session, draft)
     elif draft.kind == "qend":
@@ -2784,7 +2788,7 @@ def confirm_td_draft(state: BrowserState) -> None:
 def handle_filter_tab(state: BrowserState) -> None:
     q = parse_play_query(state.filter_text)
     if state.session is not None and (
-        q.kind == "fg" or (_college_mode(state) and q.kind in {None, "td", "fg"})
+        q.kind in {"fg", "saf"} or (_college_mode(state) and q.kind in {None, "td", "fg", "saf"})
     ):
         st = state.session.state()
         new_text, hits = tab_complete_team(state.filter_text, [st.away, st.home])
@@ -2921,6 +2925,26 @@ def handle_filter_enter(state: BrowserState) -> None:
         elif q.intent == "defense":
             trail = " d"
         state.filter_text = f"{team.lower()} td{trail} "
+        state.message = msg
+        _log_script_draft(state)
+        return
+    if q.kind == "saf" and state.session is not None:
+        st = state.session.state()
+        if not q.name_tokens:
+            state.message = f"saf which team? {st.away.lower()} / {st.home.lower()}"
+            return
+        team = resolve_game_team(q.name_tokens[0], st.away, st.home)
+        if not team:
+            handle_filter_tab(state)
+            return
+        draft, _cands, msg = arm_safety_draft(
+            state.session,
+            state.rows,
+            q,
+            quantity=_play_quantity(state),
+        )
+        state.draft = draft
+        state.filter_text = f"{team.lower()} saf "
         state.message = msg
         _log_script_draft(state)
         return
@@ -3543,6 +3567,7 @@ PROMPT_HELP = """
 NCAAF prompt  (no market list, no /)
   f td          arm Florida TD bundle
   f fg          Florida FG +3 and newly cleared totals
+  f saf         Florida defense safety +2 and newly cleared totals
   f td re       receiving (2+ on the next rec)
   f td d        plus D/ST
   pat / 2pt     extra point after a sent TD

@@ -219,6 +219,46 @@ def arm_ncaaf_fg_draft(
     return draft, cands, format_candidates(cands, armed=True) + f" · {team} FG +3 · {hint}"
 
 
+def arm_safety_draft(
+    session: SportsSession,
+    rows: Sequence[Any],
+    query: PlayQuery,
+    *,
+    quantity: int = 1,
+    previous: DraftPlay | None = None,
+) -> tuple[DraftPlay | None, list[CandidateBet], str]:
+    st = session.state()
+    token = query.name_tokens[0] if query.name_tokens else ""
+    team = resolve_game_team(token, st.away, st.home)
+    if not team:
+        return previous, [], f"saf team? {st.away.lower()} or {st.home.lower()}"
+    if previous is not None:
+        for armed_id in previous.armed_ids:
+            try:
+                session.arming.disarm(armed_id)
+            except KeyError:
+                pass
+    cands = preview_extra_overs(
+        rows, st, team, 2, sent=session.sent_markets
+    )
+    session.arming.observe(cands)
+    armed_ids: list[str] = []
+    for cand in cands:
+        bet = session.arm(cand.candidate_id, quantity=quantity)
+        armed_ids.append(bet.armed_id)
+    draft = DraftPlay(
+        player="",
+        name_tokens=(team.lower(),),
+        kind="saf",
+        armed_ids=armed_ids,
+        team=team,
+        team_key=team.lower(),
+        display=team,
+    )
+    hint = "empty Enter sends" if cands else "no new overs · empty Enter records safety +2"
+    return draft, cands, format_candidates(cands, armed=True) + f" · {team} SAF +2 · {hint}"
+
+
 def arm_fg_draft(
     session: SportsSession,
     rows: Sequence[Any],
@@ -337,6 +377,23 @@ def apply_extra_miss(session: SportsSession, extra: str) -> str:
     st = session.state()
     return (
         f"recorded {team or '?'} {extra} · "
+        f"Q{st.quarter} {st.away} {st.away_score}-{st.home_score} {st.home}"
+    )
+
+
+def apply_safety_draft(session: SportsSession, draft: DraftPlay) -> str:
+    event = GameEvent(
+        type=EventType.SAFETY,
+        team=draft.team,
+        quarter=session.state().quarter,
+        payload={"points": 2, "team_key": draft.team_key},
+        source="browse-confirm",
+        raw=f"saf {draft.team}",
+    )
+    session.ingest(event, evaluate=False)
+    st = session.state()
+    return (
+        f"recorded {draft.team} safety · "
         f"Q{st.quarter} {st.away} {st.away_score}-{st.home_score} {st.home}"
     )
 

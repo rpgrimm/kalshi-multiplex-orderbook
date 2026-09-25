@@ -45,6 +45,13 @@ class TestNcaafPrompt(unittest.TestCase):
         # dry-run confirm records session bets
         self.assertNotEqual(orders, ["no orders"])
 
+    def test_f_saf(self) -> None:
+        state = self._state()
+        handle_prompt_line(state, "f saf")
+        handle_prompt_line(state, "")
+        self.assertEqual(state.session.state().home_score, 2)
+        self.assertIsNone(state.session.pending_extra_team)
+
     def test_f_fg(self) -> None:
         state = self._state()
         armed = handle_prompt_line(state, "f fg")
