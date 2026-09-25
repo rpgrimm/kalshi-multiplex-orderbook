@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import unittest
 
-from kalshi_sports_trader import handle_prompt_line, make_headless_state
+from kalshi_sports_trader import SESSION_BETS, handle_prompt_line, make_headless_state
 from tests.test_sports_ncaaf import args, fixture
 
 
@@ -44,6 +44,19 @@ class TestNcaafPrompt(unittest.TestCase):
         self.assertTrue(orders[0].startswith("ORDERS") or orders == ["no orders"])
         # dry-run confirm records session bets
         self.assertNotEqual(orders, ["no orders"])
+
+    def test_brute_force_buys_at_97(self) -> None:
+        state = self._state()
+        state.args.brute_force = True
+        before = len(SESSION_BETS.bets)
+        handle_prompt_line(state, "f td")
+        sent = handle_prompt_line(state, "")
+        self.assertTrue(any("brute-force" in line.lower() or "sent" in line.lower() for line in sent))
+        new = SESSION_BETS.bets[before:]
+        self.assertGreater(len(new), 0)
+        self.assertTrue(all(b.limit_cents == 97 for b in new))
+        self.assertTrue(any(b.side == "no" for b in new))
+        self.assertTrue(any(b.side == "yes" for b in new))
 
     def test_f_saf(self) -> None:
         state = self._state()

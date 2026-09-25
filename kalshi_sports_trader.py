@@ -122,6 +122,7 @@ DEFAULT_PRIVATE_KEY_FILE = "grimm.txt"
 DEFAULT_REST_HOST = PROD_REST_HOST
 DEFAULT_WS_URL = PROD_WS_URL
 USER_AGENT = "kalshi-sports-trader/0.4"
+BRUTE_FORCE_CENTS = 97
 
 SEASON_LONG_HINTS = (
     "WINS",
@@ -1091,21 +1092,23 @@ def buy_yes_for_market(
     if count <= 0:
         return False, "ORDER ERROR: --count-yes must be positive"
 
-    # Ensure auth is resolved for both dry-run metadata and live submit.
-    try:
-        resolve_auth_settings(args, required=True)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"ORDER ERROR auth: {exc}"
-
+    brute = bool(getattr(args, "brute_force", False))
+    if args.live or not brute:
+        try:
+            resolve_auth_settings(args, required=True)
+        except Exception as extra:  # noqa: BLE001
+            return False, f"ORDER ERROR auth: {extra}"
     ask = quote.yes_ask if quote is not None else None
-    if ask is None:
-        return False, (
-            f"ORDER BLOCKED {row.ticker}: no YES ask yet "
-            "(wait for book / ensure market is on-screen)"
-        )
-
     slip = int(getattr(args, "slippage_cents", 1) or 0)
-    limit_cents = clamp_price_cents(int(ask) + slip)
+    if brute:
+        limit_cents = clamp_price_cents(BRUTE_FORCE_CENTS)
+    else:
+        if ask is None:
+            return False, (
+                f"ORDER BLOCKED {row.ticker}: no YES ask yet "
+                "(wait for book / ensure market is on-screen)"
+            )
+        limit_cents = clamp_price_cents(int(ask) + slip)
     legacy = make_buy_yes_limit_payload(
         ticker=row.ticker,
         count=count,
@@ -1118,11 +1121,17 @@ def buy_yes_for_market(
         return False, f"ORDER ERROR payload: {exc}"
 
     mode = "LIVE" if args.live else "DRY-RUN"
-    summary = (
-        f"{mode} BUY YES {row.ticker} count={count} "
-        f"ask={fmt_cents(ask)} limit={fmt_cents(limit_cents)} "
-        f"slip=+{slip}c tif={legacy['time_in_force']}"
-    )
+    if brute:
+        summary = (
+            f"{mode} BUY YES {row.ticker} count={count} "
+            f"brute-force limit={fmt_cents(limit_cents)} tif={legacy['time_in_force']}"
+        )
+    else:
+        summary = (
+            f"{mode} BUY YES {row.ticker} count={count} "
+            f"ask={fmt_cents(ask)} limit={fmt_cents(limit_cents)} "
+            f"slip=+{slip}c tif={legacy['time_in_force']}"
+        )
 
     # Memory-only during submit (no disk I/O, no stderr spam that breaks TUI).
     detail = f"payload_v2={json.dumps(v2, sort_keys=True)}"
@@ -1213,15 +1222,20 @@ def buy_no_for_market(
     count = effective_count_yes(args)
     if count <= 0:
         return False, "ORDER ERROR: --count-yes must be positive"
-    try:
-        resolve_auth_settings(args, required=True)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"ORDER ERROR auth: {exc}"
+    brute = bool(getattr(args, "brute_force", False))
+    if args.live or not brute:
+        try:
+            resolve_auth_settings(args, required=True)
+        except Exception as extra:  # noqa: BLE001
+            return False, f"ORDER ERROR auth: {extra}"
     ask = quote.no_ask if quote is not None else None
-    if ask is None:
-        return False, f"ORDER BLOCKED {row.ticker}: no NO ask yet"
     slip = int(getattr(args, "slippage_cents", 1) or 0)
-    limit_cents = clamp_price_cents(int(ask) + slip)
+    if brute:
+        limit_cents = clamp_price_cents(BRUTE_FORCE_CENTS)
+    else:
+        if ask is None:
+            return False, f"ORDER BLOCKED {row.ticker}: no NO ask yet"
+        limit_cents = clamp_price_cents(int(ask) + slip)
     legacy = make_buy_no_limit_payload(
         ticker=row.ticker,
         count=count,
@@ -1233,10 +1247,16 @@ def buy_no_for_market(
     except Exception as exc:  # noqa: BLE001
         return False, f"ORDER ERROR payload: {exc}"
     mode = "LIVE" if args.live else "DRY-RUN"
-    summary = (
-        f"{mode} BUY NO {row.ticker} count={count} "
-        f"ask={fmt_cents(ask)} limit={fmt_cents(limit_cents)}"
-    )
+    if brute:
+        summary = (
+            f"{mode} BUY NO {row.ticker} count={count} "
+            f"brute-force limit={fmt_cents(limit_cents)}"
+        )
+    else:
+        summary = (
+            f"{mode} BUY NO {row.ticker} count={count} "
+            f"ask={fmt_cents(ask)} limit={fmt_cents(limit_cents)}"
+        )
     ORDER_LOG.record(
         summary,
         kind="order_built",
@@ -2753,8 +2773,9 @@ def confirm_td_draft(state: BrowserState) -> None:
     sent = 0
     missed: list[str] = []
     if not state.script_mode:
+        brute = bool(getattr(state.args, "brute_force", False))
         tickers = [b.market_id for b in armed]
-        if tickers:
+        if tickers and not brute:
             state.tracker.ensure_quotes(tickers, force=True)
         state.order_busy = True
         try:
@@ -2769,7 +2790,7 @@ def confirm_td_draft(state: BrowserState) -> None:
                 ask = quote.yes_ask if quote is not None else None
                 if side == "no":
                     ask = quote.no_ask if quote is not None else None
-                if ask is None and not live:
+                if ask is None and not live and not brute:
                     SESSION_BETS.record_buy(
                         ticker=row.ticker,
                         title=row.title or row.yes_sub_title or "",
@@ -4305,7 +4326,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--slippage",
         type=int,
         default=1,
-        help="BUY YES limit = YES ask + this many cents (clamped 1..99). Default: 1",
+        help="BUY limit = ask + this many cents (clamped 1..99). Ignored with --brute-force. Default: 1",
+    )
+    p.add_argument(
+        "--brute-force",
+        action="store_true",
+        help=(
+            f"Skip the orderbook. BUY YES and BUY NO IOC at {BRUTE_FORCE_CENTS}c "
+            "for --count. SELL still prices from the live book."
+        ),
     )
     p.add_argument(
         "--time-in-force",
@@ -4575,10 +4604,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.slippage_cents < 0:
         eprint("error: --slippage-cents must be >= 0")
         return 2
+    brute = bool(getattr(args, "brute_force", False))
+    if brute:
+        eprint(
+            f"BRUTE-FORCE: BUY YES/NO x{effective_count_yes(args)} "
+            f"IOC {BRUTE_FORCE_CENTS}c (no book). SELL still uses the book."
+        )
     if args.live:
         eprint(
             f"LIVE mode: Enter on a market will BUY YES x{effective_count_yes(args)} "
-            f"(ask+{args.slippage_cents}c IOC). Prefer --demo for first tests."
+            + (
+                f"IOC {BRUTE_FORCE_CENTS}c."
+                if brute
+                else f"(ask+{args.slippage_cents}c IOC). Prefer --demo for first tests."
+            )
         )
     else:
         eprint(
