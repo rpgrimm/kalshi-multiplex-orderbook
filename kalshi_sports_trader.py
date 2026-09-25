@@ -186,6 +186,44 @@ NFL_PRIORITY_SERIES = [
     "KXNFLFFPTS",
 ]
 
+# College game-scoped series. Without this, KXNCAAFGAME is moneyline-only.
+NCAAF_PRIORITY_SERIES = [
+    "KXNCAAFGAME",
+    "KXNCAAFSPREAD",
+    "KXNCAAFTOTAL",
+    "KXNCAAFTEAMTOTAL",
+    "KXNCAAF1H",
+    "KXNCAAF1HSPREAD",
+    "KXNCAAF1HTOTAL",
+    "KXNCAAF1HTEAMTOTAL",
+    "KXNCAAF1HFT",
+    "KXNCAAF2H",
+    "KXNCAAF2HSPREAD",
+    "KXNCAAF2HTOTAL",
+    "KXNCAAF1Q",
+    "KXNCAAF1QSPREAD",
+    "KXNCAAF1QTOTAL",
+    "KXNCAAF2Q",
+    "KXNCAAF2QSPREAD",
+    "KXNCAAF2QTOTAL",
+    "KXNCAAF3Q",
+    "KXNCAAF3QSPREAD",
+    "KXNCAAF3QTOTAL",
+    "KXNCAAF4Q",
+    "KXNCAAF4QSPREAD",
+    "KXNCAAF4QTOTAL",
+    "KXNCAAFFIRSTTDTEAM",
+    "KXNCAAFDSTTD",
+    "KXNCAAFTEAMRECTD",
+    "KXNCAAFTEAMRECYDS",
+    "KXNCAAFTEAMFG",
+    "KXNCAAFTEAMTD",
+    "KXNCAAFTEAMYDS",
+    "KXNCAAFTOTALFG",
+    "KXNCAAFTOTALTD",
+    "KXNCAAF2PT",
+]
+
 
 @dataclass(frozen=True)
 class MarketRow:
@@ -654,6 +692,9 @@ def build_candidate_series(
     add(seed_series)
     if league_prefix == "KXNFL":
         for s in NFL_PRIORITY_SERIES:
+            add(s)
+    elif league_prefix == "KXNCAAF":
+        for s in NCAAF_PRIORITY_SERIES:
             add(s)
 
     if scan_all_series:
