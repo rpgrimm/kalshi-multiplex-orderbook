@@ -5,7 +5,11 @@ from __future__ import annotations
 
 import unittest
 
-from kalshi_sports_trader import build_candidate_series, league_prefix_from_series
+from kalshi_sports_trader import (
+    build_candidate_series,
+    league_prefix_from_series,
+    looks_season_long,
+)
 
 
 class TestDiscovery(unittest.TestCase):
@@ -38,6 +42,11 @@ class TestDiscovery(unittest.TestCase):
         )
         self.assertIn("KXNFLFIRSTTD", cands)
         self.assertIn("KXNFLFG", cands)
+
+    def test_ot_is_game_scoped(self) -> None:
+        self.assertFalse(looks_season_long("KXNCAAFOT"))
+        self.assertFalse(looks_season_long("KXNCAAFSPREAD"))
+        self.assertTrue(looks_season_long("KXNCAAFPLAYOFF"))
 
 
 if __name__ == "__main__":

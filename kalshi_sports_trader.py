@@ -458,6 +458,9 @@ def looks_season_long(series_ticker: str) -> bool:
             "FG",
             "SACK",
             "MARGIN",
+            "OT",
+            "2PT",
+            "SAF",
         )
     )
     if gameish:
@@ -714,7 +717,12 @@ def build_candidate_series(
             add(s)
 
     if scan_all_series:
-        for s in list_series_tickers(host, league_prefix):
+        try:
+            listed = list_series_tickers(host, league_prefix)
+        except Exception as exc:  # noqa: BLE001
+            eprint(f"series catalog failed ({exc}); using priority list only")
+            listed = []
+        for s in listed:
             if not include_season_long and looks_season_long(s):
                 continue
             add(s)
@@ -4321,15 +4329,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--series",
         action="append",
         default=[],
-        help="Only probe these series tickers (repeatable). Default: priority set.",
+        help="Only probe these series tickers (repeatable). Default: every game-scoped series.",
     )
     p.add_argument(
         "--scan-all-series",
         action="store_true",
         help=(
-            "Also probe every league series from GET /series (slow; more 429 risk). "
-            "Default uses a curated priority list only."
+            "Probe every game-scoped league series from GET /series (now the default)."
         ),
+    )
+    p.add_argument(
+        "--priority-only",
+        action="store_true",
+        help="Probe only the curated series list (old default). Skips GET /series.",
     )
     p.add_argument(
         "--include-season-long",
@@ -4555,7 +4567,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     eprint(f"game_code={game_code} seed_series={seed_series} league_prefix={league}")
     eprint(f"status_filter={'all' if not statuses else ','.join(sorted(statuses))}")
-    eprint(f"discovery={args.discovery} scan_all_series={bool(args.scan_all_series)}")
+    scan_all = True
+    if args.series or bool(getattr(args, "priority_only", False)):
+        scan_all = False
+    if bool(args.scan_all_series):
+        scan_all = True
+    eprint(
+        f"discovery={args.discovery} scan_all_series={scan_all} "
+        f"priority_only={bool(getattr(args, 'priority_only', False))}"
+    )
 
     rows: list[MarketRow] | None = None
     hits: list[Any] = []
@@ -4585,7 +4605,7 @@ def main(argv: list[str] | None = None) -> int:
             seed_series=seed_series,
             explicit_series=args.series or None,
             include_season_long=bool(args.include_season_long),
-            scan_all_series=bool(args.scan_all_series),
+            scan_all_series=scan_all,
         )
         if args.max_series and args.max_series > 0:
             candidates = candidates[: args.max_series]
