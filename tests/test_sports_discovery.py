@@ -24,6 +24,7 @@ class TestDiscovery(unittest.TestCase):
         self.assertIn("KXNCAAFSPREAD", cands)
         self.assertIn("KXNCAAFTOTAL", cands)
         self.assertIn("KXNCAAF1QTOTAL", cands)
+        self.assertIn("KXNCAAFOT", cands)
         self.assertGreater(len(cands), 10)
 
     def test_nfl_still_has_priority_list(self) -> None:

@@ -66,6 +66,7 @@ def fixture():
         row(f"KXNCAAFTEAMTOTAL-{g}-MISS28", "Ole Miss scores over 27.5 points", series="KXNCAAFTEAMTOTAL", floor=27.5),
         row(f"KXNCAAF4Q-{g}-FLA", "Florida wins the 4th quarter", series="KXNCAAF4Q"),
         row(f"KXNCAAF2H-{g}-FLA", "Florida wins the 2nd half", series="KXNCAAF2H"),
+        row(f"KXNCAAFOT-{g}-1", "1+ overtime periods", series="KXNCAAFOT", floor=1),
         row(f"KXNCAAF1Q-{g}-FLA", "Florida wins the 1st quarter", series="KXNCAAF1Q"),
         row(f"KXNCAAF1Q-{g}-MISS", "Ole Miss wins the 1st quarter", series="KXNCAAF1Q"),
         row(f"KXNCAAF1Q-{g}-TIE", "1st quarter tie", series="KXNCAAF1Q"),
@@ -360,6 +361,7 @@ class TestNcaafTd(unittest.TestCase):
         self.assertEqual(ids.get("KXNCAAFTOTAL-26SEP26MISSFLA-60"), "no")  # 58 not over 59.5
         self.assertEqual(ids.get("KXNCAAFTEAMTOTAL-26SEP26MISSFLA-FLA31"), "yes")
         self.assertEqual(ids.get("KXNCAAFTEAMTOTAL-26SEP26MISSFLA-MISS28"), "no")
+        self.assertEqual(ids.get("KXNCAAFOT-26SEP26MISSFLA-1"), "no")
         assert draft is not None
         apply_qend_draft(session, draft)
         self.assertEqual(session.state().quarter, 4)
@@ -381,6 +383,7 @@ class TestNcaafTd(unittest.TestCase):
         self.assertIn("OT", msg)
         self.assertFalse(any(i.startswith("KXNCAAFGAME-") for i in ids))
         self.assertFalse(any("KXNCAAFSPREAD" in i for i in ids))
+        self.assertEqual({c.market_id: c.side.value for c in cands}.get("KXNCAAFOT-26SEP26MISSFLA-1"), "yes")
         assert draft is not None
         apply_qend_draft(session, draft)
         self.assertEqual(session.state().quarter, 5)

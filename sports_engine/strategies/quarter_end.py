@@ -8,6 +8,7 @@ from ..catalog import (
     NCAAF_GAME_SPREAD_SERIES,
     NCAAF_GAME_TOTAL_SERIES,
     NCAAF_GAME_WINNER_SERIES,
+    NCAAF_OT_SERIES,
     NCAAF_H_SPREAD_SERIES,
     NCAAF_H_TEAM_TOTAL_SERIES,
     NCAAF_H_TOTAL_SERIES,
@@ -206,6 +207,34 @@ def preview_qend(
             out=out,
         )
     tied = int(game_state.away_score) == int(game_state.home_score)
+    if ended == 4 and college:
+        for row in rows:
+            if row_series(row) != NCAAF_OT_SERIES:
+                continue
+            floor = row_floor(row)
+            going = bool(tied)
+            if floor is None or floor <= 1:
+                side = BetSide.YES if going else BetSide.NO
+                reason = "YES — overtime" if going else "NO — overtime"
+            else:
+                side = BetSide.NO
+                reason = f"NO — OT {floor}+"
+            mid = market_id(row)
+            if not mid or mid in sent_ids:
+                continue
+            if any(c.market_id == mid and c.side == side for c in out):
+                continue
+            out.append(
+                CandidateBet(
+                    strategy_id="quarter_end",
+                    market_id=mid,
+                    side=side,
+                    reason=reason,
+                    trigger="qend",
+                    suggested_quantity=1,
+                    status=CandidateStatus.ELIGIBLE,
+                )
+            )
     if ended >= 4 and not tied:
         _settle_period(
             rows,
