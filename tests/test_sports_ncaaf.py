@@ -56,6 +56,14 @@ def fixture():
         row(f"KXNCAAF1HTEAMTOTAL-{g}-FLA8", "Florida scores over 7.5 1H points", series="KXNCAAF1HTEAMTOTAL", floor=7.5),
         row(f"KXNCAAFGAME-{g}-FLA", "Florida wins", series="KXNCAAFGAME"),
         row(f"KXNCAAFGAME-{g}-MISS", "Ole Miss wins", series="KXNCAAFGAME"),
+        row(f"KXNCAAFSPREAD-{g}-FLA4", "Florida wins by over 3.5 points", series="KXNCAAFSPREAD", floor=3.5),
+        row(f"KXNCAAFSPREAD-{g}-FLA7", "Florida wins by over 6.5 points", series="KXNCAAFSPREAD", floor=6.5),
+        row(f"KXNCAAFSPREAD-{g}-MISS4", "Ole Miss wins by over 3.5 points", series="KXNCAAFSPREAD", floor=3.5),
+        row(f"KXNCAAFTOTAL-{g}-60", "Over 59.5 points scored", series="KXNCAAFTOTAL", floor=59.5),
+        row(f"KXNCAAFTEAMTOTAL-{g}-FLA31", "Florida scores over 30.5 points", series="KXNCAAFTEAMTOTAL", floor=30.5),
+        row(f"KXNCAAFTEAMTOTAL-{g}-MISS28", "Ole Miss scores over 27.5 points", series="KXNCAAFTEAMTOTAL", floor=27.5),
+        row(f"KXNCAAF4Q-{g}-FLA", "Florida wins the 4th quarter", series="KXNCAAF4Q"),
+        row(f"KXNCAAF2H-{g}-FLA", "Florida wins the 2nd half", series="KXNCAAF2H"),
         row(f"KXNCAAF1Q-{g}-FLA", "Florida wins the 1st quarter", series="KXNCAAF1Q"),
         row(f"KXNCAAF1Q-{g}-MISS", "Ole Miss wins the 1st quarter", series="KXNCAAF1Q"),
         row(f"KXNCAAF1Q-{g}-TIE", "1st quarter tie", series="KXNCAAF1Q"),
@@ -236,6 +244,7 @@ class TestNcaafTd(unittest.TestCase):
         self.assertEqual(ids.get("KXNCAAF1QTOTAL-26SEP26MISSFLA-6"), "yes")
         self.assertEqual(ids.get("KXNCAAF1QTOTAL-26SEP26MISSFLA-8"), "no")
         self.assertFalse(any("1HSPREAD" in i or i.startswith("KXNCAAF1H-") for i in ids))
+        self.assertFalse(any(i.startswith("KXNCAAFGAME-") or "KXNCAAFSPREAD" in i for i in ids))
         self.assertEqual(session.state().quarter, 1)
         assert qend is not None
         apply_qend_draft(session, qend)
@@ -304,6 +313,63 @@ class TestNcaafTd(unittest.TestCase):
         apply_fg_draft(session, draft)
         self.assertEqual(session.state().home_score, 3)
         self.assertIsNone(session.pending_extra_team)
+
+    def test_q4_qend_settles_game_if_not_tied(self) -> None:
+        rows = fixture()
+        session = make_browse_session("26SEP26MISSFLA", rows)
+        session.ingest(GameEvent(type=EventType.QUARTER, quarter=4, source="test"), evaluate=False)
+        session.ingest(
+            GameEvent(type=EventType.SCORE, team="MISS", payload={"set": 27}, source="test"),
+            evaluate=False,
+        )
+        session.ingest(
+            GameEvent(type=EventType.SCORE, team="FLA", payload={"set": 31}, source="test"),
+            evaluate=False,
+        )
+        draft, cands, msg = arm_qend_draft(session, rows)
+        ids = {c.market_id: c.side.value for c in cands}
+        self.assertIn("2H+game", msg)
+        self.assertEqual(ids.get("KXNCAAFGAME-26SEP26MISSFLA-FLA"), "yes")
+        self.assertEqual(ids.get("KXNCAAFGAME-26SEP26MISSFLA-MISS"), "no")
+        self.assertEqual(ids.get("KXNCAAFSPREAD-26SEP26MISSFLA-FLA4"), "yes")
+        self.assertEqual(ids.get("KXNCAAFSPREAD-26SEP26MISSFLA-FLA7"), "no")
+        self.assertEqual(ids.get("KXNCAAFSPREAD-26SEP26MISSFLA-MISS4"), "no")
+        self.assertEqual(ids.get("KXNCAAFTOTAL-26SEP26MISSFLA-60"), "no")  # 58 not over 59.5
+        self.assertEqual(ids.get("KXNCAAFTEAMTOTAL-26SEP26MISSFLA-FLA31"), "yes")
+        self.assertEqual(ids.get("KXNCAAFTEAMTOTAL-26SEP26MISSFLA-MISS28"), "no")
+        assert draft is not None
+        apply_qend_draft(session, draft)
+        self.assertEqual(session.state().quarter, 4)
+
+    def test_q4_tie_goes_to_ot_without_game_settle(self) -> None:
+        rows = fixture()
+        session = make_browse_session("26SEP26MISSFLA", rows)
+        session.ingest(GameEvent(type=EventType.QUARTER, quarter=4, source="test"), evaluate=False)
+        session.ingest(
+            GameEvent(type=EventType.SCORE, team="MISS", payload={"set": 24}, source="test"),
+            evaluate=False,
+        )
+        session.ingest(
+            GameEvent(type=EventType.SCORE, team="FLA", payload={"set": 24}, source="test"),
+            evaluate=False,
+        )
+        draft, cands, msg = arm_qend_draft(session, rows)
+        ids = {c.market_id for c in cands}
+        self.assertIn("OT", msg)
+        self.assertFalse(any(i.startswith("KXNCAAFGAME-") for i in ids))
+        self.assertFalse(any("KXNCAAFSPREAD" in i for i in ids))
+        assert draft is not None
+        apply_qend_draft(session, draft)
+        self.assertEqual(session.state().quarter, 5)
+        session.ingest(
+            GameEvent(type=EventType.SCORE, team="FLA", payload={"set": 27}, source="test"),
+            evaluate=False,
+        )
+        _d, cands2, msg2 = arm_qend_draft(session, rows)
+        ids2 = {c.market_id: c.side.value for c in cands2}
+        self.assertIn("game", msg2)
+        self.assertEqual(ids2.get("KXNCAAFGAME-26SEP26MISSFLA-FLA"), "yes")
+        self.assertEqual(ids2.get("KXNCAAFSPREAD-26SEP26MISSFLA-FLA4"), "no")  # 3-point win
 
 
 if __name__ == "__main__":

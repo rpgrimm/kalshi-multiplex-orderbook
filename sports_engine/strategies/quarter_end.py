@@ -5,6 +5,9 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 from ..catalog import (
+    NCAAF_GAME_SPREAD_SERIES,
+    NCAAF_GAME_TOTAL_SERIES,
+    NCAAF_GAME_WINNER_SERIES,
     NCAAF_H_SPREAD_SERIES,
     NCAAF_H_TEAM_TOTAL_SERIES,
     NCAAF_H_TOTAL_SERIES,
@@ -12,12 +15,17 @@ from ..catalog import (
     NCAAF_Q_SPREAD_SERIES,
     NCAAF_Q_TOTAL_SERIES,
     NCAAF_Q_WINNER_SERIES,
+    NCAAF_TEAM_TOTAL_SERIES,
+    NFL_GAME_SPREAD_SERIES,
+    NFL_GAME_TOTAL_SERIES,
+    NFL_GAME_WINNER_SERIES,
     NFL_H_SPREAD_SERIES,
     NFL_H_TEAM_TOTAL_SERIES,
     NFL_H_TOTAL_SERIES,
     NFL_H_WINNER_SERIES,
     NFL_Q_SPREAD_SERIES,
     NFL_Q_WINNER_SERIES,
+    NFL_TEAM_TOTAL_SERIES,
     Q_TOTAL_SERIES,
     is_college_rows,
     market_id,
@@ -158,19 +166,20 @@ def preview_qend(
     sent_ids = {s.upper() for s in (sent or set())}
     college = is_college_rows(rows)
     out: list[CandidateBet] = []
-    _settle_period(
-        rows,
-        game_state,
-        away_pts=away_q,
-        home_pts=home_q,
-        winner_series=(NCAAF_Q_WINNER_SERIES if college else NFL_Q_WINNER_SERIES).get(ended),
-        spread_series=(NCAAF_Q_SPREAD_SERIES if college else NFL_Q_SPREAD_SERIES).get(ended),
-        total_series=(NCAAF_Q_TOTAL_SERIES if college else Q_TOTAL_SERIES).get(ended),
-        team_total_series=None,
-        label=f"Q{ended}",
-        sent_ids=sent_ids,
-        out=out,
-    )
+    if 1 <= ended <= 4:
+        _settle_period(
+            rows,
+            game_state,
+            away_pts=away_q,
+            home_pts=home_q,
+            winner_series=(NCAAF_Q_WINNER_SERIES if college else NFL_Q_WINNER_SERIES).get(ended),
+            spread_series=(NCAAF_Q_SPREAD_SERIES if college else NFL_Q_SPREAD_SERIES).get(ended),
+            total_series=(NCAAF_Q_TOTAL_SERIES if college else Q_TOTAL_SERIES).get(ended),
+            team_total_series=None,
+            label=f"Q{ended}",
+            sent_ids=sent_ids,
+            out=out,
+        )
     half = 1 if ended == 2 else 2 if ended == 4 else None
     if half is not None:
         if away_this_h is not None and home_this_h is not None:
@@ -193,6 +202,21 @@ def preview_qend(
                 NCAAF_H_TEAM_TOTAL_SERIES if college else NFL_H_TEAM_TOTAL_SERIES
             ).get(half),
             label=label,
+            sent_ids=sent_ids,
+            out=out,
+        )
+    tied = int(game_state.away_score) == int(game_state.home_score)
+    if ended >= 4 and not tied:
+        _settle_period(
+            rows,
+            game_state,
+            away_pts=int(game_state.away_score),
+            home_pts=int(game_state.home_score),
+            winner_series=NCAAF_GAME_WINNER_SERIES if college else NFL_GAME_WINNER_SERIES,
+            spread_series=NCAAF_GAME_SPREAD_SERIES if college else NFL_GAME_SPREAD_SERIES,
+            total_series=NCAAF_GAME_TOTAL_SERIES if college else NFL_GAME_TOTAL_SERIES,
+            team_total_series=NCAAF_TEAM_TOTAL_SERIES if college else NFL_TEAM_TOTAL_SERIES,
+            label="game",
             sent_ids=sent_ids,
             out=out,
         )

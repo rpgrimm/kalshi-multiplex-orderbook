@@ -60,10 +60,12 @@ class GameStateEngine:
                 event.payload["home_this_h"] = state.home_score - state.home_score_at_half
             if state.quarter < 4:
                 state.quarter += 1
+            elif state.away_score == state.home_score:
+                state.quarter = 5 if state.quarter == 4 else int(state.quarter) + 1
             state.away_score_at_q_start = state.away_score
             state.home_score_at_q_start = state.home_score
         elif event.type is EventType.QUARTER and event.quarter is not None:
-            q = max(1, min(4, int(event.quarter)))
+            q = max(1, int(event.quarter))
             state.quarter = q
             state.away_score_at_q_start = state.away_score
             state.home_score_at_q_start = state.home_score

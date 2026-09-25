@@ -3565,8 +3565,9 @@ def format_game_stats(state: BrowserState) -> str:
     if pending:
         extra = f"  extra {pending}"
     live = "LIVE" if getattr(state.args, "live", False) else "dry-run"
+    qbit = f"OT{st.quarter - 4}" if st.quarter >= 5 else f"Q{st.quarter}"
     return (
-        f"Q{st.quarter}  {st.away} {st.away_score}-{st.home_score} {st.home}"
+        f"{qbit}  {st.away} {st.away_score}-{st.home_score} {st.home}"
         f"  tds {st.game_tds}{extra}  {live}"
     )
 

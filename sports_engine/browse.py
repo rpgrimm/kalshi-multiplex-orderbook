@@ -426,6 +426,18 @@ def ingest_td_play(
     return cands, msg
 
 
+def _qend_extra(st: Any) -> str:
+    q = int(getattr(st, "quarter", 1) or 1)
+    tied = int(getattr(st, "away_score", 0)) == int(getattr(st, "home_score", 0))
+    if q == 2:
+        return " · also 1H"
+    if q == 4:
+        return " · tied · OT" if tied else " · also 2H+game"
+    if q >= 5:
+        return " · still tied · OT" if tied else " · also game"
+    return ""
+
+
 def arm_qend_draft(
     session: SportsSession,
     rows: Sequence[Any],
@@ -461,7 +473,7 @@ def arm_qend_draft(
         cands,
         format_candidates(cands, armed=True)
         + f" · Q{q} {st.away} {away_q}-{home_q} {st.home}"
-        + (" · also 1H" if q == 2 else " · also 2H" if q == 4 else "")
+        + _qend_extra(st)
         + " · Enter ends quarter",
     )
 
@@ -477,9 +489,14 @@ def apply_qend_draft(session: SportsSession, draft: DraftPlay) -> str:
     )
     session.ingest(event, evaluate=False)
     st2 = session.state()
+    ended = f"OT{st.quarter - 4}" if st.quarter >= 5 else f"Q{st.quarter}"
+    now = f"OT{st2.quarter - 4}" if st2.quarter >= 5 else f"Q{st2.quarter}"
+    note = ""
+    if st.quarter >= 4 and st2.away_score == st2.home_score and st2.quarter >= 5:
+        note = " · OT"
     return (
-        f"recorded Q{draft.display or st.quarter} end · "
-        f"now Q{st2.quarter} {st2.away} {st2.away_score}-{st2.home_score} {st2.home}"
+        f"recorded {ended} end{note} · "
+        f"now {now} {st2.away} {st2.away_score}-{st2.home_score} {st2.home}"
     )
 
 
