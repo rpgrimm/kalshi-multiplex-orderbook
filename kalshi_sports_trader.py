@@ -2462,6 +2462,10 @@ def confirm_td_draft(state: BrowserState) -> None:
     state.draft = None
     extra = f" · missed {len(missed)}" if missed else ""
     state.message = f"sent {sent}/{len(armed)}{extra} · {recorded}"
+    state.filter_text = ""
+    state.committed_player = ""
+    state.cursor = 0
+    state.offset = 0
     leave_filter_mode(state)
 
 

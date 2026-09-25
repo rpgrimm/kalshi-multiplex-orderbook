@@ -92,6 +92,7 @@ class TestFieldGoals(unittest.TestCase):
         self.assertEqual(len(confirms), 1)
         sent = {b["ticker"] for b in confirms[0]["would_send"]}
         self.assertEqual(sent, {"KXNFLFG-26SEP27KCMIA-MIA1"})
+        self.assertEqual(report["filter"].strip(), "")
         self.assertEqual(report["state"]["home_score"], 3)
         self.assertEqual(report["state"]["away_score"], 0)
 
