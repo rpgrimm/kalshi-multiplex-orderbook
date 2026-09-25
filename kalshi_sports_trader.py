@@ -2431,11 +2431,14 @@ def confirm_td_draft(state: BrowserState) -> None:
     missed: list[str] = []
     if not state.script_mode:
         tickers = [b.market_id for b in armed]
+        live = bool(getattr(state.args, "live", False))
         if tickers:
             state.tracker.ensure_quotes(tickers, force=True)
-            waiter = getattr(state.tracker, "wait_for_quotes", None)
-            if callable(waiter):
-                waiter(tickers, timeout=1.5)
+            # Dry-run records even without an ask; don't freeze the TUI for 1.5s.
+            if live:
+                waiter = getattr(state.tracker, "wait_for_quotes", None)
+                if callable(waiter):
+                    waiter(tickers, timeout=1.5)
         state.order_busy = True
         try:
             for bet in armed:
