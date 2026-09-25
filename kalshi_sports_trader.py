@@ -3413,6 +3413,212 @@ def run_key_script(state: BrowserState, script: str) -> dict[str, Any]:
     }
 
 
+PROMPT_HELP = """
+NCAAF prompt  (no market list, no /)
+  f td          arm Florida TD bundle
+  f td re       receiving (2+ on the next rec)
+  f td d        plus D/ST
+  pat / 2pt     extra point after a sent TD
+  nopat / no2pt miss
+  qend          end this quarter (Q2 also 1H)
+  o             orders
+  empty Enter   send the armed bundle
+  x             cancel armed bundle
+  q             quit
+""".strip()
+
+
+def format_game_stats(state: BrowserState) -> str:
+    if state.session is None:
+        return state.game_code
+    st = state.session.state()
+    extra = ""
+    pending = state.session.pending_extra_team
+    if pending:
+        extra = f"  extra {pending}"
+    live = "LIVE" if getattr(state.args, "live", False) else "dry-run"
+    return (
+        f"Q{st.quarter}  {st.away} {st.away_score}-{st.home_score} {st.home}"
+        f"  tds {st.game_tds}{extra}  {live}"
+    )
+
+
+def _draft_legs(state: BrowserState) -> list[dict[str, Any]]:
+    if state.session is None or state.draft is None:
+        return []
+    armed = [
+        b
+        for b in state.session.arming.armed_bets()
+        if b.armed_id in set(state.draft.armed_ids)
+    ]
+    reasons = {
+        c.candidate_id: c.reason for c in state.session.arming.candidates()
+    }
+    out = []
+    for b in armed:
+        row = next((r for r in state.rows if r.ticker.upper() == b.market_id.upper()), None)
+        title = ""
+        if row is not None:
+            title = row.title or row.yes_sub_title or ""
+        out.append(
+            {
+                "side": b.side.value.upper(),
+                "ticker": b.market_id,
+                "reason": reasons.get(b.candidate_id) or b.trigger,
+                "title": title,
+            }
+        )
+    return out
+
+
+def format_draft_lines(state: BrowserState) -> list[str]:
+    legs = _draft_legs(state)
+    lines = [f"READY {len(legs)}"]
+    for leg in legs:
+        label = leg["reason"] or leg["title"] or leg["ticker"]
+        lines.append(f"  {leg['side']:<3} {label}  {leg['ticker']}")
+    if not legs:
+        lines.append("  (nothing to send)")
+    lines.append("empty Enter sends")
+    return lines
+
+
+def format_order_lines(state: BrowserState) -> list[str]:
+    items = orders_page_items(state)
+    if not items:
+        return ["no orders"]
+    lines = [f"ORDERS {len(items)}"]
+    for it in items:
+        lines.append(
+            f"  {it.get('side', 'YES'):<3} {it.get('qty', 0):>4}  "
+            f"{it.get('ticker', '')}  {it.get('title', '')}  {it.get('source', '')}"
+        )
+    return lines
+
+
+def cancel_prompt_draft(state: BrowserState) -> None:
+    if state.session is None or state.draft is None:
+        return
+    for armed_id in list(state.draft.armed_ids):
+        try:
+            state.session.arming.disarm(armed_id)
+        except KeyError:
+            pass
+    state.draft = None
+    state.filter_text = ""
+
+
+def handle_prompt_line(state: BrowserState, line: str) -> list[str]:
+    """One NCAAF prompt command. Empty line sends an armed draft."""
+    raw = str(line or "").strip()
+    low = raw.lower()
+    if low in {"q", "quit", "exit"}:
+        return ["quit"]
+    if low in {"h", "help", "?"}:
+        return [PROMPT_HELP]
+    if low in {"o", "orders"}:
+        return format_order_lines(state)
+    if low in {"x", "cancel"}:
+        if state.draft is None:
+            return ["nothing armed"]
+        cancel_prompt_draft(state)
+        return ["cancelled"]
+    if not raw:
+        if state.draft is None:
+            return []
+        confirm_td_draft(state)
+        return [state.message or "sent"]
+    if state.draft is not None:
+        cancel_prompt_draft(state)
+    state.filter_text = raw
+    state.input_mode = "filter"
+    handle_filter_enter(state)
+    if state.draft is not None:
+        return format_draft_lines(state)
+    if state.message:
+        return [state.message]
+    return ["ok"]
+
+
+def run_college_prompt(
+    *,
+    seed_series: str,
+    game_code: str,
+    rows: list[MarketRow],
+    args: argparse.Namespace,
+    ws_url: str,
+    watch_limit: int,
+    log_raw: bool,
+    no_ws: bool,
+) -> int:
+    """Scrolling > prompt. No curses, no market list."""
+    if not sys.stdin.isatty():
+        eprint("error: --browse prompt needs stdin TTY")
+        return 2
+    tracker = BackgroundBookTracker(
+        rows,
+        ws_url=ws_url,
+        watch_limit=0 if watch_limit < 0 else watch_limit,
+        log_raw=log_raw,
+        args=args,
+    )
+    if no_ws:
+        tracker.status = "disabled"
+    else:
+        tracker.start()
+    default_log = str(
+        Path.home()
+        / ".local"
+        / "share"
+        / "kalshi-multiplex-orderbook"
+        / "sports-order-memory.log"
+    )
+    log_path = getattr(args, "order_log_file", None)
+    if getattr(args, "no_order_log_file", False) or log_path == "":
+        ORDER_LOG.configure(path=None, enabled=True)
+    else:
+        ORDER_LOG.configure(
+            path=str(log_path) if log_path else default_log,
+            idle_dump_s=float(getattr(args, "order_log_idle_s", 2.0) or 2.0),
+            capacity=int(getattr(args, "order_log_capacity", 500) or 500),
+            enabled=True,
+        )
+    state = BrowserState(
+        seed_series=seed_series,
+        game_code=game_code,
+        rows=rows,
+        tracker=tracker,
+        args=args,
+        session=make_browse_session(game_code, rows),
+        mode="markets",
+        category="all",
+    )
+    live = "LIVE" if getattr(args, "live", False) else "dry-run"
+    print(f"{seed_series}-{game_code}  {len(rows)} markets  {live}")
+    print("type a command (h help) · empty Enter sends")
+    try:
+        while True:
+            print(format_game_stats(state))
+            try:
+                line = input("> ")
+            except EOFError:
+                print()
+                break
+            except KeyboardInterrupt:
+                print()
+                break
+            for row in handle_prompt_line(state, line):
+                if row == "quit":
+                    return 0
+                print(row)
+    finally:
+        tracker.stop()
+        dumped = ORDER_LOG.maybe_dump_idle(force=True)
+        if dumped:
+            eprint(f"order log dumped: {dumped}")
+    return 0
+
+
 def run_browser(
     *,
     seed_series: str,
@@ -3925,8 +4131,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--browse",
         action="store_true",
         help=(
-            "After discovery, open keyboard market browser. Starts a silent "
-            "background WebSocket book tracker when auth is available. Ctrl-H help."
+            "After discovery, open the operator UI. NCAAF is a scrolling > prompt "
+            "(no market list). NFL is the keyboard browser. Silent WS books when auth is available."
         ),
     )
     p.add_argument(
@@ -4216,7 +4422,22 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.browse:
-        # Compact discovery summary on stderr; UI owns the screen.
+        college = str(seed_series or "").upper().startswith("KXNCAAF") or is_college_rows(rows)
+        if college:
+            eprint(
+                f"discovered {len(rows)} markets across {len(hits)} series "
+                f"in {elapsed:.1f}s; NCAAF prompt ({args.kalshi_env}/{mode})"
+            )
+            return run_college_prompt(
+                seed_series=seed_series,
+                game_code=game_code,
+                rows=rows,
+                args=args,
+                ws_url=str(args.ws_url),
+                watch_limit=int(args.watch_limit),
+                log_raw=bool(args.log_raw),
+                no_ws=bool(args.no_ws),
+            )
         eprint(
             f"discovered {len(rows)} markets across {len(hits)} series "
             f"in {elapsed:.1f}s; opening browser ({args.kalshi_env}/{mode})"
