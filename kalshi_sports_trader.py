@@ -64,6 +64,39 @@ from typing import Any, Iterable
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+from sports_engine.browse import (
+    arm_extra_draft,
+    arm_fg_draft,
+    arm_ncaaf_td_draft,
+    arm_qend_draft,
+    arm_td_draft,
+    apply_extra_draft,
+    apply_extra_miss,
+    apply_fg_draft,
+    apply_qend_draft,
+    apply_td_draft,
+    catalog_player_names,
+    ingest_quarter_end,
+    ingest_score,
+    make_browse_session,
+    parse_time_line,
+)
+from sports_engine.catalog import (
+    is_college_rows,
+    resolve_game_team,
+    row_series,
+    tab_complete_team,
+    unique_player_rows,
+)
+from sports_engine.key_script import parse_key_script
+from sports_engine.market_cache import (
+    clear_market_cache,
+    default_cache_path,
+    load_market_cache,
+    save_market_cache,
+)
+from sports_engine.play_protocol import parse_play_query, tab_complete_player
+
 PROD_REST_HOST = "https://api.elections.kalshi.com/trade-api/v2"
 PROD_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
 DEMO_REST_HOST = "https://external-api.demo.kalshi.co/trade-api/v2"
@@ -163,6 +196,44 @@ NFL_PRIORITY_SERIES = [
     "KXNFLLONGRSH",
     "KXNFLBOTH",
     "KXNFLFFPTS",
+]
+
+# College game-scoped series. Without this, KXNCAAFGAME is moneyline-only.
+NCAAF_PRIORITY_SERIES = [
+    "KXNCAAFGAME",
+    "KXNCAAFSPREAD",
+    "KXNCAAFTOTAL",
+    "KXNCAAFTEAMTOTAL",
+    "KXNCAAF1H",
+    "KXNCAAF1HSPREAD",
+    "KXNCAAF1HTOTAL",
+    "KXNCAAF1HTEAMTOTAL",
+    "KXNCAAF1HFT",
+    "KXNCAAF2H",
+    "KXNCAAF2HSPREAD",
+    "KXNCAAF2HTOTAL",
+    "KXNCAAF1Q",
+    "KXNCAAF1QSPREAD",
+    "KXNCAAF1QTOTAL",
+    "KXNCAAF2Q",
+    "KXNCAAF2QSPREAD",
+    "KXNCAAF2QTOTAL",
+    "KXNCAAF3Q",
+    "KXNCAAF3QSPREAD",
+    "KXNCAAF3QTOTAL",
+    "KXNCAAF4Q",
+    "KXNCAAF4QSPREAD",
+    "KXNCAAF4QTOTAL",
+    "KXNCAAFFIRSTTDTEAM",
+    "KXNCAAFDSTTD",
+    "KXNCAAFTEAMRECTD",
+    "KXNCAAFTEAMRECYDS",
+    "KXNCAAFTEAMFG",
+    "KXNCAAFTEAMTD",
+    "KXNCAAFTEAMYDS",
+    "KXNCAAFTOTALFG",
+    "KXNCAAFTOTALTD",
+    "KXNCAAF2PT",
 ]
 
 
@@ -634,6 +705,9 @@ def build_candidate_series(
     if league_prefix == "KXNFL":
         for s in NFL_PRIORITY_SERIES:
             add(s)
+    elif league_prefix == "KXNCAAF":
+        for s in NCAAF_PRIORITY_SERIES:
+            add(s)
 
     if scan_all_series:
         for s in list_series_tickers(host, league_prefix):
@@ -764,6 +838,25 @@ def headers_to_dict(headers: Any) -> Any:
         return str(headers)
 
 
+def make_buy_no_limit_payload(
+    *,
+    ticker: str,
+    count: int,
+    no_limit_cents: int,
+    time_in_force: str = "immediate_or_cancel",
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "action": "buy",
+        "side": "no",
+        "count": int(count),
+        "type": "limit",
+        "client_order_id": str(uuid.uuid4()),
+        "no_price": clamp_price_cents(no_limit_cents),
+        "time_in_force": time_in_force,
+    }
+
+
 def make_buy_yes_limit_payload(
     *,
     ticker: str,
@@ -810,26 +903,39 @@ def make_event_order_v2_payload(legacy_payload: dict[str, Any]) -> dict[str, Any
         raise ValueError("sports trader currently supports limit orders only")
     action = str(legacy_payload.get("action") or "").lower()
     side = str(legacy_payload.get("side") or "").lower()
-    if side != "yes" or action not in {"buy", "sell"}:
+    if action not in {"buy", "sell"} or side not in {"yes", "no"}:
         raise ValueError(f"unsupported order shape action={action!r} side={side!r}")
-    yes_price = legacy_payload.get("yes_price")
-    if yes_price is None:
-        raise ValueError(f"{action.upper()} YES limit order missing yes_price")
     tif = legacy_payload.get("time_in_force") or "immediate_or_cancel"
     if tif == "GTT":
         tif = "good_till_canceled"
-    # V2 YES book: BUY YES = bid, SELL YES = ask (reduce_only).
+    if action == "buy" and side == "yes":
+        price = legacy_payload.get("yes_price")
+        if price is None:
+            raise ValueError("BUY YES limit order missing yes_price")
+        v2_side, v2_price, reduce = "bid", int(price), False
+    elif action == "buy" and side == "no":
+        price = legacy_payload.get("no_price")
+        if price is None:
+            raise ValueError("BUY NO limit order missing no_price")
+        v2_side, v2_price, reduce = "ask", 100 - int(price), False
+    elif action == "sell" and side == "yes":
+        price = legacy_payload.get("yes_price")
+        if price is None:
+            raise ValueError("SELL YES limit order missing yes_price")
+        v2_side, v2_price, reduce = "ask", int(price), True
+    else:
+        raise ValueError(f"unsupported order shape action={action!r} side={side!r}")
     return {
         "ticker": legacy_payload["ticker"],
         "client_order_id": legacy_payload.get("client_order_id") or str(uuid.uuid4()),
-        "side": "bid" if action == "buy" else "ask",
+        "side": v2_side,
         "count": fixed_contract_count(legacy_payload["count"]),
-        "price": fixed_dollar_price_from_cents(yes_price),
+        "price": fixed_dollar_price_from_cents(v2_price),
         "time_in_force": tif,
         "self_trade_prevention_type": "taker_at_cross",
         "post_only": False,
         "cancel_order_on_pause": False,
-        "reduce_only": action == "sell",
+        "reduce_only": reduce,
     }
 
 
@@ -1026,9 +1132,98 @@ def buy_yes_for_market(
     return ok, msg
 
 
+def buy_no_for_market(
+    *,
+    args: argparse.Namespace,
+    row: "MarketRow",
+    quote: "QuoteSnap | None",
+) -> tuple[bool, str]:
+    """BUY NO. Dry-run unless --live. Prices from NO ask + slippage."""
+    count = effective_count_yes(args)
+    if count <= 0:
+        return False, "ORDER ERROR: --count-yes must be positive"
+    try:
+        resolve_auth_settings(args, required=True)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"ORDER ERROR auth: {exc}"
+    ask = quote.no_ask if quote is not None else None
+    if ask is None:
+        return False, f"ORDER BLOCKED {row.ticker}: no NO ask yet"
+    slip = int(getattr(args, "slippage_cents", 1) or 0)
+    limit_cents = clamp_price_cents(int(ask) + slip)
+    legacy = make_buy_no_limit_payload(
+        ticker=row.ticker,
+        count=count,
+        no_limit_cents=limit_cents,
+        time_in_force=str(getattr(args, "time_in_force", "immediate_or_cancel")),
+    )
+    try:
+        v2 = make_event_order_v2_payload(legacy)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"ORDER ERROR payload: {exc}"
+    mode = "LIVE" if args.live else "DRY-RUN"
+    summary = (
+        f"{mode} BUY NO {row.ticker} count={count} "
+        f"ask={fmt_cents(ask)} limit={fmt_cents(limit_cents)}"
+    )
+    ORDER_LOG.record(
+        summary,
+        kind="order_built",
+        detail=f"payload_v2={json.dumps(v2, sort_keys=True)}",
+        ticker=row.ticker,
+        mode=mode,
+        live=bool(args.live),
+        ok=None if args.live else True,
+    )
+    if not args.live:
+        SESSION_BETS.record_buy(
+            ticker=row.ticker,
+            title=row.title or row.yes_sub_title or "",
+            count=count,
+            limit_cents=limit_cents,
+            live=False,
+            dry_run=True,
+            note=summary,
+            side="no",
+        )
+        return True, summary + " (not submitted; memory-log)"
+    try:
+        info = signed_json_request(
+            args,
+            method="POST",
+            path="/trade-api/v2/portfolio/events/orders",
+            body=v2,
+            timeout=float(getattr(args, "order_submit_timeout", 10.0)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        fail = f"ORDER FAIL {row.ticker}: {exc}"
+        ORDER_LOG.record(fail, kind="order_error", detail=str(exc), ticker=row.ticker, mode=mode, live=True, ok=False)
+        return False, fail
+    http_status = info.get("http_status")
+    ok = http_status is None or (isinstance(http_status, int) and 200 <= http_status < 300)
+    msg = (
+        f"LIVE OK BUY NO {row.ticker} count={count} limit={fmt_cents(limit_cents)} http={http_status}"
+        if ok
+        else f"LIVE REJECT BUY NO {row.ticker} http={http_status}"
+    )
+    ORDER_LOG.record(msg, kind="order_response", ticker=row.ticker, mode=mode, live=True, ok=ok)
+    if ok:
+        SESSION_BETS.record_buy(
+            ticker=row.ticker,
+            title=row.title or row.yes_sub_title or "",
+            count=count,
+            limit_cents=limit_cents,
+            live=True,
+            dry_run=False,
+            note=msg,
+            side="no",
+        )
+    return ok, msg
+
+
 @dataclass
 class SessionBet:
-    """One session-tracked BUY YES that went through (live or dry-run)."""
+    """One session-tracked BUY that went through (live or dry-run)."""
 
     ticker: str
     title: str
@@ -1039,6 +1234,7 @@ class SessionBet:
     dry_run: bool
     note: str = ""
     sold_count: int = 0
+    side: str = "yes"
 
     @property
     def remaining(self) -> int:
@@ -1064,6 +1260,7 @@ class SessionBetBook:
         live: bool,
         dry_run: bool,
         note: str = "",
+        side: str = "yes",
     ) -> SessionBet:
         bet = SessionBet(
             ticker=ticker,
@@ -1074,6 +1271,7 @@ class SessionBetBook:
             live=bool(live),
             dry_run=bool(dry_run),
             note=note or "",
+            side=str(side or "yes").lower(),
         )
         self.bets.append(bet)
         return bet
@@ -1234,7 +1432,14 @@ def orders_page_items(state: "BrowserState") -> list[dict[str, Any]]:
                 "ticker": t,
                 "title": title or title_by.get(t, ""),
                 "qty": int(rem),
-                "side": "YES",
+                "side": next(
+                    (
+                        str(b.side or "yes").upper()
+                        for b in SESSION_BETS.bets
+                        if b.ticker.upper() == t and b.remaining > 0
+                    ),
+                    "YES",
+                ),
                 "source": "session-live" if any_live else "session-dry",
                 "sellable": True,
                 "net": int(rem),
@@ -1745,12 +1950,8 @@ def filter_tokens(text: str) -> list[str]:
 
 
 def row_matches_filter(row: MarketRow, filter_text: str) -> bool:
-    """Loose multi-word match: every token must appear somewhere in haystack.
-
-    Example: "patrick mahomes td" matches a market whose title/ticker contains
-    those words in any order (and with other text in between).
-    """
-    tokens = filter_tokens(filter_text)
+    """Name + kind match. Intent tokens (re/ru) are not title search."""
+    tokens = parse_play_query(filter_text).filter_tokens()
     if not tokens:
         return True
     hay = market_haystack(row)
@@ -1774,6 +1975,35 @@ class QuoteSnap:
     ready: bool = False
     seq: int | None = None
     updated_ts: float = 0.0
+
+
+class NullBookTracker:
+    """Headless tracker for --script. No websocket, no quotes."""
+
+    def __init__(self) -> None:
+        self.status = "off"
+        self.error: str | None = None
+        self.subscribed_n = 0
+        self.enabled = False
+        self.auth_label = ""
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+    def poll_status(self) -> None:
+        return None
+
+    def ensure_quotes(self, tickers: Iterable[str], *, force: bool = False) -> None:
+        return None
+
+    def quote(self, ticker: str) -> QuoteSnap | None:
+        return None
+
+    def ready_count(self) -> int:
+        return 0
 
 
 class BackgroundBookTracker:
@@ -2083,10 +2313,25 @@ SPORTS TRADER — KEYBOARD HELP (Ctrl-H)
 ======================================
 Modes (vim-style)
   NORMAL             navigate; letters are commands (default)
-  FILTER             type query; all letters/digits/space go to filter>
+  FILTER             type query; Tab completes player names
   f or /             enter FILTER mode
-  Esc / Enter        leave FILTER → NORMAL (keeps query)
-  Ctrl-U             clear filter text
+  Tab                complete player last name (wa → watson)
+  Enter              lock player; after `td` arm First TD + 1+; with a draft, confirm/send
+  `td` then Enter    arm First TD + player 1+ (no Q 6.5 yet — TD is only 6)
+  then `re`          add same-team QB 1+ pass (once; rec == re)
+  then `ru`          rush: drop QB pass
+  then `pat`         PAT good: add this-Q over 6.5
+  `fg m` then Enter  arm this game's team FG ladder (m→MIA, k→KC). Confirm Enter sends.
+  NCAAF `/ f td`     team TD: first-TD YES/NOs + Q/H overs a 6-pt score clears.
+                     `re` = receiving (2+ ladder). `d` = also D/ST. Confirm Enter sends.
+  `/ pat` `/ 2pt`    after a TD: +1 or +2 and arm newly crossed Q/H/game/team totals.
+  `/ nopat` `/ no2pt` miss: no points, close the extra-point window.
+  `/ qend`           end this quarter (no TIME mode). Winner YES, loser/tie NO,
+                     covered spreads YES, uncovered/loser spreads NO, Q totals YES/NO.
+  Enter again        send armed YES legs (dry-run unless --live) and then update score
+  `/ qend`           end this quarter: winner/tie, spreads, Q totals. Confirm Enter sends.
+  Esc                leave FILTER/TIME → NORMAL
+  Ctrl-U             clear filter + locked player
 
 NORMAL navigation
   ↑ / k / Ctrl-P     move up
@@ -2140,7 +2385,7 @@ class BrowserState:
     tracker: BackgroundBookTracker
     args: argparse.Namespace
     mode: str = "categories"  # categories | markets | detail | help | orders
-    input_mode: str = "normal"  # normal | filter
+    input_mode: str = "normal"  # normal | filter | time
     category: str = "game_lines"
     filter_text: str = ""
     cursor: int = 0
@@ -2156,16 +2401,39 @@ class BrowserState:
     sell_confirm_ticker: str = ""
     sell_confirm_qty: int = 0
     return_mode: str = "categories"  # mode to restore when leaving orders
+    session: Any = None
+    committed_player: str = ""
+    last_play_raw: str = ""
+    time_text: str = ""
+    draft: Any = None
+    script_mode: bool = False
+    script_log: list[dict[str, Any]] = field(default_factory=list)
+
+    def market_available(self, row: MarketRow) -> bool:
+        if self.session is None:
+            return True
+        ticker = str(row.ticker or "").upper()
+        if ticker in self.session.sent_markets:
+            return False
+        st = self.session.state()
+        series = row_series(row)
+        if st.game_tds >= 1 and series in {"KXNFLFIRSTTD", "KXNCAAFFIRSTTDTEAM"}:
+            return False
+        return True
 
     def category_counts(self) -> dict[str, int]:
         counts = {k: 0 for k in CATEGORY_ORDER}
         for row in self.rows:
+            if not self.market_available(row):
+                continue
             counts[classify_market(row)] = counts.get(classify_market(row), 0) + 1
         return counts
 
     def filtered_rows(self) -> list[MarketRow]:
         out: list[MarketRow] = []
         for row in self.rows:
+            if not self.market_available(row):
+                continue
             if self.category != "all" and classify_market(row) != self.category:
                 continue
             if not row_matches_filter(row, self.filter_text):
@@ -2217,12 +2485,32 @@ def format_filter_line(state: BrowserState, match_count: int | None = None) -> s
     else:
         unit = "match" if match_count == 1 else "matches"
         count_bit = f"  · {match_count} {unit}"
+    q = parse_play_query(needle)
+    intent_bit = ""
+    if q.intent == "rush":
+        intent_bit = "  · RUSH"
+    elif q.intent == "receiving":
+        intent_bit = "  · REC"
+    play_bit = f"  · player {state.committed_player}" if state.committed_player else ""
+    if state.input_mode == "time":
+        return f"TIME> {state.time_text}█  · qend · gb 7 · Esc normal"
     if filtering:
-        # Block caret so typed chars are obvious; real tty cursor parks here too.
-        return f"FILTER> {needle}█{count_bit}  · Esc/Enter normal · Ctrl-U clear"
+        if state.draft is not None:
+            return (
+                f"FILTER> {needle}█{count_bit}{intent_bit}{play_bit}  "
+                f"· re QB · ru rush · Enter confirms send"
+            )
+        if state.committed_player:
+            return (
+                f"FILTER> {needle}█{count_bit}{play_bit}  "
+                f"· td Enter · re/ru · pat · fg team"
+            )
+        return (
+            f"FILTER> {needle}█{count_bit}  · Tab name · Enter lock player"
+        )
     if needle:
-        return f"filter: {needle}{count_bit}  · f filter · Ctrl-U clear · NORMAL"
-    return f"filter: (empty){count_bit}  · f filter · NORMAL"
+        return f"filter: {needle}{count_bit}{intent_bit}{play_bit}  · f filter · Ctrl-U clear · NORMAL"
+    return f"filter: (empty){count_bit}  · f filter · / qend · NORMAL"
 
 
 def enter_filter_mode(state: BrowserState, *, jump_all: bool = False) -> None:
@@ -2241,7 +2529,8 @@ def enter_filter_mode(state: BrowserState, *, jump_all: bool = False) -> None:
 
 def leave_filter_mode(state: BrowserState) -> None:
     state.input_mode = "normal"
-    state.message = ""
+    if not state.message:
+        state.message = ""
 
 
 def clear_filter(state: BrowserState) -> None:
@@ -2249,6 +2538,380 @@ def clear_filter(state: BrowserState) -> None:
     state.cursor = 0
     state.offset = 0
     state.message = ""
+    state.committed_player = ""
+    state.last_play_raw = ""
+    state.time_text = ""
+    state.draft = None
+
+
+def _play_quantity(state: BrowserState) -> int:
+    return effective_count_yes(state.args)
+
+
+def _college_mode(state: BrowserState) -> bool:
+    if str(state.seed_series or "").upper().startswith("KXNCAAF"):
+        return True
+    return is_college_rows(state.rows)
+
+
+def _sync_draft_intent(state: BrowserState) -> None:
+    """If a TD draft is open, re/ru/pat/d updates legs when those tokens change."""
+    if state.session is None or state.draft is None:
+        return
+    q = parse_play_query(state.filter_text)
+    want_intent = q.intent if q.intent is not None else state.draft.intent
+    if want_intent == state.draft.intent and q.pat == state.draft.pat:
+        return
+    if state.draft.kind == "ncaaf_td":
+        draft, _cands, msg = arm_ncaaf_td_draft(
+            state.session,
+            state.rows,
+            q,
+            quantity=_play_quantity(state),
+            previous=state.draft,
+            intent=want_intent,
+        )
+    else:
+        draft, _cands, msg = arm_td_draft(
+            state.session,
+            state.rows,
+            q,
+            quantity=_play_quantity(state),
+            previous=state.draft,
+            intent=want_intent,
+            include_pat=q.pat,
+        )
+    state.draft = draft
+    state.message = msg
+    _log_script_draft(state)
+
+
+def _log_script_draft(state: BrowserState) -> None:
+    if not state.script_mode or state.session is None:
+        return
+    armed = state.session.arming.armed_bets()
+    state.script_log.append(
+        {
+            "event": "draft",
+            "filter": state.filter_text,
+            "message": state.message,
+            "armed": [
+                {"ticker": b.market_id, "side": b.side.value, "quantity": b.quantity}
+                for b in armed
+            ],
+        }
+    )
+
+
+def confirm_td_draft(state: BrowserState) -> None:
+    if state.session is None or state.draft is None:
+        return
+    if state.order_busy:
+        state.message = "order already in flight"
+        return
+    draft = state.draft
+    armed = [b for b in state.session.arming.armed_bets() if b.armed_id in set(draft.armed_ids)]
+    would_send = [
+        {
+            "ticker": b.market_id,
+            "side": b.side.value,
+            "quantity": b.quantity,
+            "reason": next(
+                (c.reason for c in state.session.arming.candidates() if c.candidate_id == b.candidate_id),
+                b.trigger,
+            ),
+        }
+        for b in armed
+    ]
+    sent = 0
+    missed: list[str] = []
+    if not state.script_mode:
+        tickers = [b.market_id for b in armed]
+        if tickers:
+            state.tracker.ensure_quotes(tickers, force=True)
+        state.order_busy = True
+        try:
+            for bet in armed:
+                row = next((r for r in state.rows if r.ticker.upper() == bet.market_id.upper()), None)
+                if row is None:
+                    missed.append(bet.market_id)
+                    continue
+                quote = state.tracker.quote(row.ticker)
+                live = bool(getattr(state.args, "live", False))
+                side = str(getattr(bet.side, "value", bet.side) or "yes").lower()
+                ask = quote.yes_ask if quote is not None else None
+                if side == "no":
+                    ask = quote.no_ask if quote is not None else None
+                if ask is None and not live:
+                    SESSION_BETS.record_buy(
+                        ticker=row.ticker,
+                        title=row.title or row.yes_sub_title or "",
+                        count=_play_quantity(state),
+                        limit_cents=None,
+                        live=False,
+                        dry_run=True,
+                        note=f"DRY-RUN BUY {side.upper()} {row.ticker} (no ask yet)",
+                        side=side,
+                    )
+                    sent += 1
+                    continue
+                if side == "no":
+                    ok, status = buy_no_for_market(args=state.args, row=row, quote=quote)
+                else:
+                    ok, status = buy_yes_for_market(args=state.args, row=row, quote=quote)
+                if ok:
+                    sent += 1
+                else:
+                    missed.append(short_label(status, 40))
+        finally:
+            state.order_busy = False
+            state.last_order_ts = time.time()
+    else:
+        sent = len(would_send)
+        state.script_log.append({"event": "confirm", "would_send": would_send})
+    state.session.mark_sent(b.market_id for b in armed)
+    if draft.kind == "fg":
+        recorded = apply_fg_draft(state.session, draft)
+    elif draft.kind == "extra":
+        recorded = apply_extra_draft(state.session, draft)
+    elif draft.kind == "qend":
+        recorded = apply_qend_draft(state.session, draft)
+    else:
+        recorded = apply_td_draft(state.session, draft)
+    for armed_id in list(draft.armed_ids):
+        try:
+            state.session.arming.disarm(armed_id)
+        except KeyError:
+            pass
+    state.draft = None
+    extra = f" · missed {len(missed)}" if missed else ""
+    state.message = f"sent {sent}/{len(armed)}{extra} · {recorded}"
+    state.filter_text = ""
+    state.committed_player = ""
+    state.cursor = 0
+    state.offset = 0
+    leave_filter_mode(state)
+
+
+def handle_filter_tab(state: BrowserState) -> None:
+    q = parse_play_query(state.filter_text)
+    if state.session is not None and (
+        q.kind == "fg" or (_college_mode(state) and q.kind in {None, "td", "fg"})
+    ):
+        st = state.session.state()
+        new_text, hits = tab_complete_team(state.filter_text, [st.away, st.home])
+        state.filter_text = new_text
+        state.cursor = 0
+        state.offset = 0
+        if len(hits) == 1:
+            team = resolve_game_team(hits[0], st.away, st.home) or hits[0].upper()
+            kind = q.kind or ("fg" if "fg" in state.filter_text.lower() else "")
+            if kind == "fg":
+                state.filter_text = f"fg {team.lower()} "
+                state.message = f"team {team} · Enter to arm FG"
+            elif kind == "td":
+                state.filter_text = f"{team.lower()} td "
+                state.message = f"team {team} · Enter to arm TD"
+            else:
+                state.filter_text = f"{team.lower()} "
+                state.message = f"team {team} · type td"
+            if not state.filter_text.endswith(" "):
+                state.filter_text += " "
+        elif hits:
+            state.message = "tab: " + ", ".join(hits)
+        else:
+            state.message = f"fg team? {st.away.lower()} or {st.home.lower()}"
+        if state.mode == "categories":
+            open_category(state, "all")
+        return
+    names = catalog_player_names(state.rows)
+    new_text, hits = tab_complete_player(state.filter_text, names)
+    state.filter_text = new_text
+    state.cursor = 0
+    state.offset = 0
+    if len(hits) == 1:
+        state.committed_player = hits[0]
+        if not state.filter_text.endswith(" "):
+            state.filter_text += " "
+        state.message = f"player {hits[0]} · type td then Enter"
+    elif hits:
+        state.message = "tab: " + ", ".join(hits[:8])
+    else:
+        state.message = "no name match"
+    if state.mode == "categories":
+        open_category(state, "all")
+
+
+def handle_filter_enter(state: BrowserState) -> None:
+    q = parse_play_query(state.filter_text)
+    if state.draft is not None:
+        confirm_td_draft(state)
+        return
+    if (
+        q.extra
+        and q.kind is None
+        and not q.name_tokens
+        and state.session is not None
+    ):
+        if q.extra in {"nopat", "no2pt"}:
+            if not state.session.pending_extra_team:
+                state.message = "no TD waiting for PAT/2PT"
+                return
+            state.message = apply_extra_miss(state.session, q.extra)
+            state.filter_text = ""
+            state.cursor = 0
+            leave_filter_mode(state)
+            return
+        if not state.session.pending_extra_team:
+            state.message = "no TD waiting for PAT/2PT"
+            return
+        draft, cands, msg = arm_extra_draft(
+            state.session,
+            state.rows,
+            q.extra,
+            quantity=_play_quantity(state),
+        )
+        if not cands:
+            recorded = apply_extra_draft(state.session, draft) if draft is not None else msg
+            state.message = recorded
+            state.filter_text = ""
+            state.cursor = 0
+            leave_filter_mode(state)
+            return
+        state.draft = draft
+        state.filter_text = f"{q.extra} "
+        state.message = msg
+        _log_script_draft(state)
+        return
+    if q.kind == "qend" and state.session is not None:
+        draft, _cands, msg = arm_qend_draft(
+            state.session, state.rows, quantity=_play_quantity(state)
+        )
+        state.draft = draft
+        state.filter_text = "qend "
+        state.message = msg
+        _log_script_draft(state)
+        return
+    if q.kind == "td" and _college_mode(state) and state.session is not None:
+        st = state.session.state()
+        if not q.name_tokens:
+            state.message = f"td which team? {st.away.lower()} / {st.home.lower()}"
+            return
+        team = resolve_game_team(q.name_tokens[0], st.away, st.home)
+        if not team:
+            handle_filter_tab(state)
+            return
+        draft, _cands, msg = arm_ncaaf_td_draft(
+            state.session,
+            state.rows,
+            q,
+            quantity=_play_quantity(state),
+            intent=q.intent,
+        )
+        state.draft = draft
+        trail = ""
+        if q.intent == "receiving":
+            trail = " re"
+        elif q.intent == "defense":
+            trail = " d"
+        state.filter_text = f"{team.lower()} td{trail} "
+        state.message = msg
+        _log_script_draft(state)
+        return
+    if q.kind == "fg" and state.session is not None:
+        st = state.session.state()
+        if not q.name_tokens:
+            state.message = f"fg which team? {st.away.lower()} / {st.home.lower()}"
+            return
+        team = resolve_game_team(q.name_tokens[0], st.away, st.home)
+        if not team:
+            handle_filter_tab(state)
+            return
+        draft, _cands, msg = arm_fg_draft(
+            state.session,
+            state.rows,
+            q,
+            quantity=_play_quantity(state),
+        )
+        state.draft = draft
+        state.filter_text = f"fg {team.lower()} "
+        state.message = msg
+        _log_script_draft(state)
+        return
+    if q.kind == "td" and q.name_tokens and state.session is not None:
+        draft, _cands, msg = arm_td_draft(
+            state.session,
+            state.rows,
+            q,
+            quantity=_play_quantity(state),
+            intent=q.intent,
+        )
+        state.draft = draft
+        state.committed_player = " ".join(q.name_tokens)
+        if not state.filter_text.endswith(" "):
+            state.filter_text += " "
+        state.message = msg
+        _log_script_draft(state)
+        return
+    if q.name_tokens and q.kind is None and q.intent is None:
+        if _college_mode(state) and state.session is not None:
+            st = state.session.state()
+            team = resolve_game_team(q.name_tokens[0], st.away, st.home)
+            if team:
+                state.filter_text = team.lower() + " "
+                state.message = f"team {team} · type td then Enter"
+                return
+        hits, display = unique_player_rows(state.rows, q.name_tokens)
+        if display:
+            last = display.split()[-1]
+            state.committed_player = last
+            state.filter_text = last + " "
+            state.message = f"player {display} · type td then Enter"
+            return
+        handle_filter_tab(state)
+        return
+    leave_filter_mode(state)
+
+
+def enter_time_mode(state: BrowserState) -> None:
+    state.input_mode = "time"
+    state.time_text = ""
+    st = state.session.state() if state.session is not None else None
+    if st is not None:
+        state.message = (
+            f"TIME Q{st.quarter} {st.away} {st.away_score}-{st.home_score} {st.home} "
+            f"· qend · {st.away.lower()} 7"
+        )
+    else:
+        state.message = "TIME · qend · team score"
+
+
+def handle_time_enter(state: BrowserState) -> None:
+    if state.session is None:
+        state.input_mode = "normal"
+        return
+    parsed = parse_time_line(state.time_text, state.session)
+    if parsed is None:
+        state.message = "time: qend | q 2 | gb 7"
+        return
+    kind, rest = parsed
+    qty = _play_quantity(state)
+    if kind == "qend":
+        _cands, msg = ingest_quarter_end(state.session, quantity=qty, auto_arm=True)
+        state.message = msg
+        state.time_text = ""
+    elif kind == "quarter":
+        from sports_engine.models import EventType, GameEvent
+
+        session = state.session
+        session.ingest(GameEvent(type=EventType.QUARTER, quarter=int(rest), source="timekeeping"))
+        st = session.state()
+        state.message = f"quarter Q{st.quarter}"
+        state.time_text = ""
+    elif kind == "score":
+        team, pts = rest.split()
+        state.message = ingest_score(state.session, team, int(pts))
+        state.time_text = ""
 
 
 def append_filter_char(state: BrowserState, ch: str) -> None:
@@ -2260,6 +2923,7 @@ def append_filter_char(state: BrowserState, ch: str) -> None:
     # Typing from categories with an active filter jumps into All markets.
     if state.mode == "categories":
         open_category(state, "all")
+    _sync_draft_intent(state)
 
 
 def render_browser(state: BrowserState) -> None:
@@ -2282,11 +2946,23 @@ def render_browser(state: BrowserState) -> None:
         match_count = sum(1 for row in state.rows if row_matches_filter(row, state.filter_text))
 
     lines: list[str] = []
-    mode_tag = "FILTER" if state.input_mode == "filter" else "NORMAL"
+    if state.input_mode == "filter":
+        mode_tag = "FILTER"
+    elif state.input_mode == "time":
+        mode_tag = "TIME"
+    else:
+        mode_tag = "NORMAL"
     lines.append(
         f"{state.seed_series}-{state.game_code}   markets={len(state.rows)}   "
         f"{mode_tag}   {ws_line}"
     )
+    if state.session is not None:
+        st = state.session.state()
+        n_arm = len(state.session.arming.armed_bets())
+        lines.append(
+            f"Q{st.quarter}  {st.away} {st.away_score}-{st.home_score} {st.home}  "
+            f"thisQ {st.points_this_quarter}  | armed {n_arm}"
+        )
     filter_line_idx = len(lines)  # 0-based index in lines; terminal row = idx + 1
     filter_line = format_filter_line(state, match_count)
     lines.append(filter_line)
@@ -2433,9 +3109,12 @@ def render_browser(state: BrowserState) -> None:
     sys.stdout.write("\n".join(lines) + "\n")
     # Park the real terminal cursor on the filter caret only in FILTER mode.
     if state.input_mode == "filter" and state.mode in {"categories", "markets"}:
-        # "FILTER> " prefix is 8 chars; caret sits on the █ after needle.
-        caret_col = 8 + len(state.filter_text) + 1  # 1-based columns
-        caret_row = filter_line_idx + 1  # 1-based rows after clear+home
+        caret_col = 8 + len(state.filter_text) + 1
+        caret_row = filter_line_idx + 1
+        sys.stdout.write(f"\033[{caret_row};{caret_col}H")
+    elif state.input_mode == "time":
+        caret_col = 6 + len(state.time_text) + 1
+        caret_row = filter_line_idx + 1
         sys.stdout.write(f"\033[{caret_row};{caret_col}H")
     sys.stdout.flush()
 
@@ -2596,7 +3275,10 @@ def handle_enter(state: BrowserState) -> None:
         # Enter confirms quit; caller checks quit_confirm after this.
         return
     if state.input_mode == "filter":
-        leave_filter_mode(state)
+        handle_filter_enter(state)
+        return
+    if state.draft is not None:
+        confirm_td_draft(state)
         return
     if state.mode == "categories":
         items = state.category_items()
@@ -2620,6 +3302,9 @@ def handle_back(state: BrowserState) -> bool:
         return False
     if state.input_mode == "filter":
         leave_filter_mode(state)
+        return False
+    if state.input_mode == "time":
+        state.input_mode = "normal"
         return False
     if state.mode == "help":
         state.mode = state.prev_mode
@@ -2649,6 +3334,83 @@ def handle_back(state: BrowserState) -> bool:
         clear_filter(state)
         return False
     return False
+
+
+def make_headless_state(
+    *,
+    seed_series: str,
+    game_code: str,
+    rows: list[MarketRow],
+    args: argparse.Namespace,
+) -> BrowserState:
+    return BrowserState(
+        seed_series=seed_series,
+        game_code=game_code,
+        rows=rows,
+        tracker=NullBookTracker(),
+        args=args,
+        session=make_browse_session(game_code, rows),
+        mode="markets",
+        category="all",
+        script_mode=True,
+    )
+
+
+def run_key_script(state: BrowserState, script: str) -> dict[str, Any]:
+    """Drive the same FILTER/Enter handlers as --browse. No TTY."""
+    for kind, value in parse_key_script(script):
+        if kind == "slash":
+            enter_filter_mode(state, jump_all=True)
+            continue
+        if kind == "enter":
+            if state.input_mode == "time":
+                handle_time_enter(state)
+            elif state.input_mode == "filter":
+                handle_filter_enter(state)
+            else:
+                handle_enter(state)
+            continue
+        if kind == "escape":
+            handle_back(state)
+            continue
+        if kind == "char" and value == "\t":
+            if state.input_mode == "filter":
+                handle_filter_tab(state)
+            continue
+        if kind == "word":
+            if state.input_mode == "time":
+                if state.time_text and not state.time_text.endswith(" "):
+                    state.time_text += " "
+                state.time_text += value
+                continue
+            if state.input_mode != "filter":
+                enter_filter_mode(state, jump_all=True)
+            if state.filter_text and not state.filter_text.endswith(" "):
+                append_filter_char(state, " ")
+            for ch in value:
+                append_filter_char(state, ch)
+            continue
+        if kind == "char" and state.input_mode == "filter":
+            append_filter_char(state, value)
+    st = state.session.state() if state.session is not None else None
+    return {
+        "script": script,
+        "game_code": state.game_code,
+        "filter": state.filter_text,
+        "message": state.message,
+        "committed_player": state.committed_player,
+        "state": None
+        if st is None
+        else {
+            "quarter": st.quarter,
+            "away": st.away,
+            "home": st.home,
+            "away_score": st.away_score,
+            "home_score": st.home_score,
+            "game_tds": st.game_tds,
+        },
+        "log": list(state.script_log),
+    }
 
 
 def run_browser(
@@ -2709,17 +3471,13 @@ def run_browser(
         log_path_disp = ORDER_LOG.path or default_log
     eprint(f"order memory log: {log_path_disp} (no write during submit)")
 
-    count_yes = effective_count_yes(args)
-    mode = "LIVE" if args.live else "DRY-RUN"
     state = BrowserState(
         seed_series=seed_series,
         game_code=game_code,
         rows=rows,
         tracker=tracker,
         args=args,
-        message=(
-            f"NORMAL · Enter BUY YES x{count_yes} ({mode}) · o orders · d detail · L log · f filter · Ctrl-H help"
-        ),
+        session=make_browse_session(game_code, rows),
     )
 
     fd = sys.stdin.fileno()
@@ -2800,13 +3558,34 @@ def run_browser(
                 clear_filter(state)
                 continue
 
+            if state.input_mode == "time":
+                if kind == "escape":
+                    state.input_mode = "normal"
+                    continue
+                if kind == "enter":
+                    handle_time_enter(state)
+                    continue
+                if kind == "backspace":
+                    state.time_text = state.time_text[:-1]
+                    continue
+                if kind == "ctrl" and value == "u":
+                    state.time_text = ""
+                    continue
+                if kind == "char" and value.isprintable() and value != "\t":
+                    state.time_text += value
+                    continue
+                continue
+
             # ---- FILTER input mode: all printable chars type into the query ----
             if state.input_mode == "filter":
                 if kind == "escape":
                     leave_filter_mode(state)
                     continue
                 if kind == "enter":
-                    leave_filter_mode(state)
+                    handle_filter_enter(state)
+                    continue
+                if kind == "char" and value == "\t":
+                    handle_filter_tab(state)
                     continue
                 if kind == "backspace":
                     if state.filter_text:
@@ -3151,6 +3930,51 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--engine-demo",
+        action="store_true",
+        help=(
+            "Run the sports_engine architecture slice (event → state → candidate "
+            "→ arm → mock execution). Skips catalog/browse. Never sends Kalshi orders."
+        ),
+    )
+    p.add_argument(
+        "--cache-market",
+        action="store_true",
+        help=(
+            "Write discovered markets to disk (default: "
+            "~/.local/share/kalshi-multiplex-orderbook/market-cache/{env}-{game}.json)."
+        ),
+    )
+    p.add_argument(
+        "--use-cache",
+        action="store_true",
+        help="Skip REST discovery; load --cache-market file instead.",
+    )
+    p.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Delete the cache file, then discover again unless --use-cache finds nothing.",
+    )
+    p.add_argument(
+        "--cache-file",
+        default=None,
+        help="Override market-cache JSON path.",
+    )
+    p.add_argument(
+        "--script",
+        default=None,
+        help=(
+            "Headless operator script using the same FILTER/Enter handlers, e.g. "
+            "'/ wa Enter td Enter re Enter'. Dumps JSON bets. Implies no TTY. "
+            "Does not submit Kalshi orders."
+        ),
+    )
+    p.add_argument(
+        "--script-file",
+        default=None,
+        help="Read --script text from a file.",
+    )
+    p.add_argument(
         "--no-ws",
         action="store_true",
         help="With --browse, do not start the background WebSocket tracker.",
@@ -3261,8 +4085,22 @@ def main(argv: list[str] | None = None) -> int:
         eprint(f"error: {exc}")
         return 2
 
+    if bool(getattr(args, "engine_demo", False)):
+        from sports_engine.demo import run_engine_demo
+
+        eprint("--engine-demo: mock execution only (Kalshi orders are not sent)")
+        return run_engine_demo(args, game_code=game_code, seed_series=seed_series)
+
     statuses = normalize_status_filter(args.status)
     league = league_prefix_from_series(seed_series)
+    cache_path = Path(args.cache_file) if getattr(args, "cache_file", None) else default_cache_path(
+        game_code, str(args.kalshi_env)
+    )
+    if bool(getattr(args, "clear_cache", False)):
+        if clear_market_cache(cache_path):
+            eprint(f"cleared cache {cache_path}")
+        else:
+            eprint(f"no cache file {cache_path}")
 
     t0 = time.time()
     eprint(
@@ -3272,26 +4110,56 @@ def main(argv: list[str] | None = None) -> int:
     eprint(f"status_filter={'all' if not statuses else ','.join(sorted(statuses))}")
     eprint(f"discovery={args.discovery} scan_all_series={bool(args.scan_all_series)}")
 
-    candidates = build_candidate_series(
-        args.host,
-        league_prefix=league,
-        seed_series=seed_series,
-        explicit_series=args.series or None,
-        include_season_long=bool(args.include_season_long),
-        scan_all_series=bool(args.scan_all_series),
-    )
-    if args.max_series and args.max_series > 0:
-        candidates = candidates[: args.max_series]
-    eprint(f"probing {len(candidates)} series")
+    rows: list[MarketRow] | None = None
+    hits: list[Any] = []
+    errors: list[Any] = []
+    loaded_cache = False
+    use_cache = bool(getattr(args, "use_cache", False))
+    if use_cache and cache_path.is_file():
+        data = load_market_cache(cache_path)
+        rows = []
+        for rec in data.get("markets") or []:
+            if not isinstance(rec, dict):
+                continue
+            row = market_row_from_raw(rec)
+            if row is not None:
+                rows.append(row)
+        hits = sorted({r.series_ticker for r in rows})
+        loaded_cache = True
+        eprint(f"loaded {len(rows)} markets from cache {cache_path}")
+    elif use_cache:
+        eprint(f"error: --use-cache but no file at {cache_path} (run --cache-market first)")
+        return 2
 
-    rows, hits, errors = discover_game_markets(
-        args.host,
-        game_code=game_code,
-        statuses=statuses,
-        candidate_series=candidates,
-        discovery=str(args.discovery),
-        pause_s=max(0.0, float(args.pause)),
-    )
+    if rows is None:
+        candidates = build_candidate_series(
+            args.host,
+            league_prefix=league,
+            seed_series=seed_series,
+            explicit_series=args.series or None,
+            include_season_long=bool(args.include_season_long),
+            scan_all_series=bool(args.scan_all_series),
+        )
+        if args.max_series and args.max_series > 0:
+            candidates = candidates[: args.max_series]
+        eprint(f"probing {len(candidates)} series")
+        rows, hits, errors = discover_game_markets(
+            args.host,
+            game_code=game_code,
+            statuses=statuses,
+            candidate_series=candidates,
+            discovery=str(args.discovery),
+            pause_s=max(0.0, float(args.pause)),
+        )
+        if bool(getattr(args, "cache_market", False)) and rows:
+            save_market_cache(
+                cache_path,
+                rows=rows,
+                game_code=game_code,
+                seed_series=seed_series,
+                kalshi_env=str(args.kalshi_env),
+            )
+            eprint(f"cached {len(rows)} markets → {cache_path}")
     elapsed = time.time() - t0
 
     if not rows:
@@ -3322,6 +4190,30 @@ def main(argv: list[str] | None = None) -> int:
                 elapsed=elapsed,
             )
         return 1
+
+    script_text = getattr(args, "script", None)
+    script_file = getattr(args, "script_file", None)
+    if script_file:
+        script_text = Path(script_file).expanduser().read_text(encoding="utf-8")
+    if script_text:
+        state = make_headless_state(
+            seed_series=seed_series,
+            game_code=game_code,
+            rows=rows,
+            args=args,
+        )
+        report = run_key_script(state, script_text)
+        print(json.dumps(report, indent=2))
+        return 0
+
+    if (
+        bool(getattr(args, "cache_market", False))
+        and not args.browse
+        and not args.watch
+        and not args.json
+    ):
+        print(f"{len(rows)} markets → {cache_path}")
+        return 0
 
     if args.browse:
         # Compact discovery summary on stderr; UI owns the screen.
