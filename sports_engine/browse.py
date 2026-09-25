@@ -23,7 +23,7 @@ from .session import SportsSession
 from .strategies.fg_ladder import FgLadderStrategy, preview_fg_ladder
 from .strategies.extra_points import extra_points_for, preview_extra_overs
 from .strategies.ncaaf_td import preview_ncaaf_td
-from .strategies.quarter_end import QuarterEndStrategy
+from .strategies.quarter_end import QuarterEndStrategy, preview_qend
 from .strategies.td_cluster import TdClusterStrategy, preview_td_cluster
 from .strategy_engine import StrategyEngine
 
@@ -383,6 +383,61 @@ def ingest_td_play(
                 pass
         return cands, format_candidates(cands)
     return cands, msg
+
+
+def arm_qend_draft(
+    session: SportsSession,
+    rows: Sequence[Any],
+    *,
+    quantity: int = 1,
+    previous: DraftPlay | None = None,
+) -> tuple[DraftPlay | None, list[CandidateBet], str]:
+    st = session.state()
+    if previous is not None:
+        for armed_id in previous.armed_ids:
+            try:
+                session.arming.disarm(armed_id)
+            except KeyError:
+                pass
+    cands = preview_qend(rows, st, sent=session.sent_markets)
+    session.arming.observe(cands)
+    armed_ids: list[str] = []
+    for cand in cands:
+        bet = session.arm(cand.candidate_id, quantity=quantity)
+        armed_ids.append(bet.armed_id)
+    q = st.quarter
+    away_q = st.away_score - st.away_score_at_q_start
+    home_q = st.home_score - st.home_score_at_q_start
+    draft = DraftPlay(
+        player="",
+        name_tokens=(),
+        kind="qend",
+        armed_ids=armed_ids,
+        display=f"Q{q}",
+    )
+    return (
+        draft,
+        cands,
+        format_candidates(cands, armed=True)
+        + f" · Q{q} {st.away} {away_q}-{home_q} {st.home} · Enter ends quarter",
+    )
+
+
+def apply_qend_draft(session: SportsSession, draft: DraftPlay) -> str:
+    st = session.state()
+    event = GameEvent(
+        type=EventType.QUARTER,
+        quarter=st.quarter,
+        payload={"end": True},
+        source="browse-confirm",
+        raw="qend",
+    )
+    session.ingest(event, evaluate=False)
+    st2 = session.state()
+    return (
+        f"recorded Q{draft.display or st.quarter} end · "
+        f"now Q{st2.quarter} {st2.away} {st2.away_score}-{st2.home_score} {st2.home}"
+    )
 
 
 def ingest_quarter_end(session: SportsSession, *, quantity: int = 1, auto_arm: bool = True) -> tuple[list[CandidateBet], str]:

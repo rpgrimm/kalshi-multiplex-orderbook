@@ -7,9 +7,10 @@ import unittest
 from types import SimpleNamespace
 
 from sports_engine.browse import (
+    apply_qend_draft,
     apply_td_draft,
+    arm_qend_draft,
     arm_td_draft,
-    ingest_quarter_end,
     make_browse_session,
 )
 from sports_engine.catalog import player_last_names
@@ -190,11 +191,14 @@ class TestPlayProtocol(unittest.TestCase):
     def test_qend_no_on_missed_overs_and_advances_quarter(self) -> None:
         rows = fixture()
         session = make_browse_session("26SEP17DETBUF", rows)
-        cands, msg = ingest_quarter_end(session, auto_arm=False)
+        draft, cands, msg = arm_qend_draft(session, rows)
         ids = {c.market_id for c in cands}
         self.assertIn("KXNFL1QTOTAL-26SEP17DETBUF-7", ids)
+        self.assertEqual(session.state().quarter, 1)
+        assert draft is not None
+        apply_qend_draft(session, draft)
         self.assertEqual(session.state().quarter, 2)
-        self.assertIn("now Q2", msg)
+        self.assertIn("Q1", msg)
 
 
 if __name__ == "__main__":

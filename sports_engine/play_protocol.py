@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 KIND_TD = frozenset({"td", "touchdown", "touchdowns"})
 KIND_FG = frozenset({"fg", "fieldgoal", "fieldgoals"})
+KIND_QEND = frozenset({"qend", "endq", "endqtr"})
 INTENT_REC = frozenset({"re", "rec", "recv", "receiving"})
 INTENT_RUSH = frozenset({"ru", "rush", "rushing"})
 INTENT_DEF = frozenset({"d", "def", "dst", "st"})
@@ -14,13 +15,13 @@ TWO_PT_TOKENS = frozenset({"2pt", "twopt", "two"})
 NO_PAT_TOKENS = frozenset({"nopat", "noxp", "misspat"})
 NO_2PT_TOKENS = frozenset({"no2pt", "miss2pt"})
 EXTRA_TOKENS = PAT_TOKENS | TWO_PT_TOKENS | NO_PAT_TOKENS | NO_2PT_TOKENS
-RESERVED = KIND_TD | KIND_FG | INTENT_REC | INTENT_RUSH | INTENT_DEF | EXTRA_TOKENS
+RESERVED = KIND_TD | KIND_FG | KIND_QEND | INTENT_REC | INTENT_RUSH | INTENT_DEF | EXTRA_TOKENS
 
 
 @dataclass(frozen=True)
 class PlayQuery:
     name_tokens: tuple[str, ...]
-    kind: str | None  # "td" | "fg" | None
+    kind: str | None  # "td" | "fg" | "qend" | None
     intent: str | None  # "receiving" | "rush" | "defense" | None
     pat: bool = False
     extra: str | None = None  # pat | 2pt | nopat | no2pt
@@ -42,6 +43,8 @@ class PlayQuery:
             # 1-char team prefix matches the game code (KCMIA) on every ticker.
             toks = [t for t in toks if len(t) >= 2]
             toks.append("fg")
+        if self.kind == "qend":
+            return []
         return toks
 
 
@@ -63,6 +66,8 @@ def parse_play_query(text: str) -> PlayQuery:
             kind = "td"
         elif tok in KIND_FG:
             kind = "fg"
+        elif tok in KIND_QEND:
+            kind = "qend"
         elif tok in NO_PAT_TOKENS:
             extra = "nopat"
         elif tok in NO_2PT_TOKENS:

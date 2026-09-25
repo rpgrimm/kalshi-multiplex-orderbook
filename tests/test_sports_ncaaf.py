@@ -11,9 +11,11 @@ from kalshi_sports_trader import make_headless_state, run_key_script
 from sports_engine.browse import (
     apply_extra_draft,
     apply_extra_miss,
+    apply_qend_draft,
     apply_td_draft,
     arm_extra_draft,
     arm_ncaaf_td_draft,
+    arm_qend_draft,
     make_browse_session,
 )
 from sports_engine.catalog import teams_from_game_code
@@ -51,6 +53,15 @@ def fixture():
         row(f"KXNCAAF1HTEAMTOTAL-{g}-FLA8", "Florida scores over 7.5 1H points", series="KXNCAAF1HTEAMTOTAL", floor=7.5),
         row(f"KXNCAAFGAME-{g}-FLA", "Florida wins", series="KXNCAAFGAME"),
         row(f"KXNCAAFGAME-{g}-MISS", "Ole Miss wins", series="KXNCAAFGAME"),
+        row(f"KXNCAAF1Q-{g}-FLA", "Florida wins the 1st quarter", series="KXNCAAF1Q"),
+        row(f"KXNCAAF1Q-{g}-MISS", "Ole Miss wins the 1st quarter", series="KXNCAAF1Q"),
+        row(f"KXNCAAF1Q-{g}-TIE", "1st quarter tie", series="KXNCAAF1Q"),
+        row(f"KXNCAAF1QSPREAD-{g}-FLA3", "Florida wins 1Q by over 2.5 points", series="KXNCAAF1QSPREAD", floor=2.5),
+        row(f"KXNCAAF1QSPREAD-{g}-FLA4", "Florida wins 1Q by over 3.5 points", series="KXNCAAF1QSPREAD", floor=3.5),
+        row(f"KXNCAAF1QSPREAD-{g}-FLA7", "Florida wins 1Q by over 6.5 points", series="KXNCAAF1QSPREAD", floor=6.5),
+        row(f"KXNCAAF1QSPREAD-{g}-FLA8", "Florida wins 1Q by over 7.5 points", series="KXNCAAF1QSPREAD", floor=7.5),
+        row(f"KXNCAAF1QSPREAD-{g}-MISS3", "Ole Miss wins 1Q by over 2.5 points", series="KXNCAAF1QSPREAD", floor=2.5),
+        row(f"KXNCAAF1QSPREAD-{g}-MISS7", "Ole Miss wins 1Q by over 6.5 points", series="KXNCAAF1QSPREAD", floor=6.5),
     ]
 
 
@@ -188,6 +199,45 @@ class TestNcaafTd(unittest.TestCase):
         confirms = [e for e in report["log"] if e["event"] == "confirm"]
         last = {b["ticker"] for b in confirms[-1]["would_send"]}
         self.assertTrue(any("1HTOTAL" in t and t.endswith("-7") for t in last))
+
+    def test_qend_florida_7_0(self) -> None:
+        rows = fixture()
+        session = make_browse_session("26SEP26MISSFLA", rows)
+        td, _, _ = arm_ncaaf_td_draft(session, rows, parse_play_query("f td"))
+        assert td is not None
+        apply_td_draft(session, td)
+        extra, _, _ = arm_extra_draft(session, rows, "pat")
+        assert extra is not None
+        apply_extra_draft(session, extra)
+        self.assertEqual(session.state().home_score, 7)
+        qend, cands, _ = arm_qend_draft(session, rows)
+        by = {(c.side.value, c.market_id.split("-")[-1], "SPREAD" in c.market_id, "TOTAL" in c.market_id) for c in cands}
+        ids = {c.market_id: c.side.value for c in cands}
+        self.assertEqual(ids.get("KXNCAAF1Q-26SEP26MISSFLA-FLA"), "yes")
+        self.assertEqual(ids.get("KXNCAAF1Q-26SEP26MISSFLA-MISS"), "no")
+        self.assertEqual(ids.get("KXNCAAF1Q-26SEP26MISSFLA-TIE"), "no")
+        self.assertEqual(ids.get("KXNCAAF1QSPREAD-26SEP26MISSFLA-FLA7"), "yes")
+        self.assertEqual(ids.get("KXNCAAF1QSPREAD-26SEP26MISSFLA-FLA8"), "no")
+        self.assertEqual(ids.get("KXNCAAF1QSPREAD-26SEP26MISSFLA-MISS3"), "no")
+        self.assertEqual(ids.get("KXNCAAF1QTOTAL-26SEP26MISSFLA-6"), "yes")
+        self.assertEqual(ids.get("KXNCAAF1QTOTAL-26SEP26MISSFLA-8"), "no")
+        self.assertEqual(session.state().quarter, 1)
+        assert qend is not None
+        apply_qend_draft(session, qend)
+        self.assertEqual(session.state().quarter, 2)
+
+    def test_script_qend(self) -> None:
+        state = make_headless_state(
+            seed_series="KXNCAAFGAME",
+            game_code="26SEP26MISSFLA",
+            rows=fixture(),
+            args=args(),
+        )
+        report = run_key_script(state, "/ qend Enter Enter")
+        self.assertEqual(report["state"]["quarter"], 2)
+        confirms = [e for e in report["log"] if e["event"] == "confirm"]
+        sent = {b["ticker"] for b in confirms[0]["would_send"]}
+        self.assertTrue(any(t.endswith("-TIE") for t in sent))
 
 
 if __name__ == "__main__":

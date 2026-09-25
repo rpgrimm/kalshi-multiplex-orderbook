@@ -68,10 +68,12 @@ from sports_engine.browse import (
     arm_extra_draft,
     arm_fg_draft,
     arm_ncaaf_td_draft,
+    arm_qend_draft,
     arm_td_draft,
     apply_extra_draft,
     apply_extra_miss,
     apply_fg_draft,
+    apply_qend_draft,
     apply_td_draft,
     catalog_player_names,
     ingest_quarter_end,
@@ -2324,8 +2326,10 @@ Modes (vim-style)
                      `re` = receiving (2+ ladder). `d` = also D/ST. Confirm Enter sends.
   `/ pat` `/ 2pt`    after a TD: +1 or +2 and arm newly crossed Q/H/game/team totals.
   `/ nopat` `/ no2pt` miss: no points, close the extra-point window.
+  `/ qend`           end this quarter (no TIME mode). Winner YES, loser/tie NO,
+                     covered spreads YES, uncovered/loser spreads NO, Q totals YES/NO.
   Enter again        send armed YES legs (dry-run unless --live) and then update score
-  t                  TIMEKEEPING: qend ends quarter (NO on missed overs)
+  `/ qend`           end this quarter: winner/tie, spreads, Q totals. Confirm Enter sends.
   Esc                leave FILTER/TIME → NORMAL
   Ctrl-U             clear filter + locked player
 
@@ -2506,7 +2510,7 @@ def format_filter_line(state: BrowserState, match_count: int | None = None) -> s
         )
     if needle:
         return f"filter: {needle}{count_bit}{intent_bit}{play_bit}  · f filter · Ctrl-U clear · NORMAL"
-    return f"filter: (empty){count_bit}  · f filter · t time · NORMAL"
+    return f"filter: (empty){count_bit}  · f filter · / qend · NORMAL"
 
 
 def enter_filter_mode(state: BrowserState, *, jump_all: bool = False) -> None:
@@ -2670,6 +2674,8 @@ def confirm_td_draft(state: BrowserState) -> None:
         recorded = apply_fg_draft(state.session, draft)
     elif draft.kind == "extra":
         recorded = apply_extra_draft(state.session, draft)
+    elif draft.kind == "qend":
+        recorded = apply_qend_draft(state.session, draft)
     else:
         recorded = apply_td_draft(state.session, draft)
     for armed_id in list(draft.armed_ids):
@@ -2774,6 +2780,15 @@ def handle_filter_enter(state: BrowserState) -> None:
             return
         state.draft = draft
         state.filter_text = f"{q.extra} "
+        state.message = msg
+        _log_script_draft(state)
+        return
+    if q.kind == "qend" and state.session is not None:
+        draft, _cands, msg = arm_qend_draft(
+            state.session, state.rows, quantity=_play_quantity(state)
+        )
+        state.draft = draft
+        state.filter_text = "qend "
         state.message = msg
         _log_script_draft(state)
         return
@@ -3681,10 +3696,6 @@ def run_browser(
 
             if kind == "char" and value in {"o", "O"} and state.mode != "help":
                 open_orders_page(state)
-                continue
-
-            if kind == "char" and value in {"t", "T"} and state.mode != "help":
-                enter_time_mode(state)
                 continue
 
             if state.mode == "orders" and kind == "char" and value in {"r", "R"}:
