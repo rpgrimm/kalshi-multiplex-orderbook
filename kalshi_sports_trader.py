@@ -65,6 +65,7 @@ from typing import Any, Iterable
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+from sports_engine.banner import load_banner
 from sports_engine.browse import (
     arm_extra_draft,
     arm_fg_draft,
@@ -3879,6 +3880,9 @@ def run_college_prompt(
         category="all",
     )
     live = "LIVE" if getattr(args, "live", False) else "dry-run"
+    banner = load_banner(getattr(args, "banner", None))
+    if banner:
+        print(banner)
     print(f"{seed_series}-{game_code}  {len(rows)} markets  {live}")
     print("type a command (h help) · empty Enter sends")
     try:
@@ -4422,6 +4426,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "After discovery, open the operator UI. NCAAF is a scrolling > prompt "
             "(no market list). NFL is the keyboard browser. Silent WS books when auth is available."
+        ),
+    )
+    p.add_argument(
+        "--banner",
+        default="default",
+        help=(
+            "NCAAF prompt ASCII banner stem under sports_engine/banners/ "
+            "(default, football, heisman). Edit or replace default.txt to swap."
         ),
     )
     p.add_argument(
