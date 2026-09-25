@@ -7,6 +7,8 @@ from .event_store import EventStore
 from .execution.mock import MockExecutionBackend
 from .execution_engine import ExecutionEngine
 from .game_state_engine import GameStateEngine
+from collections.abc import Sequence
+
 from .models import ArmedBet, CandidateBet, GameEvent, GameState, SimulatedOrder
 from .strategies.example import ScoreOccurredStrategy
 from .strategy_engine import StrategyEngine
@@ -34,6 +36,12 @@ class SportsSession:
         backend = MockExecutionBackend()
         self.execution = execution or ExecutionEngine(backend=backend)
         self.mock = backend if isinstance(self.execution.backend, MockExecutionBackend) else None
+        self.sent_markets: set[str] = set()
+
+    def mark_sent(self, tickers: Sequence[str]) -> None:
+        for t in tickers:
+            if t:
+                self.sent_markets.add(str(t).upper())
 
     def ingest(self, event: GameEvent, *, evaluate: bool = True) -> list[CandidateBet]:
         stored = self.store.append(event)

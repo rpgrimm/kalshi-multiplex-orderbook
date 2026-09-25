@@ -14,13 +14,14 @@ from .catalog import (
     player_last_names,
     resolve_game_team,
     team_abbrev_from_row,
-    teams_from_game_code,
+    teams_from_rows,
     unique_player_rows,
 )
 from .models import CandidateBet, EventType, GameEvent
 from .play_protocol import PlayQuery
 from .session import SportsSession
 from .strategies.fg_ladder import FgLadderStrategy, preview_fg_ladder
+from .strategies.ncaaf_td import preview_ncaaf_td
 from .strategies.quarter_end import QuarterEndStrategy
 from .strategies.td_cluster import TdClusterStrategy, preview_td_cluster
 from .strategy_engine import StrategyEngine
@@ -37,10 +38,11 @@ class DraftPlay:
     team_key: str = ""
     display: str = ""
     pat: bool = False
+    college: bool = False
 
 
 def make_browse_session(game_code: str, rows: Sequence[Any]) -> SportsSession:
-    away, home = teams_from_game_code(game_code)
+    away, home = teams_from_rows(rows, game_code)
     return SportsSession(
         game_code=game_code,
         away=away,
@@ -121,6 +123,56 @@ def arm_td_draft(
         bits = ["rush (no QB)"]
     if use_pat:
         bits.append("Q 6.5 armed" if has_q else "Q 6.5 NOT found")
+    bits.append("Enter confirms")
+    return draft, cands, format_candidates(cands, armed=True) + " · " + " · ".join(bits)
+
+
+def arm_ncaaf_td_draft(
+    session: SportsSession,
+    rows: Sequence[Any],
+    query: PlayQuery,
+    *,
+    quantity: int = 1,
+    previous: DraftPlay | None = None,
+    intent: str | None = None,
+) -> tuple[DraftPlay | None, list[CandidateBet], str]:
+    st = session.state()
+    token = query.name_tokens[0] if query.name_tokens else ""
+    team = resolve_game_team(token, st.away, st.home)
+    if not team:
+        return previous, [], f"td team? {st.away.lower()} or {st.home.lower()}"
+    use_intent = intent if intent is not None else query.intent
+    if previous is not None:
+        for armed_id in previous.armed_ids:
+            try:
+                session.arming.disarm(armed_id)
+            except KeyError:
+                pass
+    cands = preview_ncaaf_td(
+        rows, st, team, use_intent, sent=session.sent_markets
+    )
+    session.arming.observe(cands)
+    armed_ids: list[str] = []
+    for cand in cands:
+        bet = session.arm(cand.candidate_id, quantity=quantity)
+        armed_ids.append(bet.armed_id)
+    draft = DraftPlay(
+        player="",
+        name_tokens=(team.lower(),),
+        kind="ncaaf_td",
+        intent=use_intent,
+        armed_ids=armed_ids,
+        team=team,
+        team_key=team.lower(),
+        display=team,
+        college=True,
+    )
+    bits = ["offense"]
+    if use_intent == "receiving":
+        rec = st.team_rec_tds.get(team.lower(), 0) + 1
+        bits = [f"{team.lower()} {rec} receiving td"]
+    elif use_intent == "defense":
+        bits = ["D/ST"]
     bits.append("Enter confirms")
     return draft, cands, format_candidates(cands, armed=True) + " · " + " · ".join(bits)
 
@@ -210,8 +262,13 @@ def apply_td_draft(session: SportsSession, draft: DraftPlay) -> str:
         )
     st = session.state()
     extra = " + PAT" if draft.pat else ""
+    rec_note = ""
+    if draft.intent == "receiving" and draft.team:
+        rec = st.team_rec_tds.get(str(draft.team).lower(), 0)
+        rec_note = f" · {str(draft.team).lower()} {rec} receiving td"
+    who = draft.display or draft.team or draft.player
     return (
-        f"recorded {draft.display} TD{extra} · "
+        f"recorded {who} TD{extra}{rec_note} · "
         f"Q{st.quarter} {st.away} {st.away_score}-{st.home_score} {st.home} · "
         f"game TDs {st.game_tds}"
     )

@@ -66,6 +66,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 from sports_engine.browse import (
     arm_fg_draft,
+    arm_ncaaf_td_draft,
     arm_td_draft,
     apply_fg_draft,
     apply_td_draft,
@@ -75,7 +76,13 @@ from sports_engine.browse import (
     make_browse_session,
     parse_time_line,
 )
-from sports_engine.catalog import resolve_game_team, row_series, tab_complete_team, unique_player_rows
+from sports_engine.catalog import (
+    is_college_rows,
+    resolve_game_team,
+    row_series,
+    tab_complete_team,
+    unique_player_rows,
+)
 from sports_engine.key_script import parse_key_script
 from sports_engine.market_cache import (
     clear_market_cache,
@@ -826,6 +833,25 @@ def headers_to_dict(headers: Any) -> Any:
         return str(headers)
 
 
+def make_buy_no_limit_payload(
+    *,
+    ticker: str,
+    count: int,
+    no_limit_cents: int,
+    time_in_force: str = "immediate_or_cancel",
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "action": "buy",
+        "side": "no",
+        "count": int(count),
+        "type": "limit",
+        "client_order_id": str(uuid.uuid4()),
+        "no_price": clamp_price_cents(no_limit_cents),
+        "time_in_force": time_in_force,
+    }
+
+
 def make_buy_yes_limit_payload(
     *,
     ticker: str,
@@ -872,26 +898,39 @@ def make_event_order_v2_payload(legacy_payload: dict[str, Any]) -> dict[str, Any
         raise ValueError("sports trader currently supports limit orders only")
     action = str(legacy_payload.get("action") or "").lower()
     side = str(legacy_payload.get("side") or "").lower()
-    if side != "yes" or action not in {"buy", "sell"}:
+    if action not in {"buy", "sell"} or side not in {"yes", "no"}:
         raise ValueError(f"unsupported order shape action={action!r} side={side!r}")
-    yes_price = legacy_payload.get("yes_price")
-    if yes_price is None:
-        raise ValueError(f"{action.upper()} YES limit order missing yes_price")
     tif = legacy_payload.get("time_in_force") or "immediate_or_cancel"
     if tif == "GTT":
         tif = "good_till_canceled"
-    # V2 YES book: BUY YES = bid, SELL YES = ask (reduce_only).
+    if action == "buy" and side == "yes":
+        price = legacy_payload.get("yes_price")
+        if price is None:
+            raise ValueError("BUY YES limit order missing yes_price")
+        v2_side, v2_price, reduce = "bid", int(price), False
+    elif action == "buy" and side == "no":
+        price = legacy_payload.get("no_price")
+        if price is None:
+            raise ValueError("BUY NO limit order missing no_price")
+        v2_side, v2_price, reduce = "ask", 100 - int(price), False
+    elif action == "sell" and side == "yes":
+        price = legacy_payload.get("yes_price")
+        if price is None:
+            raise ValueError("SELL YES limit order missing yes_price")
+        v2_side, v2_price, reduce = "ask", int(price), True
+    else:
+        raise ValueError(f"unsupported order shape action={action!r} side={side!r}")
     return {
         "ticker": legacy_payload["ticker"],
         "client_order_id": legacy_payload.get("client_order_id") or str(uuid.uuid4()),
-        "side": "bid" if action == "buy" else "ask",
+        "side": v2_side,
         "count": fixed_contract_count(legacy_payload["count"]),
-        "price": fixed_dollar_price_from_cents(yes_price),
+        "price": fixed_dollar_price_from_cents(v2_price),
         "time_in_force": tif,
         "self_trade_prevention_type": "taker_at_cross",
         "post_only": False,
         "cancel_order_on_pause": False,
-        "reduce_only": action == "sell",
+        "reduce_only": reduce,
     }
 
 
@@ -1088,9 +1127,98 @@ def buy_yes_for_market(
     return ok, msg
 
 
+def buy_no_for_market(
+    *,
+    args: argparse.Namespace,
+    row: "MarketRow",
+    quote: "QuoteSnap | None",
+) -> tuple[bool, str]:
+    """BUY NO. Dry-run unless --live. Prices from NO ask + slippage."""
+    count = effective_count_yes(args)
+    if count <= 0:
+        return False, "ORDER ERROR: --count-yes must be positive"
+    try:
+        resolve_auth_settings(args, required=True)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"ORDER ERROR auth: {exc}"
+    ask = quote.no_ask if quote is not None else None
+    if ask is None:
+        return False, f"ORDER BLOCKED {row.ticker}: no NO ask yet"
+    slip = int(getattr(args, "slippage_cents", 1) or 0)
+    limit_cents = clamp_price_cents(int(ask) + slip)
+    legacy = make_buy_no_limit_payload(
+        ticker=row.ticker,
+        count=count,
+        no_limit_cents=limit_cents,
+        time_in_force=str(getattr(args, "time_in_force", "immediate_or_cancel")),
+    )
+    try:
+        v2 = make_event_order_v2_payload(legacy)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"ORDER ERROR payload: {exc}"
+    mode = "LIVE" if args.live else "DRY-RUN"
+    summary = (
+        f"{mode} BUY NO {row.ticker} count={count} "
+        f"ask={fmt_cents(ask)} limit={fmt_cents(limit_cents)}"
+    )
+    ORDER_LOG.record(
+        summary,
+        kind="order_built",
+        detail=f"payload_v2={json.dumps(v2, sort_keys=True)}",
+        ticker=row.ticker,
+        mode=mode,
+        live=bool(args.live),
+        ok=None if args.live else True,
+    )
+    if not args.live:
+        SESSION_BETS.record_buy(
+            ticker=row.ticker,
+            title=row.title or row.yes_sub_title or "",
+            count=count,
+            limit_cents=limit_cents,
+            live=False,
+            dry_run=True,
+            note=summary,
+            side="no",
+        )
+        return True, summary + " (not submitted; memory-log)"
+    try:
+        info = signed_json_request(
+            args,
+            method="POST",
+            path="/trade-api/v2/portfolio/events/orders",
+            body=v2,
+            timeout=float(getattr(args, "order_submit_timeout", 10.0)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        fail = f"ORDER FAIL {row.ticker}: {exc}"
+        ORDER_LOG.record(fail, kind="order_error", detail=str(exc), ticker=row.ticker, mode=mode, live=True, ok=False)
+        return False, fail
+    http_status = info.get("http_status")
+    ok = http_status is None or (isinstance(http_status, int) and 200 <= http_status < 300)
+    msg = (
+        f"LIVE OK BUY NO {row.ticker} count={count} limit={fmt_cents(limit_cents)} http={http_status}"
+        if ok
+        else f"LIVE REJECT BUY NO {row.ticker} http={http_status}"
+    )
+    ORDER_LOG.record(msg, kind="order_response", ticker=row.ticker, mode=mode, live=True, ok=ok)
+    if ok:
+        SESSION_BETS.record_buy(
+            ticker=row.ticker,
+            title=row.title or row.yes_sub_title or "",
+            count=count,
+            limit_cents=limit_cents,
+            live=True,
+            dry_run=False,
+            note=msg,
+            side="no",
+        )
+    return ok, msg
+
+
 @dataclass
 class SessionBet:
-    """One session-tracked BUY YES that went through (live or dry-run)."""
+    """One session-tracked BUY that went through (live or dry-run)."""
 
     ticker: str
     title: str
@@ -1101,6 +1229,7 @@ class SessionBet:
     dry_run: bool
     note: str = ""
     sold_count: int = 0
+    side: str = "yes"
 
     @property
     def remaining(self) -> int:
@@ -1126,6 +1255,7 @@ class SessionBetBook:
         live: bool,
         dry_run: bool,
         note: str = "",
+        side: str = "yes",
     ) -> SessionBet:
         bet = SessionBet(
             ticker=ticker,
@@ -1136,6 +1266,7 @@ class SessionBetBook:
             live=bool(live),
             dry_run=bool(dry_run),
             note=note or "",
+            side=str(side or "yes").lower(),
         )
         self.bets.append(bet)
         return bet
@@ -1296,7 +1427,14 @@ def orders_page_items(state: "BrowserState") -> list[dict[str, Any]]:
                 "ticker": t,
                 "title": title or title_by.get(t, ""),
                 "qty": int(rem),
-                "side": "YES",
+                "side": next(
+                    (
+                        str(b.side or "yes").upper()
+                        for b in SESSION_BETS.bets
+                        if b.ticker.upper() == t and b.remaining > 0
+                    ),
+                    "YES",
+                ),
                 "source": "session-live" if any_live else "session-dry",
                 "sellable": True,
                 "net": int(rem),
@@ -2179,6 +2317,8 @@ Modes (vim-style)
   then `ru`          rush: drop QB pass
   then `pat`         PAT good: add this-Q over 6.5
   `fg m` then Enter  arm this game's team FG ladder (m→MIA, k→KC). Confirm Enter sends.
+  NCAAF `/ f td`     team TD: first-TD YES/NOs + Q/H overs a 6-pt score clears.
+                     `re` = receiving (2+ ladder). `d` = also D/ST. Confirm Enter sends.
   Enter again        send armed YES legs (dry-run unless --live) and then update score
   t                  TIMEKEEPING: qend ends quarter (NO on missed overs)
   Esc                leave FILTER/TIME → NORMAL
@@ -2263,7 +2403,12 @@ class BrowserState:
     def market_available(self, row: MarketRow) -> bool:
         if self.session is None:
             return True
-        if self.session.state().game_tds >= 1 and row_series(row) == "KXNFLFIRSTTD":
+        ticker = str(row.ticker or "").upper()
+        if ticker in self.session.sent_markets:
+            return False
+        st = self.session.state()
+        series = row_series(row)
+        if st.game_tds >= 1 and series in {"KXNFLFIRSTTD", "KXNCAAFFIRSTTDTEAM"}:
             return False
         return True
 
@@ -2394,23 +2539,39 @@ def _play_quantity(state: BrowserState) -> int:
     return effective_count_yes(state.args)
 
 
+def _college_mode(state: BrowserState) -> bool:
+    if str(state.seed_series or "").upper().startswith("KXNCAAF"):
+        return True
+    return is_college_rows(state.rows)
+
+
 def _sync_draft_intent(state: BrowserState) -> None:
-    """If a TD draft is open, re/ru/pat updates legs when those tokens change."""
+    """If a TD draft is open, re/ru/pat/d updates legs when those tokens change."""
     if state.session is None or state.draft is None:
         return
     q = parse_play_query(state.filter_text)
     want_intent = q.intent if q.intent is not None else state.draft.intent
     if want_intent == state.draft.intent and q.pat == state.draft.pat:
         return
-    draft, _cands, msg = arm_td_draft(
-        state.session,
-        state.rows,
-        q,
-        quantity=_play_quantity(state),
-        previous=state.draft,
-        intent=want_intent,
-        include_pat=q.pat,
-    )
+    if state.draft.kind == "ncaaf_td":
+        draft, _cands, msg = arm_ncaaf_td_draft(
+            state.session,
+            state.rows,
+            q,
+            quantity=_play_quantity(state),
+            previous=state.draft,
+            intent=want_intent,
+        )
+    else:
+        draft, _cands, msg = arm_td_draft(
+            state.session,
+            state.rows,
+            q,
+            quantity=_play_quantity(state),
+            previous=state.draft,
+            intent=want_intent,
+            include_pat=q.pat,
+        )
     state.draft = draft
     state.message = msg
     _log_script_draft(state)
@@ -2468,7 +2629,11 @@ def confirm_td_draft(state: BrowserState) -> None:
                     continue
                 quote = state.tracker.quote(row.ticker)
                 live = bool(getattr(state.args, "live", False))
-                if (quote is None or quote.yes_ask is None) and not live:
+                side = str(getattr(bet.side, "value", bet.side) or "yes").lower()
+                ask = quote.yes_ask if quote is not None else None
+                if side == "no":
+                    ask = quote.no_ask if quote is not None else None
+                if ask is None and not live:
                     SESSION_BETS.record_buy(
                         ticker=row.ticker,
                         title=row.title or row.yes_sub_title or "",
@@ -2476,11 +2641,15 @@ def confirm_td_draft(state: BrowserState) -> None:
                         limit_cents=None,
                         live=False,
                         dry_run=True,
-                        note=f"DRY-RUN BUY YES {row.ticker} (no YES ask yet)",
+                        note=f"DRY-RUN BUY {side.upper()} {row.ticker} (no ask yet)",
+                        side=side,
                     )
                     sent += 1
                     continue
-                ok, status = buy_yes_for_market(args=state.args, row=row, quote=quote)
+                if side == "no":
+                    ok, status = buy_no_for_market(args=state.args, row=row, quote=quote)
+                else:
+                    ok, status = buy_yes_for_market(args=state.args, row=row, quote=quote)
                 if ok:
                     sent += 1
                 else:
@@ -2491,6 +2660,7 @@ def confirm_td_draft(state: BrowserState) -> None:
     else:
         sent = len(would_send)
         state.script_log.append({"event": "confirm", "would_send": would_send})
+    state.session.mark_sent(b.market_id for b in armed)
     if draft.kind == "fg":
         recorded = apply_fg_draft(state.session, draft)
     else:
@@ -2512,7 +2682,9 @@ def confirm_td_draft(state: BrowserState) -> None:
 
 def handle_filter_tab(state: BrowserState) -> None:
     q = parse_play_query(state.filter_text)
-    if q.kind == "fg" and state.session is not None:
+    if state.session is not None and (
+        q.kind == "fg" or (_college_mode(state) and q.kind in {None, "td", "fg"})
+    ):
         st = state.session.state()
         new_text, hits = tab_complete_team(state.filter_text, [st.away, st.home])
         state.filter_text = new_text
@@ -2520,8 +2692,18 @@ def handle_filter_tab(state: BrowserState) -> None:
         state.offset = 0
         if len(hits) == 1:
             team = resolve_game_team(hits[0], st.away, st.home) or hits[0].upper()
-            state.filter_text = f"fg {team.lower()} "
-            state.message = f"team {team} · Enter to arm FG"
+            kind = q.kind or ("fg" if "fg" in state.filter_text.lower() else "")
+            if kind == "fg":
+                state.filter_text = f"fg {team.lower()} "
+                state.message = f"team {team} · Enter to arm FG"
+            elif kind == "td":
+                state.filter_text = f"{team.lower()} td "
+                state.message = f"team {team} · Enter to arm TD"
+            else:
+                state.filter_text = f"{team.lower()} "
+                state.message = f"team {team} · type td"
+            if not state.filter_text.endswith(" "):
+                state.filter_text += " "
         elif hits:
             state.message = "tab: " + ", ".join(hits)
         else:
@@ -2551,6 +2733,32 @@ def handle_filter_enter(state: BrowserState) -> None:
     q = parse_play_query(state.filter_text)
     if state.draft is not None:
         confirm_td_draft(state)
+        return
+    if q.kind == "td" and _college_mode(state) and state.session is not None:
+        st = state.session.state()
+        if not q.name_tokens:
+            state.message = f"td which team? {st.away.lower()} / {st.home.lower()}"
+            return
+        team = resolve_game_team(q.name_tokens[0], st.away, st.home)
+        if not team:
+            handle_filter_tab(state)
+            return
+        draft, _cands, msg = arm_ncaaf_td_draft(
+            state.session,
+            state.rows,
+            q,
+            quantity=_play_quantity(state),
+            intent=q.intent,
+        )
+        state.draft = draft
+        trail = ""
+        if q.intent == "receiving":
+            trail = " re"
+        elif q.intent == "defense":
+            trail = " d"
+        state.filter_text = f"{team.lower()} td{trail} "
+        state.message = msg
+        _log_script_draft(state)
         return
     if q.kind == "fg" and state.session is not None:
         st = state.session.state()
@@ -2588,6 +2796,13 @@ def handle_filter_enter(state: BrowserState) -> None:
         _log_script_draft(state)
         return
     if q.name_tokens and q.kind is None and q.intent is None:
+        if _college_mode(state) and state.session is not None:
+            st = state.session.state()
+            team = resolve_game_team(q.name_tokens[0], st.away, st.home)
+            if team:
+                state.filter_text = team.lower() + " "
+                state.message = f"team {team} · type td then Enter"
+                return
         hits, display = unique_player_rows(state.rows, q.name_tokens)
         if display:
             last = display.split()[-1]

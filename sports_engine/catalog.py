@@ -14,11 +14,42 @@ NFL_TEAM_ABBREVS = frozenset(
         "TEN", "WAS", "WSH",
     }
 )
+# Kalshi NCAAF suffixes are 2–4 letters (MISS/FLA, ALA/UGA, …).
+NCAA_TEAM_ABBREVS = frozenset(
+    {
+        "ALA", "APP", "ARK", "ARMY", "AUB", "BAY", "BC", "BSU", "BYU", "CAL",
+        "CCU", "CHAR", "CIN", "CLEM", "COLO", "CONN", "DUKE", "ECU", "FAU",
+        "FIU", "FLA", "FRES", "FSU", "GASO", "GAST", "GT", "HOU", "ILL", "IND",
+        "IOWA", "ISU", "JMU", "KSU", "LIB", "LOU", "LSU", "LT", "MD", "MEM",
+        "MIA", "MICH", "MINN", "MISS", "MIZZ", "MRSH", "MSU", "MTSU", "NAVY",
+        "NCST", "ND", "NEB", "NMSU", "NW", "ODU", "OKLA", "OKST", "ORE", "ORST",
+        "OSU", "OU", "PITT", "PSU", "PUR", "RICE", "RUT", "SC", "SDSU", "SMU",
+        "STAN", "SYR", "TAM", "TCU", "TEMP", "TENN", "TEX", "TLSA", "TROY",
+        "TTU", "TULN", "UAB", "UCF", "UCLA", "UGA", "UK", "UNC", "UNLV", "UNT",
+        "USA", "USC", "USF", "USM", "UTAH", "UTEP", "VT", "WAKE", "WASH",
+        "WISC", "WKU", "WSU", "WYO",
+    }
+)
+TEAM_ABBREVS = NFL_TEAM_ABBREVS | NCAA_TEAM_ABBREVS
 Q_TOTAL_SERIES = {
     1: "KXNFL1QTOTAL",
     2: "KXNFL2QTOTAL",
     3: "KXNFL3QTOTAL",
     4: "KXNFL4QTOTAL",
+}
+NCAAF_Q_TOTAL_SERIES = {
+    1: "KXNCAAF1QTOTAL",
+    2: "KXNCAAF2QTOTAL",
+    3: "KXNCAAF3QTOTAL",
+    4: "KXNCAAF4QTOTAL",
+}
+NCAAF_H_TOTAL_SERIES = {
+    1: "KXNCAAF1HTOTAL",
+    2: "KXNCAAF2HTOTAL",
+}
+NCAAF_H_TEAM_TOTAL_SERIES = {
+    1: "KXNCAAF1HTEAMTOTAL",
+    2: "KXNCAAF2HTEAMTOTAL",
 }
 SKIP_TITLE = ("D/ST", "No Touchdown")
 
@@ -35,17 +66,39 @@ def teams_from_game_code(game_code: str) -> tuple[str, str]:
     matched = _GAME_DATE_RE.match(text)
     blob = matched.group(2) if matched else text
     found: list[tuple[str, str]] = []
-    for a_len in (2, 3):
+    for a_len in (4, 3, 2):
         b_len = len(blob) - a_len
-        if b_len not in (2, 3):
+        if b_len not in (2, 3, 4):
             continue
         a, b = blob[:a_len], blob[a_len:]
-        if a in NFL_TEAM_ABBREVS and b in NFL_TEAM_ABBREVS:
+        if a in TEAM_ABBREVS and b in TEAM_ABBREVS:
             found.append((a, b))
     if found:
         found.sort(key=lambda pair: -(len(pair[0]) + len(pair[1])))
         return found[0]
     return "AWAY", "HOME"
+
+
+def is_college_rows(rows: Sequence[Any]) -> bool:
+    return any(str(row_series(row)).startswith("KXNCAAF") for row in rows)
+
+
+def teams_from_rows(rows: Sequence[Any], game_code: str) -> tuple[str, str]:
+    away, home = teams_from_game_code(game_code)
+    if away != "AWAY" and home != "HOME":
+        return away, home
+    skip = {"NONE", "TIE", "Y", "N"}
+    codes: list[str] = []
+    for row in rows:
+        if row_series(row) not in {"KXNCAAFGAME", "KXNFLGAME", "KXNCAAFFIRSTTDTEAM"}:
+            continue
+        suffix = ticker_parts(str(getattr(row, "ticker", "") or ""))[2]
+        if not suffix or suffix in skip or suffix in codes:
+            continue
+        codes.append(suffix)
+        if len(codes) == 2:
+            return codes[0], codes[1]
+    return away, home
 
 
 def row_series(row: Any) -> str:
@@ -236,6 +289,61 @@ def tab_complete_team(text: str, teams: Sequence[str]) -> tuple[str, list[str]]:
     if len(labels) == 1:
         return prefix + labels[0], labels
     return text, labels
+
+
+def ncaaf_first_td_rows(rows: Sequence[Any]) -> list[Any]:
+    return [row for row in rows if row_series(row) == "KXNCAAFFIRSTTDTEAM"]
+
+
+def ncaaf_dst_td_row(rows: Sequence[Any]) -> Any | None:
+    hits = [row for row in rows if row_series(row) == "KXNCAAFDSTTD"]
+    return hits[0] if len(hits) == 1 else None
+
+
+def find_ncaaf_team_rec_td(
+    rows: Sequence[Any],
+    team: str,
+    floor: float,
+    game_code: str,
+) -> Any | None:
+    want = str(team or "").upper()
+    hits = [
+        row
+        for row in rows
+        if row_series(row) == "KXNCAAFTEAMRECTD"
+        and floor_equals(row, floor)
+        and team_abbrev_from_row(row, game_code) == want
+    ]
+    return hits[0] if len(hits) == 1 else None
+
+
+def overs_cleared_by(
+    rows: Sequence[Any],
+    series: str,
+    *,
+    before: float,
+    after: float,
+    game_code: str = "",
+    team: str | None = None,
+    sent: set[str] | None = None,
+) -> list[Any]:
+    """YES overs with floor in (before, after]."""
+    skip = {s.upper() for s in (sent or set())}
+    want_team = str(team or "").upper() or None
+    out: list[Any] = []
+    for row in rows:
+        if row_series(row) != str(series).upper():
+            continue
+        mid = market_id(row)
+        if mid in skip:
+            continue
+        fl = row_floor(row)
+        if fl is None or not (float(before) < fl <= float(after)):
+            continue
+        if want_team and team_abbrev_from_row(row, game_code) != want_team:
+            continue
+        out.append(row)
+    return out
 
 
 def find_team_fg(

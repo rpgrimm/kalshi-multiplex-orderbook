@@ -8,15 +8,16 @@ KIND_TD = frozenset({"td", "touchdown", "touchdowns"})
 KIND_FG = frozenset({"fg", "fieldgoal", "fieldgoals"})
 INTENT_REC = frozenset({"re", "rec", "recv", "receiving"})
 INTENT_RUSH = frozenset({"ru", "rush", "rushing"})
+INTENT_DEF = frozenset({"d", "def", "dst", "st"})
 PAT_TOKENS = frozenset({"pat", "xp", "xpt", "extra"})
-RESERVED = KIND_TD | KIND_FG | INTENT_REC | INTENT_RUSH | PAT_TOKENS
+RESERVED = KIND_TD | KIND_FG | INTENT_REC | INTENT_RUSH | INTENT_DEF | PAT_TOKENS
 
 
 @dataclass(frozen=True)
 class PlayQuery:
     name_tokens: tuple[str, ...]
     kind: str | None  # "td" | "fg" | None
-    intent: str | None  # "receiving" | "rush" | None
+    intent: str | None  # "receiving" | "rush" | "defense" | None
     pat: bool = False
     raw: str = ""
 
@@ -27,10 +28,11 @@ class PlayQuery:
         return self.kind == "fg" and bool(self.name_tokens)
 
     def filter_tokens(self) -> list[str]:
-        """Tokens that may AND against market haystack. Never includes re/ru/pat."""
+        """Tokens that may AND against market haystack. Never includes re/ru/pat/d."""
         toks = list(self.name_tokens)
         if self.kind == "td":
             toks.append("td")
+            toks = [t for t in toks if len(t) >= 2 or t == "td"]
         if self.kind == "fg":
             # 1-char team prefix matches the game code (KCMIA) on every ticker.
             toks = [t for t in toks if len(t) >= 2]
@@ -49,6 +51,8 @@ def parse_play_query(text: str) -> PlayQuery:
             intent = "receiving"
         elif tok in INTENT_RUSH:
             intent = "rush"
+        elif tok in INTENT_DEF:
+            intent = "defense"
         elif tok in KIND_TD:
             kind = "td"
         elif tok in KIND_FG:
