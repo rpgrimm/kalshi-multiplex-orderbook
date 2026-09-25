@@ -9,9 +9,20 @@ from .execution_engine import ExecutionEngine
 from .game_state_engine import GameStateEngine
 from collections.abc import Sequence
 
+from dataclasses import dataclass, field
+
 from .models import ArmedBet, CandidateBet, GameEvent, GameState, SimulatedOrder
 from .strategies.example import ScoreOccurredStrategy
 from .strategy_engine import StrategyEngine
+
+
+@dataclass
+class PlayRecord:
+    kind: str
+    label: str
+    n_events: int
+    sent: list[dict] = field(default_factory=list)
+    pending_extra_before: str | None = None
 
 
 class SportsSession:
@@ -38,11 +49,50 @@ class SportsSession:
         self.mock = backend if isinstance(self.execution.backend, MockExecutionBackend) else None
         self.sent_markets: set[str] = set()
         self.pending_extra_team: str | None = None
+        self.plays: list[PlayRecord] = []
 
     def mark_sent(self, tickers: Sequence[str]) -> None:
         for t in tickers:
             if t:
                 self.sent_markets.add(str(t).upper())
+
+    def record_play(
+        self,
+        *,
+        kind: str,
+        label: str,
+        n_events: int,
+        sent: Sequence[dict] | None = None,
+        pending_extra_before: str | None = None,
+    ) -> PlayRecord:
+        play = PlayRecord(
+            kind=kind,
+            label=label,
+            n_events=max(0, int(n_events)),
+            sent=[dict(x) for x in (sent or [])],
+            pending_extra_before=pending_extra_before,
+        )
+        self.plays.append(play)
+        return play
+
+    def rebuild_sent_markets(self) -> None:
+        self.sent_markets = {
+            str(leg.get("ticker") or "").upper()
+            for play in self.plays
+            for leg in play.sent
+            if leg.get("ticker")
+        }
+
+    def rollback_last_play(self) -> PlayRecord | None:
+        if not self.plays:
+            return None
+        play = self.plays.pop()
+        if play.n_events:
+            self.store.pop_last(play.n_events)
+        self.replay()
+        self.pending_extra_team = play.pending_extra_before
+        self.rebuild_sent_markets()
+        return play
 
     def ingest(self, event: GameEvent, *, evaluate: bool = True) -> list[CandidateBet]:
         stored = self.store.append(event)

@@ -52,6 +52,41 @@ class TestNcaafPrompt(unittest.TestCase):
         handle_prompt_line(state, "")
         self.assertEqual(state.session.state().home_score, 3)
 
+    def test_rb_undoes_td_and_asks_sell(self) -> None:
+        state = self._state()
+        handle_prompt_line(state, "f td")
+        handle_prompt_line(state, "")
+        self.assertEqual(state.session.state().home_score, 6)
+        rb = handle_prompt_line(state, "rb")
+        self.assertEqual(state.session.state().home_score, 0)
+        self.assertTrue(any("rolled back" in line for line in rb))
+        self.assertTrue(any("sell them" in line for line in rb))
+        self.assertIsNotNone(state.rollback_offer)
+        keep = handle_prompt_line(state, "n")
+        self.assertEqual(keep, ["kept those positions"])
+        armed = handle_prompt_line(state, "f td")
+        self.assertTrue(any("FIRSTTDTEAM" in line for line in armed))
+
+    def test_rb_then_y_sells(self) -> None:
+        state = self._state()
+        handle_prompt_line(state, "f td")
+        handle_prompt_line(state, "")
+        handle_prompt_line(state, "rb")
+        sold = handle_prompt_line(state, "y")
+        self.assertTrue(any(line.startswith("SELL ") or line.startswith("sold ") for line in sold))
+        self.assertTrue(any("DRY-RUN SELL" in line or line.startswith("sold ") for line in sold))
+
+    def test_rb_pat_restores_extra_window(self) -> None:
+        state = self._state()
+        handle_prompt_line(state, "f td")
+        handle_prompt_line(state, "")
+        handle_prompt_line(state, "pat")
+        handle_prompt_line(state, "")
+        self.assertEqual(state.session.state().home_score, 7)
+        handle_prompt_line(state, "rb")
+        self.assertEqual(state.session.state().home_score, 6)
+        self.assertEqual(state.session.pending_extra_team, "FLA")
+
     def test_quit(self) -> None:
         state = self._state()
         self.assertEqual(handle_prompt_line(state, "q"), ["quit"])

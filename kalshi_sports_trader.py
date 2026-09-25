@@ -878,6 +878,25 @@ def make_buy_yes_limit_payload(
     }
 
 
+def make_sell_no_limit_payload(
+    *,
+    ticker: str,
+    count: int,
+    no_limit_cents: int,
+    time_in_force: str = "immediate_or_cancel",
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "action": "sell",
+        "side": "no",
+        "count": int(count),
+        "type": "limit",
+        "client_order_id": str(uuid.uuid4()),
+        "no_price": clamp_price_cents(no_limit_cents),
+        "time_in_force": time_in_force,
+    }
+
+
 def make_sell_yes_limit_payload(
     *,
     ticker: str,
@@ -925,7 +944,10 @@ def make_event_order_v2_payload(legacy_payload: dict[str, Any]) -> dict[str, Any
             raise ValueError("SELL YES limit order missing yes_price")
         v2_side, v2_price, reduce = "ask", int(price), True
     else:
-        raise ValueError(f"unsupported order shape action={action!r} side={side!r}")
+        price = legacy_payload.get("no_price")
+        if price is None:
+            raise ValueError("SELL NO limit order missing no_price")
+        v2_side, v2_price, reduce = "bid", 100 - int(price), True
     return {
         "ticker": legacy_payload["ticker"],
         "client_order_id": legacy_payload.get("client_order_id") or str(uuid.uuid4()),
@@ -1277,12 +1299,15 @@ class SessionBetBook:
         self.bets.append(bet)
         return bet
 
-    def mark_sold(self, ticker: str, count: int) -> None:
+    def mark_sold(self, ticker: str, count: int, side: str | None = None) -> None:
         left = int(count)
+        want = str(side or "").lower() or None
         if left <= 0:
             return
         for bet in reversed(self.bets):
-            if bet.ticker != ticker or bet.remaining <= 0:
+            if bet.ticker.upper() != str(ticker).upper() or bet.remaining <= 0:
+                continue
+            if want and str(bet.side or "yes").lower() != want:
                 continue
             take = min(bet.remaining, left)
             bet.sold_count += take
@@ -1557,6 +1582,58 @@ def sell_yes_for_position(
     )
     return ok, msg
 
+
+def sell_no_for_position(
+    *,
+    args: argparse.Namespace,
+    ticker: str,
+    title: str,
+    count: int,
+    quote: "QuoteSnap | None",
+) -> tuple[bool, str]:
+    count = int(count)
+    if count <= 0:
+        return False, "SELL ERROR: count must be positive"
+    try:
+        resolve_auth_settings(args, required=True)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"SELL ERROR auth: {exc}"
+    bid = quote.no_bid if quote is not None else None
+    if bid is None:
+        return False, f"SELL BLOCKED {ticker}: no NO bid yet"
+    slip = int(getattr(args, "slippage_cents", 1) or 0)
+    limit_cents = clamp_price_cents(int(bid) - slip)
+    legacy = make_sell_no_limit_payload(
+        ticker=ticker,
+        count=count,
+        no_limit_cents=limit_cents,
+        time_in_force=str(getattr(args, "time_in_force", "immediate_or_cancel")),
+    )
+    try:
+        v2 = make_event_order_v2_payload(legacy)
+    except Exception as extra:  # noqa: BLE001
+        return False, f"SELL ERROR payload: {extra}"
+    mode = "LIVE" if args.live else "DRY-RUN"
+    summary = f"{mode} SELL NO {ticker} count={count} bid={fmt_cents(bid)} limit={fmt_cents(limit_cents)}"
+    if not args.live:
+        SESSION_BETS.mark_sold(ticker, count, side="no")
+        return True, summary + " (not submitted; memory-log)"
+    try:
+        info = signed_json_request(
+            args,
+            method="POST",
+            path="/trade-api/v2/portfolio/events/orders",
+            body=v2,
+            timeout=float(getattr(args, "order_submit_timeout", 10.0)),
+        )
+    except Exception as extra:  # noqa: BLE001
+        return False, f"SELL FAIL {ticker}: {extra}"
+    http_status = info.get("http_status")
+    ok = http_status is None or (isinstance(http_status, int) and 200 <= http_status < 300)
+    if ok:
+        SESSION_BETS.mark_sold(ticker, count, side="no")
+        return True, f"LIVE OK SELL NO {ticker} count={count} http={http_status}"
+    return False, f"LIVE REJECT SELL NO {ticker} http={http_status}"
 
 
 def _import_kx_auth():
@@ -2409,6 +2486,7 @@ class BrowserState:
     draft: Any = None
     script_mode: bool = False
     script_log: list[dict[str, Any]] = field(default_factory=list)
+    rollback_offer: Any = None
 
     def market_available(self, row: MarketRow) -> bool:
         if self.session is None:
@@ -2670,6 +2748,8 @@ def confirm_td_draft(state: BrowserState) -> None:
     else:
         sent = len(would_send)
         state.script_log.append({"event": "confirm", "would_send": would_send})
+    pending_before = state.session.pending_extra_team
+    before_n = len(state.session.store.events())
     state.session.mark_sent(b.market_id for b in armed)
     if draft.kind == "fg":
         recorded = apply_fg_draft(state.session, draft)
@@ -2679,6 +2759,13 @@ def confirm_td_draft(state: BrowserState) -> None:
         recorded = apply_qend_draft(state.session, draft)
     else:
         recorded = apply_td_draft(state.session, draft)
+    state.session.record_play(
+        kind=str(draft.kind or "td"),
+        label=recorded,
+        n_events=len(state.session.store.events()) - before_n,
+        sent=would_send,
+        pending_extra_before=pending_before,
+    )
     for armed_id in list(draft.armed_ids):
         try:
             state.session.arming.disarm(armed_id)
@@ -2758,7 +2845,16 @@ def handle_filter_enter(state: BrowserState) -> None:
             if not state.session.pending_extra_team:
                 state.message = "no TD waiting for PAT/2PT"
                 return
+            pending_before = state.session.pending_extra_team
+            before_n = len(state.session.store.events())
             state.message = apply_extra_miss(state.session, q.extra)
+            state.session.record_play(
+                kind="miss",
+                label=state.message,
+                n_events=len(state.session.store.events()) - before_n,
+                sent=[],
+                pending_extra_before=pending_before,
+            )
             state.filter_text = ""
             state.cursor = 0
             leave_filter_mode(state)
@@ -2773,7 +2869,16 @@ def handle_filter_enter(state: BrowserState) -> None:
             quantity=_play_quantity(state),
         )
         if not cands:
+            pending_before = state.session.pending_extra_team
+            before_n = len(state.session.store.events())
             recorded = apply_extra_draft(state.session, draft) if draft is not None else msg
+            state.session.record_play(
+                kind="extra",
+                label=recorded,
+                n_events=len(state.session.store.events()) - before_n,
+                sent=[],
+                pending_extra_before=pending_before,
+            )
             state.message = recorded
             state.filter_text = ""
             state.cursor = 0
@@ -3444,6 +3549,7 @@ NCAAF prompt  (no market list, no /)
   nopat / no2pt miss
   qend          end this quarter (Q2 also 1H)
   o             orders
+  rb            undo last play, then y/n to sell those legs
   empty Enter   send the armed bundle
   x             cancel armed bundle
   q             quit
@@ -3518,6 +3624,64 @@ def format_order_lines(state: BrowserState) -> list[str]:
     return lines
 
 
+def _remaining_session(ticker: str, side: str) -> int:
+    want = str(side or "yes").lower()
+    total = 0
+    for bet in SESSION_BETS.bets:
+        if bet.ticker.upper() != str(ticker).upper():
+            continue
+        if str(bet.side or "yes").lower() != want:
+            continue
+        total += bet.remaining
+    return total
+
+
+def sell_rollback_legs(state: BrowserState, play: Any) -> list[str]:
+    legs = list(getattr(play, "sent", None) or [])
+    if not legs:
+        return ["no positions from that play"]
+    if not state.script_mode:
+        tickers = [str(leg.get("ticker") or "") for leg in legs if leg.get("ticker")]
+        if tickers:
+            state.tracker.ensure_quotes(tickers, force=True)
+    lines = [f"SELL {len(legs)}"]
+    sold = 0
+    live = bool(getattr(state.args, "live", False))
+    for leg in legs:
+        ticker = str(leg.get("ticker") or "")
+        side = str(leg.get("side") or "yes").lower()
+        qty = int(leg.get("quantity") or _play_quantity(state))
+        rem = _remaining_session(ticker, side)
+        if rem <= 0:
+            lines.append(f"  skip {side.upper()} {ticker} (not holding)")
+            continue
+        qty = min(qty, rem)
+        row = next((r for r in state.rows if r.ticker.upper() == ticker.upper()), None)
+        title = (row.title if row is not None else "") or ""
+        quote = state.tracker.quote(ticker) if ticker else None
+        bid = None
+        if quote is not None:
+            bid = quote.yes_bid if side == "yes" else quote.no_bid
+        if bid is None and not live:
+            SESSION_BETS.mark_sold(ticker, qty, side=side)
+            sold += 1
+            lines.append(f"  DRY-RUN SELL {side.upper()} {ticker} x{qty} (no bid yet)")
+            continue
+        if side == "no":
+            ok, msg = sell_no_for_position(
+                args=state.args, ticker=ticker, title=title, count=qty, quote=quote
+            )
+        else:
+            ok, msg = sell_yes_for_position(
+                args=state.args, ticker=ticker, title=title, count=qty, quote=quote
+            )
+        lines.append(f"  {msg}")
+        if ok:
+            sold += 1
+    lines.append(f"sold {sold}/{len(legs)}")
+    return lines
+
+
 def cancel_prompt_draft(state: BrowserState) -> None:
     if state.session is None or state.draft is None:
         return
@@ -3534,12 +3698,40 @@ def handle_prompt_line(state: BrowserState, line: str) -> list[str]:
     """One NCAAF prompt command. Empty line sends an armed draft."""
     raw = str(line or "").strip()
     low = raw.lower()
+    if state.rollback_offer is not None:
+        play = state.rollback_offer
+        if low in {"y", "yes"}:
+            state.rollback_offer = None
+            return sell_rollback_legs(state, play)
+        if low in {"n", "no", ""}:
+            state.rollback_offer = None
+            return ["kept those positions"]
+        state.rollback_offer = None
     if low in {"q", "quit", "exit"}:
         return ["quit"]
     if low in {"h", "help", "?"}:
         return [PROMPT_HELP]
     if low in {"o", "orders"}:
         return format_order_lines(state)
+    if low in {"rb", "rollback"}:
+        if state.session is None:
+            return ["nothing to rollback"]
+        if state.draft is not None:
+            cancel_prompt_draft(state)
+        play = state.session.rollback_last_play()
+        if play is None:
+            return ["nothing to rollback"]
+        lines = [f"rolled back {play.label}", format_game_stats(state)]
+        if play.sent:
+            lines.append(f"holding {len(play.sent)} legs from that play — sell them?")
+            for leg in play.sent:
+                side = str(leg.get("side") or "yes").upper()
+                ticker = str(leg.get("ticker") or "")
+                reason = str(leg.get("reason") or "")
+                lines.append(f"  {side:<3} {reason}  {ticker}".rstrip())
+            lines.append("y sell · n keep")
+            state.rollback_offer = play
+        return lines
     if low in {"x", "cancel"}:
         if state.draft is None:
             return ["nothing armed"]

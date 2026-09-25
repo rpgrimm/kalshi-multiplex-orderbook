@@ -19,3 +19,12 @@ class EventStore:
 
     def clear(self) -> None:
         self._events.clear()
+
+    def pop_last(self, n: int = 1) -> list[GameEvent]:
+        n = max(0, int(n))
+        if n <= 0 or not self._events:
+            return []
+        take = min(n, len(self._events))
+        popped = self._events[-take:]
+        del self._events[-take:]
+        return popped
