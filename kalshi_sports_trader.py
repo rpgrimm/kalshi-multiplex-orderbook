@@ -43,6 +43,7 @@ Auth for --watch / --browse WS books (env vars or config files):
 from __future__ import annotations
 
 import argparse
+import http.client
 import uuid
 import json
 import os
@@ -466,6 +467,40 @@ def looks_season_long(series_ticker: str) -> bool:
     if gameish:
         return False
     return any(h in s for h in SEASON_LONG_HINTS)
+def _drain_http_error(exc: urllib.error.HTTPError) -> None:
+    """Consume/detach the HTTPError body so 3.14 GC close() is not a double-close."""
+    try:
+        exc.read()
+    except Exception:
+        pass
+    fp = getattr(exc, "fp", None)
+    if fp is not None:
+        try:
+            fp.close()
+        except Exception:
+            pass
+        try:
+            exc.fp = None
+        except Exception:
+            pass
+
+
+def _patch_http_response_close() -> None:
+    """Python 3.14 HTTPResponse.close() flushes an already-closed fp on GC."""
+    orig = http.client.HTTPResponse.close
+
+    def close(self, *args, **kwargs):  # noqa: ANN001
+        try:
+            return orig(self, *args, **kwargs)
+        except ValueError:
+            return None
+
+    http.client.HTTPResponse.close = close  # type: ignore[method-assign]
+
+
+_patch_http_response_close()
+
+
 def public_get_json(
     host: str,
     path: str,
@@ -504,6 +539,7 @@ def get_json_with_retries(
         try:
             return public_get_json(host, path, params=params, timeout=timeout)
         except urllib.error.HTTPError as exc:
+            _drain_http_error(exc)
             last_err = exc
             if exc.code == 404:
                 raise
