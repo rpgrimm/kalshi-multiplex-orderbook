@@ -8,7 +8,14 @@ import unittest
 from types import SimpleNamespace
 
 from kalshi_sports_trader import make_headless_state, run_key_script
-from sports_engine.browse import apply_td_draft, arm_ncaaf_td_draft, make_browse_session
+from sports_engine.browse import (
+    apply_extra_draft,
+    apply_extra_miss,
+    apply_td_draft,
+    arm_extra_draft,
+    arm_ncaaf_td_draft,
+    make_browse_session,
+)
 from sports_engine.catalog import teams_from_game_code
 from sports_engine.play_protocol import parse_play_query
 
@@ -128,6 +135,59 @@ class TestNcaafTd(unittest.TestCase):
         drafts = [e for e in report2["log"] if e["event"] == "draft"]
         armed = {a["ticker"] for a in drafts[-1]["armed"]}
         self.assertFalse(any("FIRSTTDTEAM" in t for t in armed))
+
+    def test_pat_after_td_clears_1h_65_not_q75(self) -> None:
+        rows = fixture()
+        session = make_browse_session("26SEP26MISSFLA", rows)
+        draft, _, _ = arm_ncaaf_td_draft(session, rows, parse_play_query("f td"))
+        assert draft is not None
+        apply_td_draft(session, draft)
+        self.assertEqual(session.pending_extra_team, "FLA")
+        extra, cands, _ = arm_extra_draft(session, rows, "pat")
+        ids = {c.market_id for c in cands}
+        self.assertTrue(any(i.endswith("-7") and "1HTOTAL" in i for i in ids))
+        self.assertFalse(any(i.endswith("-8") and "1QTOTAL" in i for i in ids))
+        assert extra is not None
+        apply_extra_draft(session, extra)
+        self.assertEqual(session.state().home_score, 7)
+        self.assertIsNone(session.pending_extra_team)
+
+    def test_2pt_clears_q75_and_team_1h_75(self) -> None:
+        rows = fixture()
+        session = make_browse_session("26SEP26MISSFLA", rows)
+        draft, _, _ = arm_ncaaf_td_draft(session, rows, parse_play_query("f td"))
+        assert draft is not None
+        apply_td_draft(session, draft)
+        extra, cands, _ = arm_extra_draft(session, rows, "2pt")
+        ids = {c.market_id for c in cands}
+        self.assertTrue(any(i.endswith("-8") and "1QTOTAL" in i for i in ids))
+        self.assertTrue(any(i.endswith("-FLA8") for i in ids))
+        assert extra is not None
+        apply_extra_draft(session, extra)
+        self.assertEqual(session.state().home_score, 8)
+
+    def test_nopat_keeps_score_at_6(self) -> None:
+        rows = fixture()
+        session = make_browse_session("26SEP26MISSFLA", rows)
+        draft, _, _ = arm_ncaaf_td_draft(session, rows, parse_play_query("f td"))
+        assert draft is not None
+        apply_td_draft(session, draft)
+        apply_extra_miss(session, "nopat")
+        self.assertEqual(session.state().home_score, 6)
+        self.assertIsNone(session.pending_extra_team)
+
+    def test_script_pat_after_td(self) -> None:
+        state = make_headless_state(
+            seed_series="KXNCAAFGAME",
+            game_code="26SEP26MISSFLA",
+            rows=fixture(),
+            args=args(),
+        )
+        report = run_key_script(state, "/ f td Enter Enter / pat Enter Enter")
+        self.assertEqual(report["state"]["home_score"], 7)
+        confirms = [e for e in report["log"] if e["event"] == "confirm"]
+        last = {b["ticker"] for b in confirms[-1]["would_send"]}
+        self.assertTrue(any("1HTOTAL" in t and t.endswith("-7") for t in last))
 
 
 if __name__ == "__main__":

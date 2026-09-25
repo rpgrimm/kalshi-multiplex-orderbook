@@ -10,7 +10,11 @@ INTENT_REC = frozenset({"re", "rec", "recv", "receiving"})
 INTENT_RUSH = frozenset({"ru", "rush", "rushing"})
 INTENT_DEF = frozenset({"d", "def", "dst", "st"})
 PAT_TOKENS = frozenset({"pat", "xp", "xpt", "extra"})
-RESERVED = KIND_TD | KIND_FG | INTENT_REC | INTENT_RUSH | INTENT_DEF | PAT_TOKENS
+TWO_PT_TOKENS = frozenset({"2pt", "twopt", "two"})
+NO_PAT_TOKENS = frozenset({"nopat", "noxp", "misspat"})
+NO_2PT_TOKENS = frozenset({"no2pt", "miss2pt"})
+EXTRA_TOKENS = PAT_TOKENS | TWO_PT_TOKENS | NO_PAT_TOKENS | NO_2PT_TOKENS
+RESERVED = KIND_TD | KIND_FG | INTENT_REC | INTENT_RUSH | INTENT_DEF | EXTRA_TOKENS
 
 
 @dataclass(frozen=True)
@@ -19,6 +23,7 @@ class PlayQuery:
     kind: str | None  # "td" | "fg" | None
     intent: str | None  # "receiving" | "rush" | "defense" | None
     pat: bool = False
+    extra: str | None = None  # pat | 2pt | nopat | no2pt
     raw: str = ""
 
     def is_complete_td(self) -> bool:
@@ -45,6 +50,7 @@ def parse_play_query(text: str) -> PlayQuery:
     intent: str | None = None
     kind: str | None = None
     pat = False
+    extra: str | None = None
     name: list[str] = []
     for tok in raw.lower().split():
         if tok in INTENT_REC:
@@ -57,11 +63,20 @@ def parse_play_query(text: str) -> PlayQuery:
             kind = "td"
         elif tok in KIND_FG:
             kind = "fg"
+        elif tok in NO_PAT_TOKENS:
+            extra = "nopat"
+        elif tok in NO_2PT_TOKENS:
+            extra = "no2pt"
+        elif tok in TWO_PT_TOKENS:
+            extra = "2pt"
         elif tok in PAT_TOKENS:
             pat = True
+            extra = extra or "pat"
         else:
             name.append(tok)
-    return PlayQuery(name_tokens=tuple(name), kind=kind, intent=intent, pat=pat, raw=raw)
+    return PlayQuery(
+        name_tokens=tuple(name), kind=kind, intent=intent, pat=pat, extra=extra, raw=raw
+    )
 
 
 def last_token(text: str) -> tuple[str, str]:

@@ -37,6 +37,7 @@ class SportsSession:
         self.execution = execution or ExecutionEngine(backend=backend)
         self.mock = backend if isinstance(self.execution.backend, MockExecutionBackend) else None
         self.sent_markets: set[str] = set()
+        self.pending_extra_team: str | None = None
 
     def mark_sent(self, tickers: Sequence[str]) -> None:
         for t in tickers:

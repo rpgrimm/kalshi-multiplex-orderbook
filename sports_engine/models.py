@@ -126,6 +126,8 @@ class GameState:
     team_rec_tds: dict[str, int] = field(default_factory=dict)
     away_score_at_q_start: int = 0
     home_score_at_q_start: int = 0
+    away_score_at_half: int = 0
+    home_score_at_half: int = 0
 
     @property
     def game_tds(self) -> int:
@@ -136,6 +138,26 @@ class GameState:
         return (self.away_score + self.home_score) - (
             self.away_score_at_q_start + self.home_score_at_q_start
         )
+
+    def points_this_half(self) -> int:
+        if self.quarter <= 2:
+            return self.away_score + self.home_score
+        return (self.away_score + self.home_score) - (
+            self.away_score_at_half + self.home_score_at_half
+        )
+
+    def team_points_this_half(self, team: str | None) -> int:
+        stats = self.team_stats(team)
+        if stats is None:
+            return 0
+        if self.quarter <= 2:
+            return int(stats.score)
+        half = (
+            self.away_score_at_half
+            if str(team or "").upper() in {self.away.upper(), "AWAY"}
+            else self.home_score_at_half
+        )
+        return int(stats.score) - int(half)
 
     @property
     def away_score(self) -> int:

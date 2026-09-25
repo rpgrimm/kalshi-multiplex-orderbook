@@ -65,9 +65,12 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from sports_engine.browse import (
+    arm_extra_draft,
     arm_fg_draft,
     arm_ncaaf_td_draft,
     arm_td_draft,
+    apply_extra_draft,
+    apply_extra_miss,
     apply_fg_draft,
     apply_td_draft,
     catalog_player_names,
@@ -2319,6 +2322,8 @@ Modes (vim-style)
   `fg m` then Enter  arm this game's team FG ladder (m→MIA, k→KC). Confirm Enter sends.
   NCAAF `/ f td`     team TD: first-TD YES/NOs + Q/H overs a 6-pt score clears.
                      `re` = receiving (2+ ladder). `d` = also D/ST. Confirm Enter sends.
+  `/ pat` `/ 2pt`    after a TD: +1 or +2 and arm newly crossed Q/H/game/team totals.
+  `/ nopat` `/ no2pt` miss: no points, close the extra-point window.
   Enter again        send armed YES legs (dry-run unless --live) and then update score
   t                  TIMEKEEPING: qend ends quarter (NO on missed overs)
   Esc                leave FILTER/TIME → NORMAL
@@ -2663,6 +2668,8 @@ def confirm_td_draft(state: BrowserState) -> None:
     state.session.mark_sent(b.market_id for b in armed)
     if draft.kind == "fg":
         recorded = apply_fg_draft(state.session, draft)
+    elif draft.kind == "extra":
+        recorded = apply_extra_draft(state.session, draft)
     else:
         recorded = apply_td_draft(state.session, draft)
     for armed_id in list(draft.armed_ids):
@@ -2733,6 +2740,42 @@ def handle_filter_enter(state: BrowserState) -> None:
     q = parse_play_query(state.filter_text)
     if state.draft is not None:
         confirm_td_draft(state)
+        return
+    if (
+        q.extra
+        and q.kind is None
+        and not q.name_tokens
+        and state.session is not None
+    ):
+        if q.extra in {"nopat", "no2pt"}:
+            if not state.session.pending_extra_team:
+                state.message = "no TD waiting for PAT/2PT"
+                return
+            state.message = apply_extra_miss(state.session, q.extra)
+            state.filter_text = ""
+            state.cursor = 0
+            leave_filter_mode(state)
+            return
+        if not state.session.pending_extra_team:
+            state.message = "no TD waiting for PAT/2PT"
+            return
+        draft, cands, msg = arm_extra_draft(
+            state.session,
+            state.rows,
+            q.extra,
+            quantity=_play_quantity(state),
+        )
+        if not cands:
+            recorded = apply_extra_draft(state.session, draft) if draft is not None else msg
+            state.message = recorded
+            state.filter_text = ""
+            state.cursor = 0
+            leave_filter_mode(state)
+            return
+        state.draft = draft
+        state.filter_text = f"{q.extra} "
+        state.message = msg
+        _log_script_draft(state)
         return
     if q.kind == "td" and _college_mode(state) and state.session is not None:
         st = state.session.state()

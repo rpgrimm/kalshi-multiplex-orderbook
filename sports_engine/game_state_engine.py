@@ -50,6 +50,9 @@ class GameStateEngine:
             event.payload["away_this_q"] = away_q
             event.payload["home_this_q"] = home_q
             event.payload["points_this_q"] = away_q + home_q
+            if state.quarter == 2:
+                state.away_score_at_half = state.away_score
+                state.home_score_at_half = state.home_score
             if state.quarter < 4:
                 state.quarter += 1
             state.away_score_at_q_start = state.away_score

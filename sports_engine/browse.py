@@ -21,6 +21,7 @@ from .models import CandidateBet, EventType, GameEvent
 from .play_protocol import PlayQuery
 from .session import SportsSession
 from .strategies.fg_ladder import FgLadderStrategy, preview_fg_ladder
+from .strategies.extra_points import extra_points_for, preview_extra_overs
 from .strategies.ncaaf_td import preview_ncaaf_td
 from .strategies.quarter_end import QuarterEndStrategy
 from .strategies.td_cluster import TdClusterStrategy, preview_td_cluster
@@ -215,6 +216,90 @@ def arm_fg_draft(
     return draft, cands, format_candidates(cands, armed=True) + f" · {team} FG · {hint}"
 
 
+def arm_extra_draft(
+    session: SportsSession,
+    rows: Sequence[Any],
+    extra: str,
+    *,
+    quantity: int = 1,
+    previous: DraftPlay | None = None,
+) -> tuple[DraftPlay | None, list[CandidateBet], str]:
+    team = session.pending_extra_team
+    if not team:
+        return previous, [], "no TD waiting for PAT/2PT"
+    add = extra_points_for(extra)
+    if previous is not None:
+        for armed_id in previous.armed_ids:
+            try:
+                session.arming.disarm(armed_id)
+            except KeyError:
+                pass
+    cands = preview_extra_overs(
+        rows, session.state(), team, add, sent=session.sent_markets
+    )
+    session.arming.observe(cands)
+    armed_ids: list[str] = []
+    for cand in cands:
+        bet = session.arm(cand.candidate_id, quantity=quantity)
+        armed_ids.append(bet.armed_id)
+    draft = DraftPlay(
+        player="",
+        name_tokens=(),
+        kind="extra",
+        intent=extra,
+        armed_ids=armed_ids,
+        team=team,
+        team_key=str(team).lower(),
+        display=team,
+    )
+    label = "+1 PAT" if extra == "pat" else "+2 2PT"
+    hint = "Enter confirms send" if cands else f"no new overs · Enter records {label}"
+    return draft, cands, format_candidates(cands, armed=True) + f" · {team} {label} · {hint}"
+
+
+def apply_extra_draft(session: SportsSession, draft: DraftPlay) -> str:
+    extra = draft.intent or "pat"
+    add = extra_points_for(extra)
+    if add:
+        session.ingest(
+            GameEvent(
+                type=EventType.EXTRA_POINT,
+                team=draft.team,
+                payload={"points": add, "extra": extra},
+                source="browse-confirm",
+                raw=extra,
+            ),
+            evaluate=False,
+        )
+    session.pending_extra_team = None
+    st = session.state()
+    label = "PAT" if extra == "pat" else "2PT"
+    return (
+        f"recorded {draft.team} {label} +{add} · "
+        f"Q{st.quarter} {st.away} {st.away_score}-{st.home_score} {st.home}"
+    )
+
+
+def apply_extra_miss(session: SportsSession, extra: str) -> str:
+    team = session.pending_extra_team
+    session.ingest(
+        GameEvent(
+            type=EventType.OTHER,
+            team=team,
+            payload={"points": 0, "extra": extra},
+            source="browse-confirm",
+            raw=extra,
+        ),
+        evaluate=False,
+    )
+    session.pending_extra_team = None
+    st = session.state()
+    return (
+        f"recorded {team or '?'} {extra} · "
+        f"Q{st.quarter} {st.away} {st.away_score}-{st.home_score} {st.home}"
+    )
+
+
 def apply_fg_draft(session: SportsSession, draft: DraftPlay) -> str:
     event = GameEvent(
         type=EventType.FIELD_GOAL,
@@ -261,6 +346,10 @@ def apply_td_draft(session: SportsSession, draft: DraftPlay) -> str:
             evaluate=False,
         )
     st = session.state()
+    if draft.pat:
+        session.pending_extra_team = None
+    elif draft.team:
+        session.pending_extra_team = draft.team
     extra = " + PAT" if draft.pat else ""
     rec_note = ""
     if draft.intent == "receiving" and draft.team:
